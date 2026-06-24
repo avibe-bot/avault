@@ -1,0 +1,18 @@
+[package]
+name = "avault-core"
+description = "Pure crypto core for avault: AES-256-GCM envelope (AEAD+AAD), per-record DEK wrap, HPKE blind-box open, secp256k1 sign — all zeroized. No I/O, no platform deps."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+aes-gcm.workspace = true
+hkdf.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
+subtle.workspace = true
+rand.workspace = true
+anyhow.workspace = true

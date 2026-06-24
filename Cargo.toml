@@ -1,0 +1,35 @@
+# avault — Rust custody core for Avibe Vaults.
+# Workspace: a pure crypto core, a cross-platform key store, and the `avault` binary.
+# See docs/DESIGN.md for the full design.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/avault-core",
+    "crates/avault-store",
+    "crates/avault-cli",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT"
+authors = ["The Vibe Remote Authors"]
+repository = "https://github.com/avibe-bot/avault"
+
+# Shared, version-pinned crypto stack (see docs/DESIGN.md · Appendix B). Each crate
+# opts in via `<dep>.workspace = true`. These are the intended primitives; wiring them
+# up is the P1 implementation work.
+[workspace.dependencies]
+aes-gcm = "0.10"      # AES-256-GCM AEAD
+hkdf = "0.12"         # HKDF-SHA256
+sha2 = "0.10"
+zeroize = { version = "1", features = ["zeroize_derive"] }  # deterministic wipe
+subtle = "2"          # constant-time comparison
+rand = "0.8"          # CSPRNG (OsRng)
+anyhow = "1"
+
+[profile.release]
+# Custody binary: keep symbols lean; the memory-hardening lives in code, not flags.
+opt-level = 2

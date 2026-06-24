@@ -1,0 +1,16 @@
+# Rust build output
+/target
+**/*.rs.bk
+
+# macOS
+.DS_Store
+
+# Editor / local
+*.swp
+.idea/
+.vscode/
+
+# Local secrets / runtime — never commit
+*.key
+*.pem
+/.avault-dev/
