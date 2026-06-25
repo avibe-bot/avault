@@ -366,7 +366,7 @@ fn deliver_run_rejects_name_mismatch() {
 #[test]
 fn deliver_fetch_injects_bearer_to_loopback_and_returns_response_json() {
     let home = tempfile::tempdir().unwrap();
-    let sealed = seal_secret(home.path(), "API_TOKEN", b"token-123");
+    let sealed = seal_secret(home.path(), "API_TOKEN", b"token-123\n");
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
@@ -388,6 +388,7 @@ fn deliver_fetch_injects_bearer_to_loopback_and_returns_response_json() {
         "request": {
             "method": "GET",
             "url": format!("http://127.0.0.1:{}/resource", addr.port()),
+            "allowed_hosts": ["127.0.0.1"],
             "inject": {"type": "bearer"}
         }
     });
@@ -429,7 +430,8 @@ fn deliver_fetch_rejects_plaintext_non_loopback_before_opening() {
         },
         "request": {
             "method": "GET",
-            "url": "http://example.com/resource"
+            "url": "http://example.com/resource",
+            "allowed_hosts": ["example.com"]
         }
     });
 
@@ -453,6 +455,197 @@ fn deliver_fetch_rejects_plaintext_non_loopback_before_opening() {
 }
 
 #[test]
+fn deliver_fetch_requires_allowed_hosts_before_opening() {
+    let home = tempfile::tempdir().unwrap();
+    let request = json!({
+        "name": "API_TOKEN",
+        "envelope": {
+            "ciphertext": "not-base64",
+            "nonce": "not-base64",
+            "wrap_meta": "{}"
+        },
+        "request": {
+            "method": "GET",
+            "url": "https://api.example.com/resource"
+        }
+    });
+
+    let mut fetch = avault()
+        .arg("deliver")
+        .arg("fetch")
+        .env("AVAULT_HOME", home.path())
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    fetch
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let output = fetch.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(70));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("allowed_hosts is required"));
+    assert!(!stderr.contains("open failed"));
+}
+
+#[test]
+fn deliver_fetch_rejects_unapproved_host_before_opening() {
+    let home = tempfile::tempdir().unwrap();
+    let request = json!({
+        "name": "API_TOKEN",
+        "envelope": {
+            "ciphertext": "not-base64",
+            "nonce": "not-base64",
+            "wrap_meta": "{}"
+        },
+        "request": {
+            "method": "GET",
+            "url": "https://evil.example.com/resource",
+            "allowed_hosts": ["api.example.com"]
+        }
+    });
+
+    let mut fetch = avault()
+        .arg("deliver")
+        .arg("fetch")
+        .env("AVAULT_HOME", home.path())
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    fetch
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let output = fetch.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(70));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("host is not allowed"));
+    assert!(!stderr.contains("open failed"));
+}
+
+#[test]
+fn deliver_fetch_rejects_injected_header_conflict_before_opening() {
+    let home = tempfile::tempdir().unwrap();
+    let request = json!({
+        "name": "API_TOKEN",
+        "envelope": {
+            "ciphertext": "not-base64",
+            "nonce": "not-base64",
+            "wrap_meta": "{}"
+        },
+        "request": {
+            "method": "GET",
+            "url": "https://api.example.com/resource",
+            "allowed_hosts": ["API.EXAMPLE.COM"],
+            "headers": {"authorization": "Bearer placeholder"},
+            "inject": {"type": "bearer"}
+        }
+    });
+
+    let mut fetch = avault()
+        .arg("deliver")
+        .arg("fetch")
+        .env("AVAULT_HOME", home.path())
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    fetch
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let output = fetch.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(70));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("already contains injected header"));
+    assert!(!stderr.contains("open failed"));
+}
+
+#[test]
+fn deliver_fetch_rejects_injected_query_conflict_before_opening() {
+    let home = tempfile::tempdir().unwrap();
+    let request = json!({
+        "name": "API_TOKEN",
+        "envelope": {
+            "ciphertext": "not-base64",
+            "nonce": "not-base64",
+            "wrap_meta": "{}"
+        },
+        "request": {
+            "method": "GET",
+            "url": "https://api.example.com/resource?api_key=placeholder",
+            "allowed_hosts": ["api.example.com"],
+            "inject": {"type": "query", "name": "api_key"}
+        }
+    });
+
+    let mut fetch = avault()
+        .arg("deliver")
+        .arg("fetch")
+        .env("AVAULT_HOME", home.path())
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    fetch
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let output = fetch.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(70));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("already contains injected query parameter"));
+    assert!(!stderr.contains("open failed"));
+}
+
+#[test]
+fn deliver_fetch_rejects_invalid_header_credential_before_request() {
+    let home = tempfile::tempdir().unwrap();
+    let sealed = seal_secret(home.path(), "API_TOKEN", b"token\tbad");
+    let request = json!({
+        "name": "API_TOKEN",
+        "envelope": sealed,
+        "request": {
+            "method": "GET",
+            "url": "http://127.0.0.1:9/resource",
+            "allowed_hosts": ["127.0.0.1"],
+            "inject": {"type": "header", "name": "X-Api-Key"}
+        }
+    });
+
+    let mut fetch = avault()
+        .arg("deliver")
+        .arg("fetch")
+        .env("AVAULT_HOME", home.path())
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    fetch
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let output = fetch.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(70));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("invalid HTTP header byte"));
+    assert!(!stderr.contains("HTTP transport failed"));
+    assert!(!stderr.contains("token"));
+}
+
+#[test]
 fn deliver_fetch_sanitizes_transport_errors_after_query_injection() {
     let home = tempfile::tempdir().unwrap();
     let sealed = seal_secret(home.path(), "API_TOKEN", b"token-123");
@@ -466,6 +659,7 @@ fn deliver_fetch_sanitizes_transport_errors_after_query_injection() {
         "request": {
             "method": "GET",
             "url": format!("http://127.0.0.1:{}/resource", port),
+            "allowed_hosts": ["127.0.0.1"],
             "inject": {"type": "query", "name": "api_key"}
         }
     });
@@ -517,7 +711,8 @@ fn deliver_fetch_rejects_oversized_response_body() {
         "envelope": sealed,
         "request": {
             "method": "GET",
-            "url": format!("http://127.0.0.1:{}/large", addr.port())
+            "url": format!("http://127.0.0.1:{}/large", addr.port()),
+            "allowed_hosts": ["127.0.0.1"]
         }
     });
 
@@ -689,7 +884,8 @@ fn p0_no_aad_blob_opens_via_new_delivery_paths() {
         "envelope": sealed,
         "request": {
             "method": "GET",
-            "url": format!("http://127.0.0.1:{}/p0", addr.port())
+            "url": format!("http://127.0.0.1:{}/p0", addr.port()),
+            "allowed_hosts": ["127.0.0.1"]
         }
     });
     let mut fetch = avault()

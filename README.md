@@ -78,6 +78,7 @@ one child with all env vars:
   "request": {
     "method": "GET",
     "url": "https://api.github.com/user",
+    "allowed_hosts": ["api.github.com"],
     "headers": { "Accept": "application/json" },
     "body": null,
     "inject": { "type": "bearer" }
@@ -87,9 +88,12 @@ one child with all env vars:
 
 `inject` defaults to bearer auth; custom forms are
 `{"type":"header","name":"X-Api-Key"}` and `{"type":"query","name":"api_key"}`.
-Output is response JSON `{status, headers, body}`. `https` is required except
-for loopback `http`, unsafe echo methods are rejected before decrypting, transport
-errors are sanitized, and the response body is capped.
+`allowed_hosts` is required and must include the URL host before avault opens the
+envelope; loopback hosts are not implicit. Output is response JSON
+`{status, headers, body}`. `https` is required except for loopback `http`,
+unsafe echo methods are rejected before decrypting, conflicting injected
+header/query fields are rejected, transport errors are sanitized, and the
+response body is capped.
 
 `deliver inject` accepts:
 

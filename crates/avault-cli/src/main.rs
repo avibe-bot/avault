@@ -42,6 +42,7 @@ USAGE:
     avault version
 
 P1 reads secret values, envelopes, and passphrases from stdin. Plaintext never belongs in argv.
+deliver fetch requires request.allowed_hosts before attaching a credential.
 P2 stubs: pubkey, sign, agent.
 ";
 
@@ -172,6 +173,8 @@ struct FetchRequest {
     method: String,
     url: String,
     #[serde(default)]
+    allowed_hosts: Vec<String>,
+    #[serde(default)]
     headers: BTreeMap<String, String>,
     #[serde(default)]
     body: Option<String>,
@@ -291,15 +294,21 @@ fn deliver_fetch_cmd(args: &[OsString]) -> anyhow::Result<u8> {
     let url = Url::parse(&fetch.request.url).context("fetch url is invalid")?;
     let is_loopback = is_loopback_url(&url);
     validate_fetch_url(&url)?;
+    validate_allowed_fetch_host(&url, &fetch.request.allowed_hosts)?;
     validate_fetch_method(&fetch.request.method)?;
     for (name, value) in &fetch.request.headers {
         validate_header(name, value)?;
     }
-    if let FetchInject::Header { name } = &fetch.request.inject {
-        validate_header_name(name)?;
-    }
-    if let FetchInject::Query { name } = &fetch.request.inject {
-        validate_query_name(name)?;
+    match &fetch.request.inject {
+        FetchInject::Bearer => reject_header_conflict(&fetch.request.headers, "Authorization")?,
+        FetchInject::Header { name } => {
+            validate_header_name(name)?;
+            reject_header_conflict(&fetch.request.headers, name)?;
+        }
+        FetchInject::Query { name } => {
+            validate_query_name(name)?;
+            reject_query_conflict(&url, name)?;
+        }
     }
 
     let master = avault_store::load_master_key(Backend::File)?;
@@ -311,7 +320,8 @@ fn deliver_fetch_cmd(args: &[OsString]) -> anyhow::Result<u8> {
     let mut target_url = Zeroizing::new(fetch.request.url.clone());
     match &fetch.request.inject {
         FetchInject::Bearer => {
-            let secret_text = secret_utf8(secret.as_slice(), "fetch bearer credential")?;
+            let secret_text =
+                fetch_header_credential(secret.as_slice(), "fetch bearer credential")?;
             let mut bearer =
                 Zeroizing::new(String::with_capacity("Bearer ".len() + secret_text.len()));
             bearer.push_str("Bearer ");
@@ -319,7 +329,8 @@ fn deliver_fetch_cmd(args: &[OsString]) -> anyhow::Result<u8> {
             secret_header = Some(("Authorization".to_string(), bearer));
         }
         FetchInject::Header { name } => {
-            let secret_text = secret_utf8(secret.as_slice(), "fetch header credential")?;
+            let secret_text =
+                fetch_header_credential(secret.as_slice(), "fetch header credential")?;
             secret_header = Some((name.clone(), Zeroizing::new(secret_text.to_string())));
         }
         FetchInject::Query { name } => {
@@ -572,6 +583,21 @@ fn secret_utf8<'a>(bytes: &'a [u8], label: &str) -> anyhow::Result<&'a str> {
     std::str::from_utf8(bytes).with_context(|| format!("{label} is not valid UTF-8"))
 }
 
+fn fetch_header_credential<'a>(bytes: &'a [u8], label: &str) -> anyhow::Result<&'a str> {
+    let trimmed = match bytes.last() {
+        Some(b'\r') | Some(b'\n') => &bytes[..bytes.len() - 1],
+        _ => bytes,
+    };
+    if trimmed.iter().any(|byte| is_http_control_byte(*byte)) {
+        bail!("{label} contains invalid HTTP header byte");
+    }
+    std::str::from_utf8(trimmed).with_context(|| format!("{label} is not valid UTF-8"))
+}
+
+fn is_http_control_byte(byte: u8) -> bool {
+    byte < 0x20 || byte == 0x7f
+}
+
 fn write_shell_quoted(out: &mut Vec<u8>, value: &str) -> anyhow::Result<()> {
     out.push(b'\'');
     for ch in value.chars() {
@@ -643,6 +669,54 @@ fn validate_fetch_url(url: &Url) -> anyhow::Result<()> {
     }
 }
 
+fn validate_allowed_fetch_host(url: &Url, allowed_hosts: &[String]) -> anyhow::Result<()> {
+    if allowed_hosts.is_empty() {
+        bail!("fetch allowed_hosts is required");
+    }
+    for host in allowed_hosts {
+        validate_allowed_host(host)?;
+    }
+    let Some(host) = fetch_url_host(url) else {
+        bail!("fetch url host is required");
+    };
+    if !allowed_hosts
+        .iter()
+        .any(|allowed| host.eq_ignore_ascii_case(allowed))
+    {
+        bail!("fetch host is not allowed");
+    }
+    Ok(())
+}
+
+fn validate_allowed_host(host: &str) -> anyhow::Result<()> {
+    if host.trim().is_empty()
+        || host.trim() != host
+        || host.contains('/')
+        || host.contains('\\')
+        || host.contains('@')
+        || host.contains('[')
+        || host.contains(']')
+        || host.contains('\r')
+        || host.contains('\n')
+        || host.contains('?')
+        || host.contains('#')
+    {
+        bail!("invalid fetch allowed host");
+    }
+    if host.contains(':') && host.parse::<std::net::Ipv6Addr>().is_err() {
+        bail!("invalid fetch allowed host");
+    }
+    Ok(())
+}
+
+fn fetch_url_host(url: &Url) -> Option<String> {
+    match url.host()? {
+        Host::Domain(host) => Some(host.to_string()),
+        Host::Ipv4(addr) => Some(addr.to_string()),
+        Host::Ipv6(addr) => Some(addr.to_string()),
+    }
+}
+
 fn is_loopback_url(url: &Url) -> bool {
     match url.host() {
         Some(Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
@@ -656,6 +730,19 @@ fn validate_header(name: &str, value: &str) -> anyhow::Result<()> {
     validate_header_name(name)?;
     if value.contains('\r') || value.contains('\n') {
         bail!("invalid fetch header value");
+    }
+    Ok(())
+}
+
+fn reject_header_conflict(
+    headers: &BTreeMap<String, String>,
+    injected_name: &str,
+) -> anyhow::Result<()> {
+    if headers
+        .keys()
+        .any(|name| name.eq_ignore_ascii_case(injected_name))
+    {
+        bail!("fetch request already contains injected header");
     }
     Ok(())
 }
@@ -675,6 +762,16 @@ fn validate_header_name(name: &str) -> anyhow::Result<()> {
 fn validate_query_name(name: &str) -> anyhow::Result<()> {
     if name.is_empty() || name.contains('\r') || name.contains('\n') {
         bail!("invalid fetch query parameter name");
+    }
+    Ok(())
+}
+
+fn reject_query_conflict(url: &Url, injected_name: &str) -> anyhow::Result<()> {
+    if url
+        .query_pairs()
+        .any(|(name, _)| name.as_ref() == injected_name)
+    {
+        bail!("fetch request already contains injected query parameter");
     }
     Ok(())
 }

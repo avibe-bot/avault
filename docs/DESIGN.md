@@ -501,6 +501,7 @@ The legacy single-secret form remains available:
   "request": {
     "method": "GET",
     "url": "https://api.github.com/user",
+    "allowed_hosts": ["api.github.com"],
     "headers": { "Accept": "application/json" },
     "body": null,
     "inject": { "type": "bearer" }
@@ -510,10 +511,14 @@ The legacy single-secret form remains available:
 
 `inject` defaults to `{"type":"bearer"}` and sets `Authorization: Bearer <secret>`.
 Custom header and query forms are `{"type":"header","name":"X-Api-Key"}` and
-`{"type":"query","name":"api_key"}`. The URL is validated before decrypting:
-`https` is required except for loopback `http`, and `TRACE` / `TRACK` / `CONNECT`
-are rejected because they can echo credentials. Output is JSON:
-`{"status":200,"headers":{...},"body":"..."}`. Fetch uses bounded connect,
+`{"type":"query","name":"api_key"}`. `allowed_hosts` is required and must contain
+the URL host (case-insensitive); loopback hosts are only allowed when explicitly
+listed. The URL is validated before decrypting: `https` is required except for
+loopback `http`, and `TRACE` / `TRACK` / `CONNECT` are rejected because they can
+echo credentials. Conflicting injected headers/query parameters are rejected
+before the secret is opened. Header credentials trim one trailing CR or LF, then
+reject remaining HTTP control bytes before ureq receives a header copy. Output is
+JSON: `{"status":200,"headers":{...},"body":"..."}`. Fetch uses bounded connect,
 read, write, and overall timeouts; transport errors are sanitized so injected
 credentials cannot appear in stderr, and the response body is capped.
 
