@@ -338,12 +338,14 @@ The blind box assumes the browser gets `avault`'s **genuine** public key. A full
 - `resolve_cli_path("avault")` on `PATH`; config `agents.avault.cli_path`.
 - `avault_status()` → installed / version / path, shown as a Settings · Dependencies card.
 
-**Distribution — recommend the Show-Runtime model over `askill`'s `curl | sh`.** A custody binary is version-sensitive (client/agent must match; `vt`'s own README warns about lockstep upgrades). So ship **per-platform prebuilt `avault` binaries bundled in the wheel + a manifest, version-locked to the avibe release** (exactly how Show Runtime ships its `*.tgz`), rather than a floating `curl | sh`. The integration touchpoint stays identical; the distribution is safer.
+**Distribution — decided: a real manifest-pinned release pipeline (not `askill`'s `curl | sh`).** A custody binary is version-sensitive (client/agent must match), so it ships like Show Runtime: per-platform prebuilt `avault` binaries attached to the avibe release, **version-pinned by a manifest**; `vibe runtime prepare` downloads the right platform asset, verifies its checksum, and installs it. Build the full delivery path **stub-first** (wire avibe → download → `PATH` → Settings card against the current stub binary), then implement the crypto behind it — no throwaway dev installer. Targets: `macos-arm64` + `linux-x64` first; **macOS code-signing / notarization is an explicit pipeline sub-task**. The avault repo owns building/releasing the binaries; avibe pins the compatible version.
 
-**Two run modes (same binary):**
+**Two run modes (same binary) — and which is safer:**
 
-1. **CLI one-shot (P1):** the daemon spawns `avault seal/open/...`; it reads the master key, uses it, wipes it on `Drop`, exits. The common path is `askill`-shaped, and the per-op window already gets Rust hygiene.
-2. **Resident agent (P2):** `avault agent` listens on a unix socket, holds the grant DEK-set for the TTL, and is the signing oracle. The daemon authorizes via `SO_PEERCRED`. Only grant-caching and signing pay this cost.
+1. **CLI one-shot (P1):** the daemon spawns `avault seal/open/...`; it reads the master key, uses it, wipes it on `Drop`, exits. **This is the more conservative transport** — no listening endpoint to defend, and the key is in memory only for the op (a tiny window).
+2. **Resident agent (P2):** `avault agent` listens on a unix socket, holds the grant DEK-set for its TTL, and is the signing oracle. It is **strictly more exposed** (a long-lived key in memory + a socket to defend), so it is used only where cross-call state is required (grant DEK-cache, signing). Harden it: short **idle-timeout zeroize**, cache **DEKs not the master 24/7** (read the master transiently to unwrap, then wipe), `mlock` + no-coredump, and `SO_PEERCRED` / `LOCAL_PEERCRED` peer-uid auth (no shared token).
+
+Peer-cred gates *other users* and remote, not a same-uid process — which is correct, because the standard tier's boundary is the OS account anyway (§4.1). Same-uid misuse is bounded by the narrow interface (no `decrypt → plaintext`), full audit, hardware non-extractability, and — for high-value secrets — the protected tier (cryptographic enforcement, not caller-auth).
 
 **Ingest without Python reading plaintext:** for the CLI `set` path, pass stdin's **file descriptor** straight to the `avault` subprocess (Python never `read()`s the bytes). For the web path, the browser uses the blind box (§7.1).
 
@@ -351,10 +353,11 @@ The blind box assumes the browser gets `avault`'s **genuine** public key. A full
 
 ## 13. Cross-platform key stores
 
-`avault-store` selects the strongest local store available:
+`avault-store` selects the strongest local store available. Order (strongest first):
 
-- **P1:** `file + mlock` (0600) — works headless, on Linux, and on macOS. Universal baseline.
-- **Later, as factors / stronger roots:** macOS **Keychain / Secure Enclave**, Linux **TPM** (seal/unseal, optional PCR/auth binding), cloud **KMS** KEK. These raise standard-tier strength (non-extractable keys) and can serve as protected-tier factors on the machine for the no-browser case.
+- **Hardware / cloud (strongest roots):** macOS **Keychain / Secure Enclave**, Linux **TPM 2.0** (seal/unseal, optional PCR/auth binding), cloud **KMS** KEK. Non-extractable keys; can also serve as protected-tier factors on the machine for the no-browser case. Best for servers that must **auto-restart unattended**.
+- **`file + passphrase` (P2 — the cloud/no-hardware sweet spot):** wrap the master key under a KEK derived from an operator passphrase (`scrypt` / Argon2id); store only `wrapped_master`, so **the plaintext master never touches disk**. Unlock **once at startup** (passphrase via stdin) into `mlock`'d memory. Same "wrap the root under a factor-KEK" idea as the protected-tier VMK, applied to the standard master. *Honest limits:* it defends **at-rest** (stolen disk / leaked backup / same-uid file read are useless without the passphrase) but **not the running machine** (after unlock the master is in memory); and it needs a human passphrase **per restart**, trading fully-unattended auto-restart for at-rest safety. Pairs with the resident agent (unlock once, hold in memory) or, for one-shot CLI on Linux, the **kernel keyring** (hold the unwrapped master between invocations; cleared on reboot).
+- **`file + mlock` (0600) — P1 baseline / floor:** works headless on Linux and macOS. At-rest the key file is **plaintext** (protected only by the OS account + `mlock` / no-coredump), so it is the floor, not a strong at-rest guarantee.
 
 This is an internal store selection inside `avault`, not an Avibe-level plugin layer.
 
@@ -362,7 +365,7 @@ This is an internal store selection inside `avault`, not an Avibe-level plugin l
 
 ## 14. Project shape
 
-- **Repo:** `avibe-bot/avault` (name provisional — see §16).
+- **Repo:** `avibe-bot/avault` (name settled — see §16).
 - **Cargo workspace:**
 
   ```
@@ -391,13 +394,15 @@ This is an internal store selection inside `avault`, not an Avibe-level plugin l
 
 ---
 
-## 16. Open decisions
+## 16. Decisions (settled 2026-06-25)
 
-1. **Name:** `avault` / `avibe-custody` / other?
-2. **Envelope:** keep `wrap_meta` / `wrapped_dek` (cheap rotation, no DB break — recommended) vs `vt`'s pure-derive?
-3. **Distribution:** bundled-in-wheel + manifest, version-locked (recommended) vs `askill`-style `curl | sh`?
-4. **P1 = CLI-only first?** (recommended yes.)
-5. **Protected-tier pubkey trust:** pinning vs attestation mechanism for `avault`'s public key.
+1. **Name → `avault`.** Short, ownable; already the repo / binary / crate prefix. Not published to crates.io, so no registry-name collision concern.
+2. **Envelope → wrapped_dek (Scheme A).** Random per-record DEK, wrapped under the root (master / VMK); store `wrapped_dek`. Cheap rotation (re-wrap, never re-encrypt), no DB break, and it unifies the standard + protected envelopes. The protected tier extends it with **N `wrapped_vmk` factor-copies** (password via `scrypt`, passkey via WebAuthn-PRF, second device, recovery code) — **any one factor unlocks the same random VMK**, and add / remove / change-password is a re-wrap of the VMK, not a re-encrypt of data. The only "derive" is *factor → KEK*; the DEK and VMK are random and wrapped. (Rejected: `vt`'s pure-derive — forces full re-encrypt on rotation and a second envelope format.)
+3. **Distribution → a real manifest-pinned release pipeline**, version-locked to the avibe release (Show-Runtime model); build the full path **stub-first**; targets `macos-arm64` + `linux-x64`; macOS signing/notarization is an explicit sub-task. (Rejected: `curl | sh` and any throwaway dev installer.)
+4. **P1 scope → standard-tier CLI core.** In: `avault-core` seal/open (AES-256-GCM + wrapped_dek + AAD), `avault-store` `file+mlock`, `avault-cli` (`seal` via stdin, `deliver run`, `key export/import`), the stub-first delivery pipeline, and the avibe-side wiring (route `vault_crypto.py`'s standard value path through avault; `vault_secrets` stays the metadata source of truth). Out → P2: resident agent, scope grants + approval-card UX, signing, the protected tier, hardware/passphrase stores, `fetch`/`inject`. The standard-create transient-plaintext-in-Python residual stays in P1 (§11.3); the blind box eliminates it in P2.
+5. **Protected-tier pubkey trust → deferred to P2** (the protected tier itself is P2). Lean **attest** (sign the ephemeral X25519 pubkey with an identity key the browser already trusts) — it pairs with the ephemeral-keypair choice and defeats first-use MITM; interim **pin** (TOFU) is acceptable. Not on the P1 path.
+6. **Transport safety → CLI is the conservative default (P1); the resident agent (P2) is a deliberate, hardened tradeoff.** CLI has no listening surface and a tiny key-in-memory window. The agent (for grant-cache + signing only) is more exposed → idle-timeout zeroize, cache DEKs not the master 24/7, `mlock` + no-coredump, peer-cred auth. See §12.
+7. **Master-key store on no-hardware hosts → add `file + passphrase`** (passphrase-wrapped master, unlock once at startup; plaintext never on disk). The cloud/no-TPM sweet spot; defends at-rest, not the running machine; P2, pairs with the agent or the Linux kernel keyring. See §13.
 
 ---
 
@@ -408,6 +413,8 @@ This is an internal store selection inside `avault`, not an Avibe-level plugin l
 - **Standard tier ≠ machine-compromise resistance** — it is at-rest + use-gating + no-LLM-exposure, not "safe if the box is owned" (§4.1).
 - **Browser JS hygiene** is best-effort (wipeable typed arrays, non-extractable WebCrypto keys), not a secure enclave; exposure is one operation while the user is present (§8.3).
 - **secp256k1 is not hardware-backed** on Apple SE / passkeys — software key + hardware unlock factor; true hardware custody needs an external wallet (§8.3).
+- **`file + passphrase` defends at-rest, not the running machine** — after the startup unlock the master is in memory; and it needs a passphrase per restart (trades unattended auto-restart for at-rest safety). For fully-unattended servers use TPM/KMS (§13).
+- **The resident agent (P2) widens exposure** vs the one-shot CLI (long-lived key in memory + a socket); mitigated by idle-timeout zeroize, DEK-not-master residency, mlock/no-dump, peer-cred auth (§12).
 
 ---
 
