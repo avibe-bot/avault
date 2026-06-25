@@ -3,7 +3,7 @@
 //! P1 is a one-shot CLI: control via argv/JSON, bulk blobs via stdin, results via stdout.
 //! P2 keeps `pubkey`, `sign`, and `agent` as stubs.
 
-use anyhow::{bail, Context};
+use anyhow::{anyhow, bail, Context};
 use avault_core::{ExportBlob, Sealed};
 use avault_store::{Backend, FileStore};
 use serde::{Deserialize, Serialize};
@@ -17,12 +17,16 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
+use std::time::Duration;
 use url::{Host, Url};
 use zeroize::{Zeroize, Zeroizing};
 
 const MAX_STDIN_SECRET_BYTES: usize = 1024 * 1024;
 const MAX_STDIN_ENVELOPE_BYTES: usize = 2 * 1024 * 1024;
 const STDIN_READ_CHUNK_BYTES: usize = 8192;
+const FETCH_CONNECT_TIMEOUT_SECS: u64 = 10;
+const FETCH_TOTAL_TIMEOUT_SECS: u64 = 30;
+const MAX_FETCH_BODY_BYTES: usize = 8 * 1024 * 1024;
 
 const USAGE: &str = "\
 avault — Avibe Vaults custody core
@@ -32,7 +36,6 @@ USAGE:
     avault deliver run --name NAME --env VAR [--envelope-file PATH] -- COMMAND [ARGS...]
     avault deliver run -- COMMAND [ARGS...] < run-secrets.json
     avault deliver fetch < fetch-request.json
-    avault deliver export < export-secrets.json
     avault deliver inject < inject-request.json
     avault key export
     avault key import [--force]
@@ -104,7 +107,6 @@ fn deliver_cmd(args: &[OsString]) -> anyhow::Result<u8> {
     match subcmd {
         "run" => deliver_run_cmd(&args[1..]),
         "fetch" => deliver_fetch_cmd(&args[1..]),
-        "export" => deliver_export_cmd(&args[1..]),
         "inject" => deliver_inject_cmd(&args[1..]),
         other => bail!("unknown deliver subcommand: {other}"),
     }
@@ -153,8 +155,6 @@ struct NamedSecretInput {
     name: String,
     #[serde(default)]
     env: Option<String>,
-    #[serde(default)]
-    export: Option<String>,
     #[serde(default)]
     key: Option<String>,
     envelope: Sealed,
@@ -358,8 +358,14 @@ fn perform_fetch(
     is_loopback: bool,
 ) -> anyhow::Result<FetchOutput> {
     let method = method.to_ascii_uppercase();
+    let connect_timeout = Duration::from_secs(FETCH_CONNECT_TIMEOUT_SECS);
+    let total_timeout = Duration::from_secs(FETCH_TOTAL_TIMEOUT_SECS);
     let agent = ureq::AgentBuilder::new()
         .redirects(0)
+        .timeout_connect(connect_timeout)
+        .timeout_read(total_timeout)
+        .timeout_write(total_timeout)
+        .timeout(total_timeout)
         .try_proxy_from_env(!is_loopback)
         .build();
     let mut request = agent.request(&method, url.as_str());
@@ -382,7 +388,11 @@ fn perform_fetch(
     let response = match response {
         Ok(response) => response,
         Err(ureq::Error::Status(_, response)) => response,
-        Err(err) => return Err(err).context("HTTP transport failed"),
+        Err(ureq::Error::Transport(err)) => {
+            let kind = err.kind();
+            drop(err);
+            return Err(anyhow!("HTTP transport failed: {kind}"));
+        }
     };
 
     let status = response.status();
@@ -392,9 +402,7 @@ fn perform_fetch(
             response_headers.insert(name, value.to_string());
         }
     }
-    let body = response
-        .into_string()
-        .context("failed to read response body as UTF-8")?;
+    let body = read_capped_fetch_body(response)?;
     Ok(FetchOutput {
         status,
         headers: response_headers,
@@ -402,38 +410,18 @@ fn perform_fetch(
     })
 }
 
-fn deliver_export_cmd(args: &[OsString]) -> anyhow::Result<u8> {
-    if !args.is_empty() {
-        bail!("deliver export reads its JSON array from stdin and takes no options");
+fn read_capped_fetch_body(response: ureq::Response) -> anyhow::Result<String> {
+    let mut reader = response
+        .into_reader()
+        .take((MAX_FETCH_BODY_BYTES as u64) + 1);
+    let mut body = Vec::new();
+    reader
+        .read_to_end(&mut body)
+        .map_err(|_| anyhow!("failed to read fetch response body"))?;
+    if body.len() > MAX_FETCH_BODY_BYTES {
+        bail!("fetch response body exceeds size limit");
     }
-
-    let input = read_json_stdin("failed to read deliver export JSON from stdin")?;
-    let secrets: Vec<NamedSecretInput> =
-        serde_json::from_slice(input.as_slice()).context("deliver export JSON is invalid")?;
-    if secrets.is_empty() {
-        bail!("deliver export requires at least one secret");
-    }
-
-    let mut opened = open_named_secrets(secrets, DeliveryTarget::Export)?;
-    let mut out = Zeroizing::new(Vec::new());
-    for secret in &opened {
-        validate_shell_name(&secret.name, "export name")?;
-        let value = secret_utf8(secret.plaintext.as_slice(), "export value")?;
-        write!(out, "export {}=", secret.name).context("failed to render export line")?;
-        write_shell_quoted(&mut out, value).context("failed to render export line")?;
-        out.push(b'\n');
-    }
-    opened.zeroize();
-    drop(opened);
-
-    io::stdout()
-        .write_all(out.as_slice())
-        .context("failed to write export lines")?;
-    io::stdout()
-        .flush()
-        .context("failed to flush export lines")?;
-    out.zeroize();
-    Ok(0)
+    String::from_utf8(body).map_err(|_| anyhow!("fetch response body is not valid UTF-8"))
 }
 
 fn deliver_inject_cmd(args: &[OsString]) -> anyhow::Result<u8> {
@@ -452,7 +440,7 @@ fn deliver_inject_cmd(args: &[OsString]) -> anyhow::Result<u8> {
         bail!("deliver inject format is not implemented in P1.1");
     }
 
-    let mut opened = open_named_secrets(inject.secrets, DeliveryTarget::Inject)?;
+    let mut opened = open_named_secrets(inject.secrets)?;
     let mut rendered = render_inject_file(&opened, &format)?;
     opened.zeroize();
     drop(opened);
@@ -463,29 +451,15 @@ fn deliver_inject_cmd(args: &[OsString]) -> anyhow::Result<u8> {
     Ok(0)
 }
 
-enum DeliveryTarget {
-    Export,
-    Inject,
-}
-
-fn open_named_secrets(
-    secrets: Vec<NamedSecretInput>,
-    target: DeliveryTarget,
-) -> anyhow::Result<Vec<OpenedSecret>> {
+fn open_named_secrets(secrets: Vec<NamedSecretInput>) -> anyhow::Result<Vec<OpenedSecret>> {
     let master = avault_store::load_master_key(Backend::File)?;
     let mut opened = Vec::with_capacity(secrets.len());
     let mut seen = BTreeSet::new();
     for secret in secrets {
-        let target_name = match target {
-            DeliveryTarget::Export => secret
-                .export
-                .or(secret.env)
-                .unwrap_or_else(|| secret.name.clone()),
-            DeliveryTarget::Inject => secret
-                .key
-                .or(secret.env)
-                .unwrap_or_else(|| secret.name.clone()),
-        };
+        let target_name = secret
+            .key
+            .or(secret.env)
+            .unwrap_or_else(|| secret.name.clone());
         validate_shell_name(&target_name, "secret target name")?;
         if !seen.insert(target_name.clone()) {
             bail!("duplicate secret target name");

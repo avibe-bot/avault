@@ -34,7 +34,6 @@ avault deliver run --name OPENAI_API_KEY --env OPENAI_API_KEY -- env
 avault deliver run --name OPENAI_API_KEY --env OPENAI_API_KEY --envelope-file envelope.json -- env
 avault deliver run -- env < run-secrets.json
 avault deliver fetch < fetch-request.json
-avault deliver export < export-secrets.json
 avault deliver inject < inject-request.json
 avault key export < passphrase.txt
 avault key import [--force] < import-request.json
@@ -89,11 +88,10 @@ one child with all env vars:
 `inject` defaults to bearer auth; custom forms are
 `{"type":"header","name":"X-Api-Key"}` and `{"type":"query","name":"api_key"}`.
 Output is response JSON `{status, headers, body}`. `https` is required except
-for loopback `http`, and unsafe echo methods are rejected before decrypting.
+for loopback `http`, unsafe echo methods are rejected before decrypting, transport
+errors are sanitized, and the response body is capped.
 
-`deliver export` accepts the same array shape as `run`; use `export` or `env` for
-the shell variable name. It writes POSIX shell-quoted `export NAME='value'` lines
-to inherited stdout. `deliver inject` accepts:
+`deliver inject` accepts:
 
 ```json
 {
@@ -153,7 +151,7 @@ cargo clippy --all-targets
 ## Roadmap
 
 - **P1** — `avault-core` + CLI + `file+mlock` store; Rust takes the standard-tier seal/open. Closes the Python memory-hygiene gap.
-- **P1.1** — complete standard-tier delivery: multi-secret run, brokered fetch, shell export, and atomic dotenv/json inject.
+- **P1.1** — complete standard-tier delivery: multi-secret run, brokered fetch, and atomic dotenv/json inject.
 - **P2** — resident agent + `SO_PEERCRED` + scope-grant DEK cache + secp256k1 signer; hardware-store backends.
 - **P3** — multi-factor (passkey-PRF, TPM, KMS); external signer (hardware wallet / WalletConnect).
 

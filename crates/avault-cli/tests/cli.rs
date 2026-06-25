@@ -453,33 +453,94 @@ fn deliver_fetch_rejects_plaintext_non_loopback_before_opening() {
 }
 
 #[test]
-fn deliver_export_emits_shell_export_lines() {
+fn deliver_fetch_sanitizes_transport_errors_after_query_injection() {
     let home = tempfile::tempdir().unwrap();
-    let sealed = seal_secret(home.path(), "OPENAI_API_KEY", b"sk-with space&special");
-    let request = json!([
-        {"name": "OPENAI_API_KEY", "export": "API_KEY", "envelope": sealed}
-    ]);
+    let sealed = seal_secret(home.path(), "API_TOKEN", b"token-123");
+    let port = {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let request = json!({
+        "name": "API_TOKEN",
+        "envelope": sealed,
+        "request": {
+            "method": "GET",
+            "url": format!("http://127.0.0.1:{}/resource", port),
+            "inject": {"type": "query", "name": "api_key"}
+        }
+    });
 
-    let mut export = avault()
+    let mut fetch = avault()
         .arg("deliver")
-        .arg("export")
+        .arg("fetch")
         .env("AVAULT_HOME", home.path())
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    export
+    fetch
         .stdin
         .as_mut()
         .unwrap()
         .write_all(request.to_string().as_bytes())
         .unwrap();
-    let output = export.wait_with_output().unwrap();
-    assert!(output.status.success());
-    assert_eq!(
-        String::from_utf8(output.stdout).unwrap(),
-        "export API_KEY='sk-with space&special'\n"
-    );
+    let output = fetch.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(70));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("HTTP transport failed"));
+    assert!(!stderr.contains("token-123"));
+    assert!(!stderr.contains("api_key"));
+    assert!(!stderr.contains("127.0.0.1"));
+    assert!(!stderr.contains("/resource"));
+}
+
+#[test]
+fn deliver_fetch_rejects_oversized_response_body() {
+    let home = tempfile::tempdir().unwrap();
+    let sealed = seal_secret(home.path(), "API_TOKEN", b"token-123");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = stream.read(&mut buf).unwrap();
+        let body_len = 8 * 1024 * 1024 + 1;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {body_len}\r\n\r\n"
+        )
+        .unwrap();
+        stream.write_all(&vec![b'a'; body_len]).unwrap();
+    });
+    let request = json!({
+        "name": "API_TOKEN",
+        "envelope": sealed,
+        "request": {
+            "method": "GET",
+            "url": format!("http://127.0.0.1:{}/large", addr.port())
+        }
+    });
+
+    let mut fetch = avault()
+        .arg("deliver")
+        .arg("fetch")
+        .env("AVAULT_HOME", home.path())
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    fetch
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let output = fetch.wait_with_output().unwrap();
+    server.join().unwrap();
+    assert_eq!(output.status.code(), Some(70));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("response body exceeds size limit"));
+    assert!(!stderr.contains("token-123"));
 }
 
 #[test]
@@ -582,30 +643,6 @@ fn p0_no_aad_blob_opens_via_new_delivery_paths() {
         .write_all(run_request.to_string().as_bytes())
         .unwrap();
     assert!(run.wait().unwrap().success());
-
-    let export_request = json!([
-        {"name": "OPENAI_API_KEY", "export": "OPENAI_API_KEY", "envelope": sealed.clone()}
-    ]);
-    let mut export = avault()
-        .arg("deliver")
-        .arg("export")
-        .env("AVAULT_HOME", home.path())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    export
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(export_request.to_string().as_bytes())
-        .unwrap();
-    let output = export.wait_with_output().unwrap();
-    assert!(output.status.success());
-    assert_eq!(
-        String::from_utf8(output.stdout).unwrap(),
-        "export OPENAI_API_KEY='p0-python-value'\n"
-    );
 
     let inject_path = home.path().join("p0.env");
     let inject_request = json!({
