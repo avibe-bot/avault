@@ -1,0 +1,328 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target_name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target_name: macos-arm64
+            rust_target: aarch64-apple-darwin
+            os: macos-15
+            binary: avault
+          - target_name: linux-x64
+            rust_target: x86_64-unknown-linux-musl
+            os: ubuntu-22.04
+            binary: avault
+
+    steps:
+      - name: Check out repository
+        # Pinned from actions/checkout@v4.
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+
+      - name: Verify tag is reachable from master
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin master
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/master; then
+            echo "::error::Release tag ${GITHUB_REF_NAME} (${GITHUB_SHA}) is not reachable from origin/master."
+            echo "::error::Merge the release commit to master before pushing a v* tag."
+            exit 1
+          fi
+
+      - name: Cache cargo registry and build artifacts
+        # Pinned from actions/cache@v4.
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-${{ matrix.rust_target }}-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.rust_target }}-cargo-
+            ${{ runner.os }}-cargo-
+
+      - name: Install Rust target
+        run: rustup target add "${{ matrix.rust_target }}"
+
+      - name: Verify release tag matches crate version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          crate_version="$(
+            cargo metadata --no-deps --format-version 1 |
+              python3 -c 'import json, sys; data = json.load(sys.stdin); print(next(pkg["version"] for pkg in data["packages"] if pkg["name"] == "avault-cli"))'
+          )"
+          if [[ "$crate_version" != "$tag_version" ]]; then
+            echo "::error::Release tag v${tag_version} does not match avault-cli package version ${crate_version}."
+            echo "::error::Bump the workspace package version before tagging so the manifest and binary self-report the same version."
+            exit 1
+          fi
+
+      - name: Build release binary
+        run: cargo build --release --target "${{ matrix.rust_target }}" --bin avault
+
+      - name: Strip binary
+        run: strip "target/${{ matrix.rust_target }}/release/${{ matrix.binary }}"
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          asset="avault-${version}-${{ matrix.target_name }}"
+          mkdir -p "dist/${asset}"
+          cp "target/${{ matrix.rust_target }}/release/${{ matrix.binary }}" "dist/${asset}/avault"
+          tar -C "dist/${asset}" -czf "dist/${asset}.tar.gz" avault
+          (
+            cd dist
+            if command -v shasum >/dev/null 2>&1; then
+              shasum -a 256 "${asset}.tar.gz" > "${asset}.tar.gz.sha256"
+            else
+              sha256sum "${asset}.tar.gz" > "${asset}.tar.gz.sha256"
+            fi
+          )
+
+      - name: Upload unsigned macOS build artifact
+        if: matrix.target_name == 'macos-arm64'
+        # Pinned from actions/upload-artifact@v4.
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: unsigned-macos-arm64
+          path: |
+            dist/avault-*.tar.gz
+            dist/avault-*.tar.gz.sha256
+          if-no-files-found: error
+
+      - name: Upload Linux release artifact
+        if: matrix.target_name == 'linux-x64'
+        # Pinned from actions/upload-artifact@v4.
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: avault-linux-x64
+          path: |
+            dist/avault-*.tar.gz
+            dist/avault-*.tar.gz.sha256
+          if-no-files-found: error
+
+  macos-artifact:
+    name: Prepare macOS artifact
+    runs-on: macos-15
+    needs: build
+    permissions:
+      contents: read
+
+    steps:
+      - name: Download unsigned macOS artifact
+        # Pinned from actions/download-artifact@v4.
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: unsigned-macos-arm64
+          path: unsigned-macos
+
+      - name: Verify and unpack unsigned macOS artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          asset="avault-${version}-macos-arm64"
+          (
+            cd unsigned-macos
+            shasum -a 256 -c "${asset}.tar.gz.sha256"
+          )
+          mkdir -p "dist/${asset}"
+          tar -C "dist/${asset}" -xzf "unsigned-macos/${asset}.tar.gz"
+
+      - name: Check macOS signing secrets
+        id: macos_signing_secrets
+        env:
+          APPLE_CODESIGN_CERTIFICATE_P12: ${{ secrets.APPLE_CODESIGN_CERTIFICATE_P12 }}
+          APPLE_CODESIGN_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CODESIGN_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${APPLE_CODESIGN_CERTIFICATE_P12}" &&
+                -n "${APPLE_CODESIGN_CERTIFICATE_PASSWORD}" &&
+                -n "${APPLE_SIGNING_IDENTITY}" &&
+                -n "${APPLE_ID}" &&
+                -n "${APPLE_TEAM_ID}" &&
+                -n "${APPLE_APP_SPECIFIC_PASSWORD}" ]]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Sign and notarize macOS binary
+        if: steps.macos_signing_secrets.outputs.available == 'true'
+        env:
+          APPLE_CODESIGN_CERTIFICATE_P12: ${{ secrets.APPLE_CODESIGN_CERTIFICATE_P12 }}
+          APPLE_CODESIGN_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CODESIGN_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # TODO: Supply Apple Developer ID Application certs/secrets in the repo
+          # before relying on signed macOS artifacts in production. This separate
+          # fresh runner keeps Apple secrets out of the build job and intentionally
+          # skips signing when the APPLE_* secrets are absent.
+          version="${GITHUB_REF_NAME#v}"
+          asset="avault-${version}-macos-arm64"
+          binary_path="dist/${asset}/avault"
+          keychain_password="$(uuidgen)"
+          keychain_path="$RUNNER_TEMP/avault-signing.keychain-db"
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          security list-keychains -d user -s "$keychain_path"
+          security default-keychain -d user -s "$keychain_path"
+          python3 - <<'PY'
+          import base64
+          import os
+          from pathlib import Path
+
+          Path(os.environ["RUNNER_TEMP"], "certificate.p12").write_bytes(
+              base64.b64decode(os.environ["APPLE_CODESIGN_CERTIFICATE_P12"])
+          )
+          PY
+          security import "$RUNNER_TEMP/certificate.p12" \
+            -k "$keychain_path" \
+            -P "$APPLE_CODESIGN_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "$keychain_password" "$keychain_path"
+
+          codesign \
+            --force \
+            --timestamp \
+            --options runtime \
+            --sign "$APPLE_SIGNING_IDENTITY" \
+            "$binary_path"
+
+          ditto -c -k --keepParent \
+            "$binary_path" \
+            "$RUNNER_TEMP/avault-notarize.zip"
+
+          xcrun notarytool submit "$RUNNER_TEMP/avault-notarize.zip" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --wait
+
+      - name: Report unsigned macOS artifact
+        if: steps.macos_signing_secrets.outputs.available == 'false'
+        run: echo "::notice::APPLE_* secrets are incomplete; publishing unsigned macOS artifact."
+
+      - name: Package macOS artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          asset="avault-${version}-macos-arm64"
+          mkdir -p dist-final
+          tar -C "dist/${asset}" -czf "dist-final/${asset}.tar.gz" avault
+          (
+            cd dist-final
+            shasum -a 256 "${asset}.tar.gz" > "${asset}.tar.gz.sha256"
+          )
+
+      - name: Upload macOS release artifact
+        # Pinned from actions/upload-artifact@v4.
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: avault-macos-arm64
+          path: |
+            dist-final/avault-*.tar.gz
+            dist-final/avault-*.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs:
+      - build
+      - macos-artifact
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download packaged artifacts
+        # Pinned from actions/download-artifact@v4.
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: avault-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          version = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          dist = Path("dist")
+          targets = {}
+
+          for target in ("macos-arm64", "linux-x64"):
+              asset = f"avault-{version}-{target}.tar.gz"
+              sha_path = dist / f"{asset}.sha256"
+              digest = sha_path.read_text(encoding="utf-8").split()[0]
+              targets[target] = {
+                  "asset": asset,
+                  "sha256": digest,
+              }
+
+          manifest = {
+              "schema_version": 1,
+              "versions": {
+                  version: targets,
+              },
+          }
+          (dist / "manifest.json").write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Create GitHub Release
+        # Pinned from softprops/action-gh-release@v2.
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: avault ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            dist/avault-*.tar.gz
+            dist/avault-*.tar.gz.sha256
+            dist/manifest.json
