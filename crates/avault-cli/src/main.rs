@@ -3,19 +3,30 @@
 //! P1 is a one-shot CLI: control via argv/JSON, bulk blobs via stdin, results via stdout.
 //! P2 keeps `pubkey`, `sign`, and `agent` as stubs.
 
-use anyhow::{bail, Context};
+use anyhow::{anyhow, bail, Context};
 use avault_core::{ExportBlob, Sealed};
 use avault_store::{Backend, FileStore};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsString;
-use std::fs;
-use std::io::{self, Read};
-use std::process::{Command, ExitCode, Stdio};
+use std::fs::{self, File};
+use std::io::{self, Read, Write};
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitCode, ExitStatus, Stdio};
+use std::time::Duration;
+use url::{Host, Url};
 use zeroize::{Zeroize, Zeroizing};
 
 const MAX_STDIN_SECRET_BYTES: usize = 1024 * 1024;
 const MAX_STDIN_ENVELOPE_BYTES: usize = 2 * 1024 * 1024;
 const STDIN_READ_CHUNK_BYTES: usize = 8192;
+const FETCH_CONNECT_TIMEOUT_SECS: u64 = 10;
+const FETCH_TOTAL_TIMEOUT_SECS: u64 = 30;
+const MAX_FETCH_BODY_BYTES: usize = 8 * 1024 * 1024;
 
 const USAGE: &str = "\
 avault — Avibe Vaults custody core
@@ -23,11 +34,15 @@ avault — Avibe Vaults custody core
 USAGE:
     avault seal --name NAME
     avault deliver run --name NAME --env VAR [--envelope-file PATH] -- COMMAND [ARGS...]
+    avault deliver run -- COMMAND [ARGS...] < run-secrets.json
+    avault deliver fetch < fetch-request.json
+    avault deliver inject < inject-request.json
     avault key export
     avault key import [--force]
     avault version
 
 P1 reads secret values, envelopes, and passphrases from stdin. Plaintext never belongs in argv.
+deliver fetch requires request.allowed_hosts before attaching a credential.
 P2 stubs: pubkey, sign, agent.
 ";
 
@@ -92,7 +107,8 @@ fn deliver_cmd(args: &[OsString]) -> anyhow::Result<u8> {
     };
     match subcmd {
         "run" => deliver_run_cmd(&args[1..]),
-        "fetch" | "inject" => bail!("deliver {subcmd} is a P2 stub and is not implemented in P1"),
+        "fetch" => deliver_fetch_cmd(&args[1..]),
+        "inject" => deliver_inject_cmd(&args[1..]),
         other => bail!("unknown deliver subcommand: {other}"),
     }
 }
@@ -108,31 +124,121 @@ fn deliver_run_cmd(args: &[OsString]) -> anyhow::Result<u8> {
         bail!("deliver run requires a command");
     }
 
-    let run_options = parse_deliver_run_options(options)?;
-    let name = run_options.name;
-    let env_name = run_options.env_name;
-    let envelope_file = run_options.envelope_file;
-    if env_name.contains('=') || env_name.is_empty() {
-        bail!("invalid env var name");
+    if options.is_empty() {
+        let input = read_json_stdin("failed to read deliver run JSON from stdin")?;
+        let secrets: Vec<EnvSecretInput> =
+            serde_json::from_slice(input.as_slice()).context("deliver run JSON is invalid")?;
+        run_child_with_secret_env(command, secrets, true)
+    } else {
+        let run_options = parse_deliver_run_options(options)?;
+        let envelope_stdin = run_options.envelope_file.is_none();
+        let envelope = read_envelope(run_options.envelope_file.as_deref())?;
+        let sealed: Sealed =
+            serde_json::from_slice(envelope.as_slice()).context("envelope JSON is invalid")?;
+        let secrets = vec![EnvSecretInput {
+            name: run_options.name,
+            env: run_options.env_name,
+            envelope: sealed,
+        }];
+        run_child_with_secret_env(command, secrets, envelope_stdin)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct EnvSecretInput {
+    name: String,
+    env: String,
+    envelope: Sealed,
+}
+
+#[derive(Debug, Deserialize)]
+struct NamedSecretInput {
+    name: String,
+    #[serde(default)]
+    env: Option<String>,
+    #[serde(default)]
+    key: Option<String>,
+    envelope: Sealed,
+}
+
+#[derive(Debug, Deserialize)]
+struct FetchInput {
+    name: String,
+    envelope: Sealed,
+    request: FetchRequest,
+}
+
+#[derive(Debug, Deserialize)]
+struct FetchRequest {
+    method: String,
+    url: String,
+    #[serde(default)]
+    allowed_hosts: Vec<String>,
+    #[serde(default)]
+    headers: BTreeMap<String, String>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default = "default_fetch_inject")]
+    inject: FetchInject,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum FetchInject {
+    Bearer,
+    Header { name: String },
+    Query { name: String },
+}
+
+#[derive(Debug, Serialize)]
+struct FetchOutput {
+    status: u16,
+    headers: BTreeMap<String, String>,
+    body: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct InjectInput {
+    path: PathBuf,
+    #[serde(default = "default_inject_format")]
+    format: String,
+    secrets: Vec<NamedSecretInput>,
+}
+
+struct OpenedSecret {
+    name: String,
+    plaintext: Zeroizing<Vec<u8>>,
+}
+
+fn default_fetch_inject() -> FetchInject {
+    FetchInject::Bearer
+}
+
+fn default_inject_format() -> String {
+    "dotenv".to_string()
+}
+
+fn run_child_with_secret_env(
+    command: &[OsString],
+    secrets: Vec<EnvSecretInput>,
+    envelope_stdin: bool,
+) -> anyhow::Result<u8> {
+    if secrets.is_empty() {
+        bail!("deliver run requires at least one secret");
     }
 
-    let envelope_stdin = envelope_file.is_none();
-    let envelope = read_envelope(envelope_file.as_deref())?;
-    let sealed: Sealed =
-        serde_json::from_slice(envelope.as_slice()).context("envelope JSON is invalid")?;
-    let master = avault_store::load_master_key(Backend::File)?;
-    let mut plaintext =
-        avault_core::open(master.as_bytes(), &name, &sealed).context("open failed")?;
-    drop(master);
-
+    let mut opened = open_env_secrets(secrets)?;
     let mut child = {
-        let env_value = std::str::from_utf8(plaintext.as_slice())
-            .context("secret value is not valid UTF-8 for env delivery")?;
         let mut child = Command::new(&command[0]);
-        // Accepted standard-tier residual: `Command::env` copies this value into std's
-        // process builder and then into the child's environment. Rust does not expose that
-        // buffer for zeroizing; the value is wiped from avault's owned buffer after spawn.
-        child.args(&command[1..]).env(&env_name, env_value);
+        child.args(&command[1..]);
+        for secret in &opened {
+            let env_value = std::str::from_utf8(secret.plaintext.as_slice())
+                .context("secret value is not valid UTF-8 for env delivery")?;
+            // Accepted standard-tier residual: `Command::env` copies this value into std's
+            // process builder and then into the child's environment. Rust does not expose that
+            // buffer for zeroizing; avault wipes its owned buffers immediately after spawn.
+            child.env(&secret.name, env_value);
+        }
         if envelope_stdin {
             child.stdin(Stdio::null());
         } else {
@@ -144,11 +250,542 @@ fn deliver_run_cmd(args: &[OsString]) -> anyhow::Result<u8> {
             .spawn()
             .context("failed to run child command")?
     };
-    plaintext.zeroize();
-    drop(plaintext);
-    let status = child.wait().context("failed to wait for child command")?;
+    opened.zeroize();
+    drop(opened);
 
-    Ok(status.code().unwrap_or(1).try_into().unwrap_or(1))
+    let status = child.wait().context("failed to wait for child command")?;
+    Ok(status_to_exit_code(status))
+}
+
+fn open_env_secrets(secrets: Vec<EnvSecretInput>) -> anyhow::Result<Vec<OpenedSecret>> {
+    let master = avault_store::load_master_key(Backend::File)?;
+    let mut opened = Vec::with_capacity(secrets.len());
+    let mut seen = BTreeSet::new();
+    for secret in secrets {
+        validate_shell_name(&secret.env, "env var name")?;
+        if !seen.insert(secret.env.clone()) {
+            bail!("duplicate env var name");
+        }
+        let plaintext = avault_core::open(master.as_bytes(), &secret.name, &secret.envelope)
+            .with_context(|| format!("open failed for {}", secret.name))?;
+        opened.push(OpenedSecret {
+            name: secret.env,
+            plaintext,
+        });
+    }
+    drop(master);
+    Ok(opened)
+}
+
+impl Zeroize for OpenedSecret {
+    fn zeroize(&mut self) {
+        self.plaintext.zeroize();
+    }
+}
+
+fn deliver_fetch_cmd(args: &[OsString]) -> anyhow::Result<u8> {
+    if !args.is_empty() {
+        bail!("deliver fetch reads its JSON request from stdin and takes no options");
+    }
+
+    let input = read_json_stdin("failed to read deliver fetch JSON from stdin")?;
+    let fetch: FetchInput =
+        serde_json::from_slice(input.as_slice()).context("deliver fetch JSON is invalid")?;
+    let url = Url::parse(&fetch.request.url).context("fetch url is invalid")?;
+    let is_loopback = is_loopback_url(&url);
+    validate_fetch_url(&url)?;
+    validate_allowed_fetch_host(&url, &fetch.request.allowed_hosts)?;
+    validate_fetch_method(&fetch.request.method)?;
+    for (name, value) in &fetch.request.headers {
+        validate_header(name, value)?;
+    }
+    match &fetch.request.inject {
+        FetchInject::Bearer => reject_header_conflict(&fetch.request.headers, "Authorization")?,
+        FetchInject::Header { name } => {
+            validate_header_name(name)?;
+            reject_header_conflict(&fetch.request.headers, name)?;
+        }
+        FetchInject::Query { name } => {
+            validate_query_name(name)?;
+            reject_query_conflict(&url, name)?;
+        }
+    }
+
+    let master = avault_store::load_master_key(Backend::File)?;
+    let mut secret = avault_core::open(master.as_bytes(), &fetch.name, &fetch.envelope)
+        .context("open failed")?;
+    drop(master);
+
+    let mut secret_header: Option<(String, Zeroizing<String>)> = None;
+    let mut target_url = Zeroizing::new(fetch.request.url.clone());
+    match &fetch.request.inject {
+        FetchInject::Bearer => {
+            let secret_text =
+                fetch_header_credential(secret.as_slice(), "fetch bearer credential")?;
+            let mut bearer =
+                Zeroizing::new(String::with_capacity("Bearer ".len() + secret_text.len()));
+            bearer.push_str("Bearer ");
+            bearer.push_str(secret_text);
+            secret_header = Some(("Authorization".to_string(), bearer));
+        }
+        FetchInject::Header { name } => {
+            let secret_text =
+                fetch_header_credential(secret.as_slice(), "fetch header credential")?;
+            secret_header = Some((name.clone(), Zeroizing::new(secret_text.to_string())));
+        }
+        FetchInject::Query { name } => {
+            let secret_text = secret_utf8(secret.as_slice(), "fetch query credential")?;
+            target_url = build_secret_query_url(&fetch.request.url, name, secret_text)?;
+        }
+    }
+    secret.zeroize();
+    drop(secret);
+
+    let output = perform_fetch(
+        &fetch.request.method,
+        &mut target_url,
+        &fetch.request.headers,
+        secret_header,
+        fetch.request.body,
+        is_loopback,
+    )
+    .context("fetch request failed")?;
+    let exit_code = if (200..=299).contains(&output.status) {
+        0
+    } else {
+        1
+    };
+    serde_json::to_writer(io::stdout(), &output).context("failed to write fetch response JSON")?;
+    println!();
+    Ok(exit_code)
+}
+
+fn perform_fetch(
+    method: &str,
+    url: &mut Zeroizing<String>,
+    headers: &BTreeMap<String, String>,
+    mut secret_header: Option<(String, Zeroizing<String>)>,
+    body: Option<String>,
+    is_loopback: bool,
+) -> anyhow::Result<FetchOutput> {
+    let method = method.to_ascii_uppercase();
+    let connect_timeout = Duration::from_secs(FETCH_CONNECT_TIMEOUT_SECS);
+    let total_timeout = Duration::from_secs(FETCH_TOTAL_TIMEOUT_SECS);
+    let agent = ureq::AgentBuilder::new()
+        .redirects(0)
+        .timeout_connect(connect_timeout)
+        .timeout_read(total_timeout)
+        .timeout_write(total_timeout)
+        .timeout(total_timeout)
+        .try_proxy_from_env(!is_loopback)
+        .build();
+    let mut request = agent.request(&method, url.as_str());
+    for (name, value) in headers {
+        request = request.set(name, value);
+    }
+    if let Some((name, value)) = secret_header.as_mut() {
+        // Accepted egress residual: ureq owns an internal header copy until the
+        // request is sent. avault wipes its owned copy immediately after building it.
+        request = request.set(name, value.as_str());
+        value.zeroize();
+    }
+    // For query-param injection, the request builder owns the egress URL copy now.
+    url.zeroize();
+
+    let response = match body {
+        Some(body) => request.send_string(&body),
+        None => request.call(),
+    };
+    let response = match response {
+        Ok(response) => response,
+        Err(ureq::Error::Status(_, response)) => response,
+        Err(ureq::Error::Transport(err)) => {
+            let kind = err.kind();
+            drop(err);
+            return Err(anyhow!("HTTP transport failed: {kind}"));
+        }
+    };
+
+    let status = response.status();
+    let mut response_headers = BTreeMap::new();
+    for name in response.headers_names() {
+        if let Some(value) = response.header(&name) {
+            response_headers.insert(name, value.to_string());
+        }
+    }
+    let body = read_capped_fetch_body(response)?;
+    Ok(FetchOutput {
+        status,
+        headers: response_headers,
+        body,
+    })
+}
+
+fn read_capped_fetch_body(response: ureq::Response) -> anyhow::Result<String> {
+    let mut reader = response
+        .into_reader()
+        .take((MAX_FETCH_BODY_BYTES as u64) + 1);
+    let mut body = Vec::new();
+    reader
+        .read_to_end(&mut body)
+        .map_err(|_| anyhow!("failed to read fetch response body"))?;
+    if body.len() > MAX_FETCH_BODY_BYTES {
+        bail!("fetch response body exceeds size limit");
+    }
+    String::from_utf8(body).map_err(|_| anyhow!("fetch response body is not valid UTF-8"))
+}
+
+fn deliver_inject_cmd(args: &[OsString]) -> anyhow::Result<u8> {
+    if !args.is_empty() {
+        bail!("deliver inject reads its JSON request from stdin and takes no options");
+    }
+
+    let input = read_json_stdin("failed to read deliver inject JSON from stdin")?;
+    let inject: InjectInput =
+        serde_json::from_slice(input.as_slice()).context("deliver inject JSON is invalid")?;
+    if inject.secrets.is_empty() {
+        bail!("deliver inject requires at least one secret");
+    }
+    let format = inject.format.to_ascii_lowercase();
+    if format != "dotenv" && format != "json" {
+        bail!("deliver inject format is not implemented in P1.1");
+    }
+
+    let mut opened = open_named_secrets(inject.secrets)?;
+    let mut rendered = render_inject_file(&opened, &format)?;
+    opened.zeroize();
+    drop(opened);
+
+    atomic_write_0600(&inject.path, rendered.as_slice()).context("failed to write inject file")?;
+    rendered.zeroize();
+    println!(r#"{{"ok":true}}"#);
+    Ok(0)
+}
+
+fn open_named_secrets(secrets: Vec<NamedSecretInput>) -> anyhow::Result<Vec<OpenedSecret>> {
+    let master = avault_store::load_master_key(Backend::File)?;
+    let mut opened = Vec::with_capacity(secrets.len());
+    let mut seen = BTreeSet::new();
+    for secret in secrets {
+        let target_name = secret
+            .key
+            .or(secret.env)
+            .unwrap_or_else(|| secret.name.clone());
+        validate_shell_name(&target_name, "secret target name")?;
+        if !seen.insert(target_name.clone()) {
+            bail!("duplicate secret target name");
+        }
+        let plaintext = avault_core::open(master.as_bytes(), &secret.name, &secret.envelope)
+            .with_context(|| format!("open failed for {}", secret.name))?;
+        opened.push(OpenedSecret {
+            name: target_name,
+            plaintext,
+        });
+    }
+    drop(master);
+    Ok(opened)
+}
+
+fn render_inject_file(
+    secrets: &[OpenedSecret],
+    format: &str,
+) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+    match format {
+        "dotenv" => render_dotenv(secrets),
+        "json" => render_json(secrets),
+        _ => bail!("deliver inject format is not implemented in P1.1"),
+    }
+}
+
+fn render_dotenv(secrets: &[OpenedSecret]) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+    let mut out = Zeroizing::new(Vec::new());
+    for secret in secrets {
+        let value = secret_utf8(secret.plaintext.as_slice(), "dotenv value")?;
+        write!(out, "{}=", secret.name).context("failed to render dotenv")?;
+        write_shell_quoted(&mut out, value).context("failed to render dotenv")?;
+        out.push(b'\n');
+    }
+    Ok(out)
+}
+
+fn render_json(secrets: &[OpenedSecret]) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+    let mut out = Zeroizing::new(Vec::new());
+    out.extend_from_slice(b"{\n");
+    for (index, secret) in secrets.iter().enumerate() {
+        let value = secret_utf8(secret.plaintext.as_slice(), "json value")?;
+        out.extend_from_slice(b"  ");
+        serde_json::to_writer(&mut *out, &secret.name)?;
+        out.extend_from_slice(b": ");
+        write_json_string(&mut out, value)?;
+        if index + 1 != secrets.len() {
+            out.push(b',');
+        }
+        out.push(b'\n');
+    }
+    out.push(b'}');
+    out.push(b'\n');
+    Ok(out)
+}
+
+fn atomic_write_0600(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let parent = writable_parent(path);
+    fs::create_dir_all(parent).context("failed to create inject output directory")?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".avault-inject.")
+        .suffix(".tmp")
+        .tempfile_in(parent)
+        .context("failed to create temporary inject file")?;
+    tmp.as_file_mut()
+        .set_permissions(fs::Permissions::from_mode(0o600))
+        .context("failed to set temporary inject file mode")?;
+    tmp.as_file_mut()
+        .write_all(bytes)
+        .context("failed to write temporary inject file")?;
+    tmp.as_file_mut()
+        .sync_all()
+        .context("failed to sync temporary inject file")?;
+    tmp.persist(path)
+        .map_err(|err| err.error)
+        .context("failed to install inject file")?;
+    File::open(parent)
+        .context("failed to open inject output directory")?
+        .sync_all()
+        .context("failed to sync inject output directory")?;
+    Ok(())
+}
+
+fn writable_parent(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
+fn validate_shell_name(name: &str, label: &str) -> anyhow::Result<()> {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first == '_' || first.is_ascii_uppercase() || first.is_ascii_lowercase() => {
+        }
+        _ => bail!("invalid {label}"),
+    }
+    if !chars.all(|ch| {
+        ch == '_' || ch.is_ascii_uppercase() || ch.is_ascii_lowercase() || ch.is_ascii_digit()
+    }) {
+        bail!("invalid {label}");
+    }
+    Ok(())
+}
+
+fn secret_utf8<'a>(bytes: &'a [u8], label: &str) -> anyhow::Result<&'a str> {
+    if bytes.contains(&0) {
+        bail!("{label} contains NUL byte");
+    }
+    std::str::from_utf8(bytes).with_context(|| format!("{label} is not valid UTF-8"))
+}
+
+fn fetch_header_credential<'a>(bytes: &'a [u8], label: &str) -> anyhow::Result<&'a str> {
+    let trimmed = match bytes.last() {
+        Some(b'\r') | Some(b'\n') => &bytes[..bytes.len() - 1],
+        _ => bytes,
+    };
+    if trimmed.iter().any(|byte| is_http_control_byte(*byte)) {
+        bail!("{label} contains invalid HTTP header byte");
+    }
+    std::str::from_utf8(trimmed).with_context(|| format!("{label} is not valid UTF-8"))
+}
+
+fn is_http_control_byte(byte: u8) -> bool {
+    byte < 0x20 || byte == 0x7f
+}
+
+fn write_shell_quoted(out: &mut Vec<u8>, value: &str) -> anyhow::Result<()> {
+    out.push(b'\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            out.extend_from_slice(b"'\\''");
+        } else {
+            write!(out, "{ch}")?;
+        }
+    }
+    out.push(b'\'');
+    Ok(())
+}
+
+fn write_json_string(out: &mut Vec<u8>, value: &str) -> anyhow::Result<()> {
+    serde_json::to_writer(out, value).context("failed to render JSON string")
+}
+
+fn build_secret_query_url(url: &str, name: &str, value: &str) -> anyhow::Result<Zeroizing<String>> {
+    let _ = Url::parse(url).context("fetch url is invalid")?;
+    let fragment_start = url.find('#').unwrap_or(url.len());
+    let (base, fragment) = url.split_at(fragment_start);
+    let separator = if base.contains('?') { '&' } else { '?' };
+    let mut out = Zeroizing::new(String::with_capacity(
+        url.len() + 1 + name.len() + 1 + value.len(),
+    ));
+    out.push_str(base);
+    out.push(separator);
+    push_query_encoded(&mut out, name);
+    out.push('=');
+    push_query_encoded(&mut out, value);
+    out.push_str(fragment);
+    Ok(out)
+}
+
+fn push_query_encoded(out: &mut String, value: &str) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for byte in value.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(*byte as char);
+            }
+            b' ' => out.push('+'),
+            other => {
+                out.push('%');
+                out.push(HEX[(other >> 4) as usize] as char);
+                out.push(HEX[(other & 0x0f) as usize] as char);
+            }
+        }
+    }
+}
+
+fn validate_fetch_method(method: &str) -> anyhow::Result<()> {
+    let method = method.to_ascii_uppercase();
+    if method.is_empty() || method.bytes().any(|byte| !byte.is_ascii_alphabetic()) {
+        bail!("invalid fetch method");
+    }
+    if matches!(method.as_str(), "TRACE" | "TRACK" | "CONNECT") {
+        bail!("fetch method is not allowed");
+    }
+    Ok(())
+}
+
+fn validate_fetch_url(url: &Url) -> anyhow::Result<()> {
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" if is_loopback_url(url) => Ok(()),
+        "http" => bail!("refusing to attach a credential over plaintext HTTP"),
+        _ => bail!("fetch URL scheme must be https, or http for loopback"),
+    }
+}
+
+fn validate_allowed_fetch_host(url: &Url, allowed_hosts: &[String]) -> anyhow::Result<()> {
+    if allowed_hosts.is_empty() {
+        bail!("fetch allowed_hosts is required");
+    }
+    for host in allowed_hosts {
+        validate_allowed_host(host)?;
+    }
+    let Some(host) = fetch_url_host(url) else {
+        bail!("fetch url host is required");
+    };
+    if !allowed_hosts
+        .iter()
+        .any(|allowed| host.eq_ignore_ascii_case(allowed))
+    {
+        bail!("fetch host is not allowed");
+    }
+    Ok(())
+}
+
+fn validate_allowed_host(host: &str) -> anyhow::Result<()> {
+    if host.trim().is_empty()
+        || host.trim() != host
+        || host.contains('/')
+        || host.contains('\\')
+        || host.contains('@')
+        || host.contains('[')
+        || host.contains(']')
+        || host.contains('\r')
+        || host.contains('\n')
+        || host.contains('?')
+        || host.contains('#')
+    {
+        bail!("invalid fetch allowed host");
+    }
+    if host.contains(':') && host.parse::<std::net::Ipv6Addr>().is_err() {
+        bail!("invalid fetch allowed host");
+    }
+    Ok(())
+}
+
+fn fetch_url_host(url: &Url) -> Option<String> {
+    match url.host()? {
+        Host::Domain(host) => Some(host.to_string()),
+        Host::Ipv4(addr) => Some(addr.to_string()),
+        Host::Ipv6(addr) => Some(addr.to_string()),
+    }
+}
+
+fn is_loopback_url(url: &Url) -> bool {
+    match url.host() {
+        Some(Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        Some(Host::Ipv4(addr)) => addr.is_loopback(),
+        Some(Host::Ipv6(addr)) => addr.is_loopback(),
+        None => false,
+    }
+}
+
+fn validate_header(name: &str, value: &str) -> anyhow::Result<()> {
+    validate_header_name(name)?;
+    if value.contains('\r') || value.contains('\n') {
+        bail!("invalid fetch header value");
+    }
+    Ok(())
+}
+
+fn reject_header_conflict(
+    headers: &BTreeMap<String, String>,
+    injected_name: &str,
+) -> anyhow::Result<()> {
+    if headers
+        .keys()
+        .any(|name| name.eq_ignore_ascii_case(injected_name))
+    {
+        bail!("fetch request already contains injected header");
+    }
+    Ok(())
+}
+
+fn validate_header_name(name: &str) -> anyhow::Result<()> {
+    if name.trim().is_empty()
+        || name.contains('\r')
+        || name.contains('\n')
+        || name.contains(':')
+        || name.eq_ignore_ascii_case("host")
+    {
+        bail!("invalid fetch header name");
+    }
+    Ok(())
+}
+
+fn validate_query_name(name: &str) -> anyhow::Result<()> {
+    if name.is_empty() || name.contains('\r') || name.contains('\n') {
+        bail!("invalid fetch query parameter name");
+    }
+    Ok(())
+}
+
+fn reject_query_conflict(url: &Url, injected_name: &str) -> anyhow::Result<()> {
+    if url
+        .query_pairs()
+        .any(|(name, _)| name.as_ref() == injected_name)
+    {
+        bail!("fetch request already contains injected query parameter");
+    }
+    Ok(())
+}
+
+fn status_to_exit_code(status: ExitStatus) -> u8 {
+    #[cfg(unix)]
+    if let Some(signal) = status.signal() {
+        return (128 + signal).try_into().unwrap_or(1);
+    }
+
+    status
+        .code()
+        .and_then(|code| code.try_into().ok())
+        .unwrap_or(1)
 }
 
 fn key_cmd(args: &[OsString]) -> anyhow::Result<u8> {
@@ -489,6 +1126,10 @@ fn parse_flag(args: &[OsString], flag: &str) -> anyhow::Result<bool> {
 
 fn read_stdin_zeroizing() -> anyhow::Result<Zeroizing<Vec<u8>>> {
     read_zeroizing_to_cap(io::stdin(), MAX_STDIN_SECRET_BYTES)
+}
+
+fn read_json_stdin(context: &'static str) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+    read_zeroizing_to_cap(io::stdin(), MAX_STDIN_ENVELOPE_BYTES).context(context)
 }
 
 fn read_zeroizing_to_cap(

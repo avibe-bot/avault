@@ -1,11 +1,56 @@
 use serde_json::json;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
+use std::thread;
 
 fn avault() -> Command {
     Command::new(env!("CARGO_BIN_EXE_avault"))
+}
+
+fn seal_secret(home: &std::path::Path, name: &str, value: &[u8]) -> serde_json::Value {
+    let mut seal = avault()
+        .arg("seal")
+        .arg("--name")
+        .arg(name)
+        .env("AVAULT_HOME", home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    seal.stdin.as_mut().unwrap().write_all(value).unwrap();
+    let output = seal.wait_with_output().unwrap();
+    assert!(output.status.success());
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn write_p0_master(home: &std::path::Path) {
+    fs::set_permissions(home, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(
+        home.join("machine.key"),
+        [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f,
+        ],
+    )
+    .unwrap();
+    fs::set_permissions(home.join("machine.key"), fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+fn p0_no_aad_envelope() -> serde_json::Value {
+    json!({
+        "ciphertext": "gbSQ4CgEA//jJu56fOvXZE0hKkc9LktZoM+58v2Dsw==",
+        "nonce": "MDEyMzQ1Njc4OTo7",
+        "wrap_meta": json!({
+            "v": 1,
+            "scheme": "machine-aesgcm-v1",
+            "wrapped_dek": "suj8cHJp0VSVnU1txzlNBBmnMD/TUGlEHy4kjvt+g7RlXgPlB6d7YQpDbhPKDEg7",
+            "dek_nonce": "QEFCQ0RFRkdISUpL"
+        }).to_string()
+    })
 }
 
 #[test]
@@ -101,6 +146,69 @@ fn deliver_run_returns_child_exit_code() {
         .unwrap();
     let status = deliver.wait().unwrap();
     assert_eq!(status.code(), Some(7));
+}
+
+#[test]
+fn deliver_run_accepts_multiple_secrets_for_one_child() {
+    let home = tempfile::tempdir().unwrap();
+    let first = seal_secret(home.path(), "FIRST_SECRET", b"alpha");
+    let second = seal_secret(home.path(), "SECOND_SECRET", b"beta");
+    let request = json!([
+        {"name": "FIRST_SECRET", "env": "FIRST_ENV", "envelope": first},
+        {"name": "SECOND_SECRET", "env": "SECOND_ENV", "envelope": second}
+    ]);
+
+    let mut deliver = avault()
+        .arg("deliver")
+        .arg("run")
+        .arg("--")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg(r#"test "$FIRST_ENV" = alpha && test "$SECOND_ENV" = beta && printf ok"#)
+        .env("AVAULT_HOME", home.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    deliver
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let output = deliver.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"ok");
+}
+
+#[cfg(unix)]
+#[test]
+fn deliver_run_preserves_signal_exit_code() {
+    let home = tempfile::tempdir().unwrap();
+    let sealed = seal_secret(home.path(), "OPENAI_API_KEY", b"s3cr3t");
+    let request = json!([
+        {"name": "OPENAI_API_KEY", "env": "SECRET_VALUE", "envelope": sealed}
+    ]);
+
+    let mut deliver = avault()
+        .arg("deliver")
+        .arg("run")
+        .arg("--")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg("kill -TERM $$")
+        .env("AVAULT_HOME", home.path())
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    deliver
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let status = deliver.wait().unwrap();
+    assert_eq!(status.code(), Some(143));
 }
 
 #[test]
@@ -253,6 +361,552 @@ fn deliver_run_rejects_name_mismatch() {
     let output = deliver.wait_with_output().unwrap();
     assert!(!output.status.success());
     assert_eq!(output.status.code(), Some(70));
+}
+
+#[test]
+fn deliver_fetch_injects_bearer_to_loopback_and_returns_response_json() {
+    let home = tempfile::tempdir().unwrap();
+    let sealed = seal_secret(home.path(), "API_TOKEN", b"token-123\n");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).unwrap();
+        let request = String::from_utf8_lossy(&buf[..n]);
+        assert!(request.starts_with("GET /resource HTTP/1.1"));
+        assert!(request.contains("Authorization: Bearer token-123"));
+        stream
+            .write_all(
+                b"HTTP/1.1 201 Created\r\nContent-Type: text/plain\r\nContent-Length: 8\r\n\r\naccepted",
+            )
+            .unwrap();
+    });
+    let request = json!({
+        "name": "API_TOKEN",
+        "envelope": sealed,
+        "request": {
+            "method": "GET",
+            "url": format!("http://127.0.0.1:{}/resource", addr.port()),
+            "allowed_hosts": ["127.0.0.1"],
+            "inject": {"type": "bearer"}
+        }
+    });
+
+    let mut fetch = avault()
+        .arg("deliver")
+        .arg("fetch")
+        .env("AVAULT_HOME", home.path())
+        .env("HTTP_PROXY", "http://127.0.0.1:9")
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .env("ALL_PROXY", "http://127.0.0.1:9")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    fetch
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let output = fetch.wait_with_output().unwrap();
+    server.join().unwrap();
+    assert!(output.status.success());
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["status"], 201);
+    assert_eq!(response["body"], "accepted");
+}
+
+#[test]
+fn deliver_fetch_rejects_plaintext_non_loopback_before_opening() {
+    let home = tempfile::tempdir().unwrap();
+    let request = json!({
+        "name": "API_TOKEN",
+        "envelope": {
+            "ciphertext": "not-base64",
+            "nonce": "not-base64",
+            "wrap_meta": "{}"
+        },
+        "request": {
+            "method": "GET",
+            "url": "http://example.com/resource",
+            "allowed_hosts": ["example.com"]
+        }
+    });
+
+    let mut fetch = avault()
+        .arg("deliver")
+        .arg("fetch")
+        .env("AVAULT_HOME", home.path())
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    fetch
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let output = fetch.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(70));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("plaintext HTTP"));
+}
+
+#[test]
+fn deliver_fetch_requires_allowed_hosts_before_opening() {
+    let home = tempfile::tempdir().unwrap();
+    let request = json!({
+        "name": "API_TOKEN",
+        "envelope": {
+            "ciphertext": "not-base64",
+            "nonce": "not-base64",
+            "wrap_meta": "{}"
+        },
+        "request": {
+            "method": "GET",
+            "url": "https://api.example.com/resource"
+        }
+    });
+
+    let mut fetch = avault()
+        .arg("deliver")
+        .arg("fetch")
+        .env("AVAULT_HOME", home.path())
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    fetch
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let output = fetch.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(70));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("allowed_hosts is required"));
+    assert!(!stderr.contains("open failed"));
+}
+
+#[test]
+fn deliver_fetch_rejects_unapproved_host_before_opening() {
+    let home = tempfile::tempdir().unwrap();
+    let request = json!({
+        "name": "API_TOKEN",
+        "envelope": {
+            "ciphertext": "not-base64",
+            "nonce": "not-base64",
+            "wrap_meta": "{}"
+        },
+        "request": {
+            "method": "GET",
+            "url": "https://evil.example.com/resource",
+            "allowed_hosts": ["api.example.com"]
+        }
+    });
+
+    let mut fetch = avault()
+        .arg("deliver")
+        .arg("fetch")
+        .env("AVAULT_HOME", home.path())
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    fetch
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let output = fetch.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(70));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("host is not allowed"));
+    assert!(!stderr.contains("open failed"));
+}
+
+#[test]
+fn deliver_fetch_rejects_injected_header_conflict_before_opening() {
+    let home = tempfile::tempdir().unwrap();
+    let request = json!({
+        "name": "API_TOKEN",
+        "envelope": {
+            "ciphertext": "not-base64",
+            "nonce": "not-base64",
+            "wrap_meta": "{}"
+        },
+        "request": {
+            "method": "GET",
+            "url": "https://api.example.com/resource",
+            "allowed_hosts": ["API.EXAMPLE.COM"],
+            "headers": {"authorization": "Bearer placeholder"},
+            "inject": {"type": "bearer"}
+        }
+    });
+
+    let mut fetch = avault()
+        .arg("deliver")
+        .arg("fetch")
+        .env("AVAULT_HOME", home.path())
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    fetch
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let output = fetch.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(70));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("already contains injected header"));
+    assert!(!stderr.contains("open failed"));
+}
+
+#[test]
+fn deliver_fetch_rejects_injected_query_conflict_before_opening() {
+    let home = tempfile::tempdir().unwrap();
+    let request = json!({
+        "name": "API_TOKEN",
+        "envelope": {
+            "ciphertext": "not-base64",
+            "nonce": "not-base64",
+            "wrap_meta": "{}"
+        },
+        "request": {
+            "method": "GET",
+            "url": "https://api.example.com/resource?api_key=placeholder",
+            "allowed_hosts": ["api.example.com"],
+            "inject": {"type": "query", "name": "api_key"}
+        }
+    });
+
+    let mut fetch = avault()
+        .arg("deliver")
+        .arg("fetch")
+        .env("AVAULT_HOME", home.path())
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    fetch
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let output = fetch.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(70));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("already contains injected query parameter"));
+    assert!(!stderr.contains("open failed"));
+}
+
+#[test]
+fn deliver_fetch_rejects_invalid_header_credential_before_request() {
+    let home = tempfile::tempdir().unwrap();
+    let sealed = seal_secret(home.path(), "API_TOKEN", b"token\tbad");
+    let request = json!({
+        "name": "API_TOKEN",
+        "envelope": sealed,
+        "request": {
+            "method": "GET",
+            "url": "http://127.0.0.1:9/resource",
+            "allowed_hosts": ["127.0.0.1"],
+            "inject": {"type": "header", "name": "X-Api-Key"}
+        }
+    });
+
+    let mut fetch = avault()
+        .arg("deliver")
+        .arg("fetch")
+        .env("AVAULT_HOME", home.path())
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    fetch
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let output = fetch.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(70));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("invalid HTTP header byte"));
+    assert!(!stderr.contains("HTTP transport failed"));
+    assert!(!stderr.contains("token"));
+}
+
+#[test]
+fn deliver_fetch_sanitizes_transport_errors_after_query_injection() {
+    let home = tempfile::tempdir().unwrap();
+    let sealed = seal_secret(home.path(), "API_TOKEN", b"token-123");
+    let port = {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let request = json!({
+        "name": "API_TOKEN",
+        "envelope": sealed,
+        "request": {
+            "method": "GET",
+            "url": format!("http://127.0.0.1:{}/resource", port),
+            "allowed_hosts": ["127.0.0.1"],
+            "inject": {"type": "query", "name": "api_key"}
+        }
+    });
+
+    let mut fetch = avault()
+        .arg("deliver")
+        .arg("fetch")
+        .env("AVAULT_HOME", home.path())
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    fetch
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let output = fetch.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(70));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("HTTP transport failed"));
+    assert!(!stderr.contains("token-123"));
+    assert!(!stderr.contains("api_key"));
+    assert!(!stderr.contains("127.0.0.1"));
+    assert!(!stderr.contains("/resource"));
+}
+
+#[test]
+fn deliver_fetch_rejects_oversized_response_body() {
+    let home = tempfile::tempdir().unwrap();
+    let sealed = seal_secret(home.path(), "API_TOKEN", b"token-123");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = stream.read(&mut buf).unwrap();
+        let body_len = 8 * 1024 * 1024 + 1;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {body_len}\r\n\r\n"
+        )
+        .unwrap();
+        stream.write_all(&vec![b'a'; body_len]).unwrap();
+    });
+    let request = json!({
+        "name": "API_TOKEN",
+        "envelope": sealed,
+        "request": {
+            "method": "GET",
+            "url": format!("http://127.0.0.1:{}/large", addr.port()),
+            "allowed_hosts": ["127.0.0.1"]
+        }
+    });
+
+    let mut fetch = avault()
+        .arg("deliver")
+        .arg("fetch")
+        .env("AVAULT_HOME", home.path())
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    fetch
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let output = fetch.wait_with_output().unwrap();
+    server.join().unwrap();
+    assert_eq!(output.status.code(), Some(70));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("response body exceeds size limit"));
+    assert!(!stderr.contains("token-123"));
+}
+
+#[test]
+fn deliver_inject_writes_dotenv_and_json_as_0600() {
+    let home = tempfile::tempdir().unwrap();
+    let alpha = seal_secret(home.path(), "A_KEY", b"alpha-1");
+    let beta = seal_secret(home.path(), "B_KEY", b"beta-2");
+    let dotenv_path = home.path().join("secrets.env");
+    let json_path = home.path().join("secrets.json");
+
+    let dotenv = json!({
+        "path": dotenv_path,
+        "format": "dotenv",
+        "secrets": [
+            {"name": "A_KEY", "key": "A_KEY", "envelope": alpha.clone()},
+            {"name": "B_KEY", "key": "B_KEY", "envelope": beta.clone()}
+        ]
+    });
+    let mut inject = avault()
+        .arg("deliver")
+        .arg("inject")
+        .env("AVAULT_HOME", home.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    inject
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(dotenv.to_string().as_bytes())
+        .unwrap();
+    let output = inject.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"{\"ok\":true}\n");
+    assert_eq!(
+        fs::metadata(&dotenv_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::read_to_string(&dotenv_path).unwrap(),
+        "A_KEY='alpha-1'\nB_KEY='beta-2'\n"
+    );
+
+    let json_request = json!({
+        "path": json_path,
+        "format": "json",
+        "secrets": [
+            {"name": "A_KEY", "key": "A_KEY", "envelope": alpha},
+            {"name": "B_KEY", "key": "B_KEY", "envelope": beta}
+        ]
+    });
+    let mut inject = avault()
+        .arg("deliver")
+        .arg("inject")
+        .env("AVAULT_HOME", home.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    inject
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(json_request.to_string().as_bytes())
+        .unwrap();
+    assert!(inject.wait().unwrap().success());
+    assert_eq!(
+        fs::metadata(&json_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let parsed: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&json_path).unwrap()).unwrap();
+    assert_eq!(parsed, json!({"A_KEY": "alpha-1", "B_KEY": "beta-2"}));
+}
+
+#[test]
+fn p0_no_aad_blob_opens_via_new_delivery_paths() {
+    let home = tempfile::tempdir().unwrap();
+    write_p0_master(home.path());
+    let sealed = p0_no_aad_envelope();
+
+    let run_request = json!([
+        {"name": "OPENAI_API_KEY", "env": "SECRET_VALUE", "envelope": sealed.clone()}
+    ]);
+    let mut run = avault()
+        .arg("deliver")
+        .arg("run")
+        .arg("--")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg(r#"test "$SECRET_VALUE" = "p0-python-value""#)
+        .env("AVAULT_HOME", home.path())
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    run.stdin
+        .as_mut()
+        .unwrap()
+        .write_all(run_request.to_string().as_bytes())
+        .unwrap();
+    assert!(run.wait().unwrap().success());
+
+    let inject_path = home.path().join("p0.env");
+    let inject_request = json!({
+        "path": inject_path,
+        "format": "dotenv",
+        "secrets": [
+            {"name": "OPENAI_API_KEY", "key": "OPENAI_API_KEY", "envelope": sealed.clone()}
+        ]
+    });
+    let mut inject = avault()
+        .arg("deliver")
+        .arg("inject")
+        .env("AVAULT_HOME", home.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    inject
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(inject_request.to_string().as_bytes())
+        .unwrap();
+    assert!(inject.wait().unwrap().success());
+    assert_eq!(
+        fs::read_to_string(&inject_path).unwrap(),
+        "OPENAI_API_KEY='p0-python-value'\n"
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).unwrap();
+        let request = String::from_utf8_lossy(&buf[..n]);
+        assert!(request.contains("Authorization: Bearer p0-python-value"));
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .unwrap();
+    });
+    let fetch_request = json!({
+        "name": "OPENAI_API_KEY",
+        "envelope": sealed,
+        "request": {
+            "method": "GET",
+            "url": format!("http://127.0.0.1:{}/p0", addr.port()),
+            "allowed_hosts": ["127.0.0.1"]
+        }
+    });
+    let mut fetch = avault()
+        .arg("deliver")
+        .arg("fetch")
+        .env("AVAULT_HOME", home.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    fetch
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(fetch_request.to_string().as_bytes())
+        .unwrap();
+    let output = fetch.wait_with_output().unwrap();
+    server.join().unwrap();
+    assert!(output.status.success());
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["body"], "ok");
 }
 
 #[test]

@@ -2,9 +2,10 @@
 
 A small, hardened **Rust key-custody core** for [Avibe](https://github.com/avibe-bot/avibe) Vaults — the one component that ever holds a key or performs cryptography, so the agent (and Python) never do.
 
-> **Status: P1 core.** The standard-tier Rust crypto core, `file+mlock` master-key store,
-> and one-shot CLI are implemented. The resident agent, pubkey/blind-box receiver,
-> signer, protected tier, and hardware stores remain P2+.
+> **Status: P1.1 standard-tier core.** The standard-tier Rust crypto core,
+> `file+mlock` master-key store, and one-shot CLI delivery surface are implemented.
+> The resident agent, pubkey/blind-box receiver, signer, protected tier, and
+> hardware stores remain P2+.
 
 ## Why
 
@@ -25,12 +26,15 @@ avault makes the split real:
 
 ## Interface (deliberately narrow)
 
-P1 implements:
+P1.1 implements:
 
 ```sh
 avault seal --name OPENAI_API_KEY < value.txt
 avault deliver run --name OPENAI_API_KEY --env OPENAI_API_KEY -- env
 avault deliver run --name OPENAI_API_KEY --env OPENAI_API_KEY --envelope-file envelope.json -- env
+avault deliver run -- env < run-secrets.json
+avault deliver fetch < fetch-request.json
+avault deliver inject < inject-request.json
 avault key export < passphrase.txt
 avault key import [--force] < import-request.json
 ```
@@ -51,6 +55,64 @@ master key, injects the value into the requested env var for the child command,
 inherits stdout/stderr, and exits with the child's exit code. Because stdin is used
 for the envelope in that mode, the child gets null stdin; use `--envelope-file` when
 the child must inherit avault's stdin. There is no plaintext-printing `open` command.
+
+The canonical P1.1 `deliver run` form accepts multiple secrets on stdin and spawns
+one child with all env vars:
+
+```json
+[
+  {
+    "name": "OPENAI_API_KEY",
+    "env": "OPENAI_API_KEY",
+    "envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." }
+  }
+]
+```
+
+`deliver fetch` performs brokered HTTP egress itself. Stdin is:
+
+```json
+{
+  "name": "GITHUB_TOKEN",
+  "envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." },
+  "request": {
+    "method": "GET",
+    "url": "https://api.github.com/user",
+    "allowed_hosts": ["api.github.com"],
+    "headers": { "Accept": "application/json" },
+    "body": null,
+    "inject": { "type": "bearer" }
+  }
+}
+```
+
+`inject` defaults to bearer auth; custom forms are
+`{"type":"header","name":"X-Api-Key"}` and `{"type":"query","name":"api_key"}`.
+`allowed_hosts` is required and must include the URL host before avault opens the
+envelope; loopback hosts are not implicit. Output is response JSON
+`{status, headers, body}`. `https` is required except for loopback `http`,
+unsafe echo methods are rejected before decrypting, conflicting injected
+header/query fields are rejected, transport errors are sanitized, and the
+response body is capped.
+
+`deliver inject` accepts:
+
+```json
+{
+  "path": "/path/to/secrets.env",
+  "format": "dotenv",
+  "secrets": [
+    {
+      "name": "OPENAI_API_KEY",
+      "key": "OPENAI_API_KEY",
+      "envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." }
+    }
+  ]
+}
+```
+
+P1.1 implements `dotenv` and `json` files with atomic 0600 writes; `yaml` and
+`toml` remain deferred.
 
 `key export` reads a passphrase from stdin and emits the P0-compatible
 `machine-key-export-v1` JSON blob. `key import` reads JSON from stdin:
@@ -93,6 +155,7 @@ cargo clippy --all-targets
 ## Roadmap
 
 - **P1** — `avault-core` + CLI + `file+mlock` store; Rust takes the standard-tier seal/open. Closes the Python memory-hygiene gap.
+- **P1.1** — complete standard-tier delivery: multi-secret run, brokered fetch, and atomic dotenv/json inject.
 - **P2** — resident agent + `SO_PEERCRED` + scope-grant DEK cache + secp256k1 signer; hardware-store backends.
 - **P3** — multi-factor (passkey-PRF, TPM, KMS); external signer (hardware wallet / WalletConnect).
 
