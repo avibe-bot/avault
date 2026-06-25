@@ -2,7 +2,9 @@
 
 A small, hardened **Rust key-custody core** for [Avibe](https://github.com/avibe-bot/avibe) Vaults — the one component that ever holds a key or performs cryptography, so the agent (and Python) never do.
 
-> **Status: early.** This repo is a scaffold + the authoritative design. The crypto is not implemented yet — see [`docs/DESIGN.md`](docs/DESIGN.md) and the roadmap below.
+> **Status: P1 core.** The standard-tier Rust crypto core, `file+mlock` master-key store,
+> and one-shot CLI are implemented. The resident agent, pubkey/blind-box receiver,
+> signer, protected tier, and hardware stores remain P2+.
 
 ## Why
 
@@ -23,7 +25,44 @@ avault makes the split real:
 
 ## Interface (deliberately narrow)
 
-`pubkey` · `seal` · `deliver` (run/fetch/inject) · `sign` · `key export|import` — plus `agent` (resident, for grant DEK-cache + signing). Full table in [`docs/DESIGN.md`](docs/DESIGN.md) (Appendix C).
+P1 implements:
+
+```sh
+avault seal --name OPENAI_API_KEY < value.txt
+avault deliver run --name OPENAI_API_KEY --env OPENAI_API_KEY -- env
+avault deliver run --name OPENAI_API_KEY --env OPENAI_API_KEY --envelope-file envelope.json -- env
+avault key export < passphrase.txt
+avault key import [--force] < import-request.json
+```
+
+`seal` reads the value from stdin and writes envelope JSON on stdout:
+`{ciphertext, nonce, wrap_meta}`. `wrap_meta` matches P0 Python's
+`{"v":1,"scheme":"machine-aesgcm-v1","wrapped_dek":...,"dek_nonce":...}` shape.
+New P1 writes authenticate the value with AAD bytes
+`name || "machine-aesgcm-v1" || 0x01`; the shared KAT lives at
+`crates/avault-core/tests/fixtures/p1_aad_vector.json`. Legacy P0 no-AAD rows are
+read-compatible only.
+
+The P1 file store uses `$AVAULT_HOME/machine.key` when `AVAULT_HOME` is set, or
+`$HOME/.avibe/state/vault/machine.key` by default, matching the P0 Python basename.
+
+`deliver run` reads envelope JSON from stdin by default, opens it with the local
+master key, injects the value into the requested env var for the child command,
+inherits stdout/stderr, and exits with the child's exit code. Because stdin is used
+for the envelope in that mode, the child gets null stdin; use `--envelope-file` when
+the child must inherit avault's stdin. There is no plaintext-printing `open` command.
+
+`key export` reads a passphrase from stdin and emits the P0-compatible
+`machine-key-export-v1` JSON blob. `key import` reads JSON from stdin:
+
+```json
+{
+  "passphrase": "same passphrase",
+  "blob": { "scheme": "machine-key-export-v1", "...": "..." }
+}
+```
+
+P2 stubs: `pubkey`, `sign`, and `agent`.
 
 ## How Avibe talks to it
 
@@ -53,7 +92,7 @@ cargo clippy --all-targets
 
 ## Roadmap
 
-- **P1** — `avault-core` + CLI + `file+mlock` store; Rust takes the standard-tier seal/open; blind-box create. Closes the Python memory-hygiene gap.
+- **P1** — `avault-core` + CLI + `file+mlock` store; Rust takes the standard-tier seal/open. Closes the Python memory-hygiene gap.
 - **P2** — resident agent + `SO_PEERCRED` + scope-grant DEK cache + secp256k1 signer; hardware-store backends.
 - **P3** — multi-factor (passkey-PRF, TPM, KMS); external signer (hardware wallet / WalletConnect).
 
