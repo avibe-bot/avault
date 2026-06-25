@@ -19,7 +19,8 @@ This matches the distribution decision in `docs/DESIGN.md` Section 16, decision
    It also fails if the tagged commit is not reachable from `origin/master`.
 5. GitHub Actions runs `.github/workflows/release.yml`.
 6. The workflow builds, strips, packages, checksums, and uploads the supported
-   platform artifacts.
+   platform artifacts. Release builds run with Cargo's committed lockfile via
+   `--locked`.
 7. The workflow creates the GitHub Release for the tag and uploads
    `manifest.json`.
 

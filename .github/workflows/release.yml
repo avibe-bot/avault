@@ -80,7 +80,7 @@ jobs:
           fi
 
       - name: Build release binary
-        run: cargo build --release --target "${{ matrix.rust_target }}" --bin avault
+        run: cargo build --locked --release --target "${{ matrix.rust_target }}" --bin avault
 
       - name: Strip binary
         run: strip "target/${{ matrix.rust_target }}/release/${{ matrix.binary }}"
