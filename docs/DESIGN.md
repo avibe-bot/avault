@@ -386,7 +386,8 @@ This is an internal store selection inside `avault`, not an Avibe-level plugin l
 | Phase | Scope | State |
 |---|---|---|
 | **P0** | Python standard tier: DB + envelope + delivery + `$<NAME>` (#631) | **done — keep & merge; not replaced before P1** |
-| **P1** | `avault-core` + CLI + `file+mlock` store; Rust takes standard-tier seal/open; blind-box create; `vibe runtime prepare` ensure + Dependencies card. Closes the memory-hygiene gap. | next |
+| **P1** | `avault-core` + CLI + `file+mlock` store; Rust takes standard-tier seal/open; blind-box create; `vibe runtime prepare` ensure + Dependencies card. Closes the memory-hygiene gap. | done |
+| **P1.1** | Complete the standard-tier delivery surface so Avibe can route every value-open through `avault`: multi-secret `deliver run`, brokered `deliver fetch`, shell `deliver export`, and atomic-file `deliver inject` (dotenv/json). | current |
 | **P2** | Resident agent + `SO_PEERCRED` + scope-grant DEK cache + signer (secp256k1; approval-card context in the sign prompt). Protected-tier non-browser factors via hardware stores. | after P1 |
 | **P3** | Multi-factor (passkey-PRF copies, TPM, KMS KEK); external `SignerProvider` (hardware wallet / WalletConnect). | later |
 
@@ -399,7 +400,7 @@ This is an internal store selection inside `avault`, not an Avibe-level plugin l
 1. **Name → `avault`.** Short, ownable; already the repo / binary / crate prefix. Not published to crates.io, so no registry-name collision concern.
 2. **Envelope → wrapped_dek (Scheme A).** Random per-record DEK, wrapped under the root (master / VMK); store `wrapped_dek`. Cheap rotation (re-wrap, never re-encrypt), no DB break, and it unifies the standard + protected envelopes. The protected tier extends it with **N `wrapped_vmk` factor-copies** (password via `scrypt`, passkey via WebAuthn-PRF, second device, recovery code) — **any one factor unlocks the same random VMK**, and add / remove / change-password is a re-wrap of the VMK, not a re-encrypt of data. The only "derive" is *factor → KEK*; the DEK and VMK are random and wrapped. (Rejected: `vt`'s pure-derive — forces full re-encrypt on rotation and a second envelope format.)
 3. **Distribution → a real manifest-pinned release pipeline**, version-locked to the avibe release (Show-Runtime model); build the full path **stub-first**; targets `macos-arm64` + `linux-x64`; macOS signing/notarization is an explicit sub-task. (Rejected: `curl | sh` and any throwaway dev installer.)
-4. **P1 scope → standard-tier CLI core.** In: `avault-core` seal/open (AES-256-GCM + wrapped_dek + AAD), `avault-store` `file+mlock`, `avault-cli` (`seal` via stdin, `deliver run`, `key export/import`), the stub-first delivery pipeline, and the avibe-side wiring (route `vault_crypto.py`'s standard value path through avault; `vault_secrets` stays the metadata source of truth). Out → P2: resident agent, scope grants + approval-card UX, signing, the protected tier, hardware/passphrase stores, `fetch`/`inject`. The standard-create transient-plaintext-in-Python residual stays in P1 (§11.3); the blind box eliminates it in P2.
+4. **P1 scope → standard-tier CLI core.** In: `avault-core` seal/open (AES-256-GCM + wrapped_dek + AAD), `avault-store` `file+mlock`, `avault-cli` (`seal` via stdin, `deliver run`, `key export/import`), the stub-first delivery pipeline, and the avibe-side wiring (route `vault_crypto.py`'s standard value path through avault; `vault_secrets` stays the metadata source of truth). P1.1 pulls the remaining standard-tier delivery modes (`deliver fetch`, `deliver export`, `deliver inject`) forward so Avibe can remove the Python open path all at once. Out → P2: resident agent, scope grants + approval-card UX, signing, the protected tier, hardware/passphrase stores. The standard-create transient-plaintext-in-Python residual stays in P1 (§11.3); the blind box eliminates it in P2.
 5. **Protected-tier pubkey trust → deferred to P2** (the protected tier itself is P2). Lean **attest** (sign the ephemeral X25519 pubkey with an identity key the browser already trusts) — it pairs with the ephemeral-keypair choice and defeats first-use MITM; interim **pin** (TOFU) is acceptable. Not on the P1 path.
 6. **Transport safety → CLI is the conservative default (P1); the resident agent (P2) is a deliberate, hardened tradeoff.** CLI has no listening surface and a tiny key-in-memory window. The agent (for grant-cache + signing only) is more exposed → idle-timeout zeroize, cache DEKs not the master 24/7, `mlock` + no-coredump, peer-cred auth. See §12.
 7. **Master-key store on no-hardware hosts → add `file + passphrase`** (passphrase-wrapped master, unlock once at startup; plaintext never on disk). The cloud/no-TPM sweet spot; defends at-rest, not the running machine; P2, pairs with the agent or the Linux kernel keyring. See §13.
@@ -469,6 +470,85 @@ These are starting recommendations, not frozen choices — items #2 (envelope) a
 | `key export` / `key import` | passphrase (stdin) | encrypted backup / ok | back up, migrate, restore the master key |
 
 The resident agent (P2) adds `grant` / `release`: cache a scope's DEK-set for a TTL so repeated uses in-window skip re-unlock. Standard-tier signing of an ETH key is `sign`; protected-tier ETH signing happens entirely in the browser and never reaches this interface.
+
+### P1.1 CLI delivery schemas
+
+All P1.1 delivery inputs are JSON on stdin. The `envelope` object is the persisted
+`{ciphertext, nonce, wrap_meta}` shape. The `name` field is the secret name used for
+AAD. Values never appear in argv.
+
+`deliver run` accepts a JSON array and spawns exactly one child:
+
+```json
+[
+  {
+    "name": "OPENAI_API_KEY",
+    "env": "OPENAI_API_KEY",
+    "envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." }
+  }
+]
+```
+
+The legacy single-secret form remains available:
+`avault deliver run --name NAME --env VAR [--envelope-file PATH] -- COMMAND`.
+
+`deliver fetch` accepts one secret plus a request spec:
+
+```json
+{
+  "name": "GITHUB_TOKEN",
+  "envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." },
+  "request": {
+    "method": "GET",
+    "url": "https://api.github.com/user",
+    "headers": { "Accept": "application/json" },
+    "body": null,
+    "inject": { "type": "bearer" }
+  }
+}
+```
+
+`inject` defaults to `{"type":"bearer"}` and sets `Authorization: Bearer <secret>`.
+Custom header and query forms are `{"type":"header","name":"X-Api-Key"}` and
+`{"type":"query","name":"api_key"}`. The URL is validated before decrypting:
+`https` is required except for loopback `http`, and `TRACE` / `TRACK` / `CONNECT`
+are rejected because they can echo credentials. Output is JSON:
+`{"status":200,"headers":{...},"body":"..."}`.
+
+`deliver export` accepts the same array style as `run`; `export` names the shell
+variable, and `env` is accepted as an alias:
+
+```json
+[
+  {
+    "name": "OPENAI_API_KEY",
+    "export": "OPENAI_API_KEY",
+    "envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." }
+  }
+]
+```
+
+It writes POSIX shell-quoted `export NAME='value'` lines to inherited stdout.
+
+`deliver inject` accepts a target file, a format, and a secret array:
+
+```json
+{
+  "path": "/path/to/secrets.env",
+  "format": "dotenv",
+  "secrets": [
+    {
+      "name": "OPENAI_API_KEY",
+      "key": "OPENAI_API_KEY",
+      "envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." }
+    }
+  ]
+}
+```
+
+`key` names the rendered entry, and `env` is accepted as an alias. P1.1 implements
+`dotenv` and `json`; `yaml` and `toml` remain deferred. Files are written atomically
+through a 0600 temporary file, fsync, rename, and parent-directory fsync.
 
 ### Transport
 
