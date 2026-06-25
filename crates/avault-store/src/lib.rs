@@ -8,9 +8,9 @@ use anyhow::{bail, Context};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use std::env;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -149,17 +149,7 @@ impl FileStore {
             .path
             .parent()
             .context("master key path has no parent")?;
-        let mut tmp = tempfile::Builder::new()
-            .prefix(".machine.")
-            .suffix(".tmp")
-            .tempfile_in(parent)
-            .context("failed to create temporary master key file")?;
-        tmp.as_file_mut()
-            .write_all(key)
-            .context("failed to write temporary master key file")?;
-        tmp.as_file_mut()
-            .sync_all()
-            .context("failed to sync temporary master key file")?;
+        let tmp = write_synced_temp_key(parent, key)?;
 
         if force {
             tmp.persist(&self.path)
@@ -179,19 +169,21 @@ impl FileStore {
         self.ensure_parent()?;
 
         let key = MasterKey::generate_locked();
+        let parent = self
+            .path
+            .parent()
+            .context("master key path has no parent")?;
+        let tmp = write_synced_temp_key(parent, key.as_bytes())?;
+        drop(key);
 
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true).mode(0o600);
-        match options.open(&self.path) {
-            Ok(mut file) => {
-                file.write_all(key.as_bytes())
-                    .context("failed to write new master key")?;
-                file.sync_all().context("failed to sync new master key")?;
+        match tmp.persist_noclobber(&self.path) {
+            Ok(_) => {
+                validate_file_mode(&self.path)?;
                 sync_parent_dir(&self.path)?;
                 Ok(())
             }
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-            Err(err) => Err(err).context("failed to create master key"),
+            Err(err) if err.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(err) => Err(err.error).context("failed to install new master key"),
         }
     }
 
@@ -204,6 +196,27 @@ impl FileStore {
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).ok();
         Ok(())
     }
+}
+
+fn write_synced_temp_key(
+    parent: &Path,
+    key: &[u8; MASTER_KEY_BYTES],
+) -> anyhow::Result<tempfile::NamedTempFile> {
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".machine.")
+        .suffix(".tmp")
+        .tempfile_in(parent)
+        .context("failed to create temporary master key file")?;
+    tmp.as_file_mut()
+        .set_permissions(fs::Permissions::from_mode(0o600))
+        .context("failed to set temporary master key mode")?;
+    tmp.as_file_mut()
+        .write_all(key)
+        .context("failed to write temporary master key file")?;
+    tmp.as_file_mut()
+        .sync_all()
+        .context("failed to sync temporary master key file")?;
+    Ok(tmp)
 }
 
 fn sync_parent_dir(path: &Path) -> anyhow::Result<()> {
@@ -345,6 +358,21 @@ mod tests {
         let key = [9u8; MASTER_KEY_BYTES];
         store.import(&key, false).unwrap();
         assert_eq!(store.get().unwrap().as_bytes(), &key);
+        let mode = fs::metadata(store.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert!(stale_tmp.exists());
+    }
+
+    #[test]
+    fn create_does_not_reuse_stale_temp_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileStore::new(tmp.path().join("machine.key"));
+        let stale_tmp = tmp.path().join(".machine.stale.tmp");
+        fs::write(&stale_tmp, [3u8; MASTER_KEY_BYTES]).unwrap();
+        fs::set_permissions(&stale_tmp, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let key = store.get_or_create().unwrap();
+        assert_ne!(key.as_bytes(), &[3u8; MASTER_KEY_BYTES]);
         let mode = fs::metadata(store.path()).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         assert!(stale_tmp.exists());

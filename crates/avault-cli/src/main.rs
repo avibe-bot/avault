@@ -73,6 +73,7 @@ fn seal_cmd(args: &[OsString]) -> anyhow::Result<u8> {
     let master = avault_store::load_or_create_master_key(Backend::File)?;
     let sealed =
         avault_core::seal(master.as_bytes(), &name, value.as_slice()).context("seal failed")?;
+    drop(master);
     value.zeroize();
     serde_json::to_writer(io::stdout(), &sealed).context("failed to write envelope JSON")?;
     println!();
@@ -158,6 +159,7 @@ fn key_export_cmd() -> anyhow::Result<u8> {
     let master = avault_store::load_master_key(Backend::File)?;
     let blob = avault_core::export_master_key(master.as_bytes(), passphrase.as_slice())
         .context("key export failed")?;
+    drop(master);
     passphrase.zeroize();
     serde_json::to_writer(io::stdout(), &blob).context("failed to write key export JSON")?;
     println!();
@@ -180,6 +182,7 @@ fn key_import_cmd(args: &[OsString]) -> anyhow::Result<u8> {
     FileStore::new(avault_store::default_master_key_path()?)
         .import(&key, force)
         .context("failed to store imported master key")?;
+    drop(key);
     println!(r#"{{"ok":true}}"#);
     Ok(0)
 }
@@ -257,12 +260,8 @@ fn parse_flag(args: &[OsString], flag: &str) -> anyhow::Result<bool> {
 }
 
 fn read_stdin_zeroizing() -> anyhow::Result<Zeroizing<Vec<u8>>> {
-    Ok(Zeroizing::new(read_stdin_bytes()?))
-}
-
-fn read_stdin_bytes() -> anyhow::Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    io::stdin().read_to_end(&mut buf)?;
+    let mut buf = Zeroizing::new(Vec::new());
+    io::stdin().read_to_end(buf.as_mut())?;
     Ok(buf)
 }
 
