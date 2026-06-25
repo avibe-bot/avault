@@ -46,7 +46,7 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 
 [[package]]
 name = "avault-cli"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "avault-core",
@@ -61,7 +61,7 @@ dependencies = [
 
 [[package]]
 name = "avault-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -79,7 +79,7 @@ dependencies = [
 
 [[package]]
 name = "avault-store"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "libc",
