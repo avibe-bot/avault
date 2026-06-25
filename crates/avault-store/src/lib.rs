@@ -31,9 +31,26 @@ pub struct MasterKey {
 }
 
 impl MasterKey {
+    fn zeroed_locked() -> Self {
+        let key = Box::new(Zeroizing::new([0u8; MASTER_KEY_BYTES]));
+        harden_process_memory();
+        lock_memory(key.as_ptr(), MASTER_KEY_BYTES);
+        Self { key }
+    }
+
+    fn generate_locked() -> Self {
+        let mut key = Self::zeroed_locked();
+        OsRng.fill_bytes(key.key.as_mut().as_mut());
+        key
+    }
+
     /// Borrow the key for a single crypto operation.
     pub fn as_bytes(&self) -> &[u8; MASTER_KEY_BYTES] {
         self.key.as_ref()
+    }
+
+    fn as_mut_bytes(&mut self) -> &mut [u8; MASTER_KEY_BYTES] {
+        self.key.as_mut()
     }
 }
 
@@ -109,10 +126,8 @@ impl FileStore {
         validate_file_mode(&self.path)?;
         let mut file = File::open(&self.path).with_context(|| "master key not found")?;
 
-        let mut key = Box::new(Zeroizing::new([0u8; MASTER_KEY_BYTES]));
-        harden_process_memory();
-        lock_memory(key.as_ptr(), MASTER_KEY_BYTES);
-        file.read_exact(key.as_mut().as_mut())
+        let mut key = MasterKey::zeroed_locked();
+        file.read_exact(key.as_mut_bytes())
             .with_context(|| "master key has invalid length")?;
         let mut extra = [0u8; 1];
         match file.read(&mut extra) {
@@ -120,7 +135,6 @@ impl FileStore {
             Ok(_) => bail!("master key has invalid length"),
             Err(err) => return Err(err).context("failed to validate master key length"),
         }
-        let key = MasterKey { key };
         Ok(key)
     }
 
@@ -157,22 +171,23 @@ impl FileStore {
                 .context("master key already exists")?;
         }
         validate_file_mode(&self.path)?;
+        sync_parent_dir(&self.path)?;
         Ok(())
     }
 
     fn create_atomic(&self) -> anyhow::Result<()> {
         self.ensure_parent()?;
 
-        let mut key = Zeroizing::new([0u8; MASTER_KEY_BYTES]);
-        OsRng.fill_bytes(key.as_mut());
+        let key = MasterKey::generate_locked();
 
         let mut options = OpenOptions::new();
         options.write(true).create_new(true).mode(0o600);
         match options.open(&self.path) {
             Ok(mut file) => {
-                file.write_all(key.as_ref())
+                file.write_all(key.as_bytes())
                     .context("failed to write new master key")?;
                 file.sync_all().context("failed to sync new master key")?;
+                sync_parent_dir(&self.path)?;
                 Ok(())
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
@@ -189,6 +204,14 @@ impl FileStore {
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).ok();
         Ok(())
     }
+}
+
+fn sync_parent_dir(path: &Path) -> anyhow::Result<()> {
+    let parent = path.parent().context("master key path has no parent")?;
+    File::open(parent)
+        .context("failed to open master key directory")?
+        .sync_all()
+        .context("failed to sync master key directory")
 }
 
 fn validate_file_mode(path: &Path) -> anyhow::Result<()> {

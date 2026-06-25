@@ -210,9 +210,9 @@ pub fn import_master_key(
         bail!("imported key has invalid length");
     }
 
-    let mut out = [0u8; KEY_BYTES];
-    out.copy_from_slice(&key);
-    Ok(Zeroizing::new(out))
+    let mut out = Zeroizing::new([0u8; KEY_BYTES]);
+    out.as_mut().copy_from_slice(&key);
+    Ok(out)
 }
 
 fn encrypt_with_key(
