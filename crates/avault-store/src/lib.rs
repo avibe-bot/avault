@@ -61,6 +61,37 @@ impl Drop for MasterKey {
     }
 }
 
+/// Apply best-effort process-wide memory hardening before secret material is read.
+///
+/// This disables core dumps where supported. It is intentionally idempotent so CLI
+/// startup and store key loading can both call it before their own secret windows.
+#[cfg(target_os = "linux")]
+pub fn harden_process_memory() {
+    // Safety invariant: `prctl(PR_SET_DUMPABLE, 0)` changes the current process dumpability
+    // and does not dereference user pointers. It prevents key pages from entering core dumps.
+    unsafe {
+        libc::prctl(libc::PR_SET_DUMPABLE, 0);
+    }
+}
+
+/// Apply best-effort process-wide memory hardening before secret material is read.
+#[cfg(target_os = "macos")]
+pub fn harden_process_memory() {
+    let limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // Safety invariant: `setrlimit(RLIMIT_CORE, {0,0})` changes only the current process
+    // resource limit and does not dereference Rust-owned secret buffers.
+    unsafe {
+        libc::setrlimit(libc::RLIMIT_CORE, &limit);
+    }
+}
+
+/// Apply best-effort process-wide memory hardening before secret material is read.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn harden_process_memory() {}
+
 /// Return the default P1 master-key path: `$AVAULT_HOME/machine.key` or
 /// `$HOME/.avibe/state/vault/machine.key`.
 pub fn default_master_key_path() -> anyhow::Result<PathBuf> {
@@ -237,18 +268,6 @@ fn validate_file_mode(path: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-fn harden_process_memory() {
-    // Safety invariant: `prctl(PR_SET_DUMPABLE, 0)` changes the current process dumpability
-    // and does not dereference user pointers. It prevents key pages from entering core dumps.
-    unsafe {
-        libc::prctl(libc::PR_SET_DUMPABLE, 0);
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn harden_process_memory() {}
-
-#[cfg(target_os = "linux")]
 fn lock_memory(ptr: *const u8, len: usize) {
     let (base, span) = page_span(ptr, len);
     // Safety invariant: the pointer/length describe the live master-key array owned by
@@ -262,11 +281,12 @@ fn lock_memory(ptr: *const u8, len: usize) {
 
 #[cfg(target_os = "macos")]
 fn lock_memory(ptr: *const u8, len: usize) {
+    let (base, span) = page_span(ptr, len);
     // Safety invariant: the pointer/length describe the live master-key array owned by
-    // `MasterKey`; `mlock` does not mutate Rust-visible contents. macOS has no
-    // `MADV_DONTDUMP`, so this is best-effort only.
+    // `MasterKey`; the page-aligned range covers that array and `mlock` does not mutate
+    // Rust-visible contents. macOS has no `MADV_DONTDUMP`, so this is best-effort only.
     unsafe {
-        libc::mlock(ptr.cast(), len);
+        libc::mlock((base as *const u8).cast(), span);
     }
 }
 
@@ -275,10 +295,7 @@ fn lock_memory(_ptr: *const u8, _len: usize) {}
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn unlock_memory(ptr: *const u8, len: usize) {
-    #[cfg(target_os = "linux")]
     let (base, span) = page_span(ptr, len);
-    #[cfg(target_os = "macos")]
-    let (base, span) = (ptr as usize, len);
     // Safety invariant: the pointer/length still refer to the master-key array during
     // `Drop`; `munlock` releases the page-lock after the explicit zeroize in `Drop`.
     unsafe {
@@ -289,7 +306,7 @@ fn unlock_memory(ptr: *const u8, len: usize) {
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn unlock_memory(_ptr: *const u8, _len: usize) {}
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn page_span(ptr: *const u8, len: usize) -> (usize, usize) {
     // Safety invariant: `sysconf(_SC_PAGESIZE)` reads process configuration and does not
     // dereference user pointers. A bad return falls back to the common 4096-byte page.
@@ -376,5 +393,17 @@ mod tests {
         let mode = fs::metadata(store.path()).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         assert!(stale_tmp.exists());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn page_span_covers_unaligned_range() {
+        let start = 0x12345usize;
+        let len = MASTER_KEY_BYTES;
+        let (base, span) = page_span(start as *const u8, len);
+
+        assert!(base <= start);
+        assert!(base + span >= start + len);
+        assert!(span >= len);
     }
 }

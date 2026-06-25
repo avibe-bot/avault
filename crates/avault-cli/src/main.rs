@@ -38,6 +38,8 @@ fn main() -> ExitCode {
 }
 
 fn run(args: Vec<OsString>) -> anyhow::Result<u8> {
+    avault_store::harden_process_memory();
+
     let Some(cmd) = args.first().and_then(|s| s.to_str()) else {
         print!("{USAGE}");
         return Ok(0);
@@ -117,11 +119,15 @@ fn deliver_run_cmd(args: &[OsString]) -> anyhow::Result<u8> {
     let master = avault_store::load_master_key(Backend::File)?;
     let mut plaintext =
         avault_core::open(master.as_bytes(), &name, &sealed).context("open failed")?;
+    drop(master);
 
     let mut child = {
         let env_value = std::str::from_utf8(plaintext.as_slice())
             .context("secret value is not valid UTF-8 for env delivery")?;
         let mut child = Command::new(&command[0]);
+        // Accepted standard-tier residual: `Command::env` copies this value into std's
+        // process builder and then into the child's environment. Rust does not expose that
+        // buffer for zeroizing; the value is wiped from avault's owned buffer after spawn.
         child.args(&command[1..]).env(&env_name, env_value);
         if envelope_stdin {
             child.stdin(Stdio::null());
@@ -136,7 +142,6 @@ fn deliver_run_cmd(args: &[OsString]) -> anyhow::Result<u8> {
     };
     plaintext.zeroize();
     drop(plaintext);
-    drop(master);
     let status = child.wait().context("failed to wait for child command")?;
 
     Ok(status.code().unwrap_or(1).try_into().unwrap_or(1))
