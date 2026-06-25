@@ -1,0 +1,12 @@
+{
+  "description": "P1 standard-tier AES-256-GCM envelope with AAD = name || scheme || version_byte.",
+  "name": "OPENAI_API_KEY",
+  "master_key_b64": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=",
+  "plaintext_b64": "c2sta25vd24tYW5zd2Vy",
+  "aad_b64": "T1BFTkFJX0FQSV9LRVltYWNoaW5lLWFlc2djbS12MQE=",
+  "sealed": {
+    "ciphertext": "591YZbAowty3GAJi7lbO5MKelwiFe7u9xA6By+yHYQ==",
+    "nonce": "EBESExQVFhcYGRob",
+    "wrap_meta": "{\"v\":1,\"scheme\":\"machine-aesgcm-v1\",\"wrapped_dek\":\"cpsE08g9vKmy1ehlbbVaVmD4Xi8zNdVZ1E/WqfU34LZM86DlFGfWRyNa7M+nK610\",\"dek_nonce\":\"ICEiIyQlJicoKSor\"}"
+  }
+}

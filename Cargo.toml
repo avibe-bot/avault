@@ -22,13 +22,19 @@ repository = "https://github.com/avibe-bot/avault"
 # opts in via `<dep>.workspace = true`. These are the intended primitives; wiring them
 # up is the P1 implementation work.
 [workspace.dependencies]
-aes-gcm = "0.10"      # AES-256-GCM AEAD
+aes-gcm = { version = "0.10", features = ["zeroize"] }      # AES-256-GCM AEAD
 hkdf = "0.12"         # HKDF-SHA256
 sha2 = "0.10"
 zeroize = { version = "1", features = ["zeroize_derive"] }  # deterministic wipe
 subtle = "2"          # constant-time comparison
 rand = "0.8"          # CSPRNG (OsRng)
 anyhow = "1"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+scrypt = "0.11"
+libc = "0.2"
+tempfile = "3"
 
 [profile.release]
 # Custody binary: keep symbols lean; the memory-hardening lives in code, not flags.

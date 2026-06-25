@@ -11,3 +11,8 @@ repository.workspace = true
 [dependencies]
 zeroize.workspace = true
 anyhow.workspace = true
+rand.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
