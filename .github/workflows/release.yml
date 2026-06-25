@@ -30,8 +30,7 @@ jobs:
 
     steps:
       - name: Check out repository
-        # Pinned from actions/checkout@v4.
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
 
@@ -47,8 +46,7 @@ jobs:
           fi
 
       - name: Cache cargo registry and build artifacts
-        # Pinned from actions/cache@v4.
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/bin/
@@ -105,8 +103,7 @@ jobs:
 
       - name: Upload unsigned macOS build artifact
         if: matrix.target_name == 'macos-arm64'
-        # Pinned from actions/upload-artifact@v4.
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: unsigned-macos-arm64
           path: |
@@ -116,8 +113,7 @@ jobs:
 
       - name: Upload Linux release artifact
         if: matrix.target_name == 'linux-x64'
-        # Pinned from actions/upload-artifact@v4.
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: avault-linux-x64
           path: |
@@ -134,8 +130,7 @@ jobs:
 
     steps:
       - name: Download unsigned macOS artifact
-        # Pinned from actions/download-artifact@v4.
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: unsigned-macos-arm64
           path: unsigned-macos
@@ -254,8 +249,7 @@ jobs:
           )
 
       - name: Upload macOS release artifact
-        # Pinned from actions/upload-artifact@v4.
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: avault-macos-arm64
           path: |
@@ -274,8 +268,7 @@ jobs:
 
     steps:
       - name: Download packaged artifacts
-        # Pinned from actions/download-artifact@v4.
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: avault-*
           path: dist
@@ -316,8 +309,7 @@ jobs:
           PY
 
       - name: Create GitHub Release
-        # Pinned from softprops/action-gh-release@v2.
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           tag_name: ${{ github.ref_name }}
           name: avault ${{ github.ref_name }}
