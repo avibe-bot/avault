@@ -7,12 +7,14 @@
 use anyhow::{bail, Context};
 use rand::rngs::OsRng;
 use rand::RngCore;
+use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::env;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use zeroize::{Zeroize, Zeroizing};
+use std::ptr::NonNull;
+use zeroize::Zeroize;
 
 /// Master key size for the standard-tier store.
 pub const MASTER_KEY_BYTES: usize = 32;
@@ -27,37 +29,89 @@ pub enum Backend {
 
 /// The loaded master key. The buffer is zeroized on drop and mlock'd where available.
 pub struct MasterKey {
-    key: Box<Zeroizing<[u8; MASTER_KEY_BYTES]>>,
+    page: LockedKeyPage,
 }
 
 impl MasterKey {
-    fn zeroed_locked() -> Self {
-        let key = Box::new(Zeroizing::new([0u8; MASTER_KEY_BYTES]));
+    fn zeroed_locked() -> anyhow::Result<Self> {
+        let page = LockedKeyPage::new_zeroed()?;
         harden_process_memory();
-        lock_memory(key.as_ptr(), MASTER_KEY_BYTES);
-        Self { key }
+        lock_memory(page.as_ptr(), page.len());
+        Ok(Self { page })
     }
 
-    fn generate_locked() -> Self {
-        let mut key = Self::zeroed_locked();
-        OsRng.fill_bytes(key.key.as_mut().as_mut());
-        key
+    fn generate_locked() -> anyhow::Result<Self> {
+        let mut key = Self::zeroed_locked()?;
+        OsRng.fill_bytes(key.as_mut_bytes());
+        Ok(key)
     }
 
     /// Borrow the key for a single crypto operation.
     pub fn as_bytes(&self) -> &[u8; MASTER_KEY_BYTES] {
-        self.key.as_ref()
+        self.page.as_key()
     }
 
     fn as_mut_bytes(&mut self) -> &mut [u8; MASTER_KEY_BYTES] {
-        self.key.as_mut()
+        self.page.as_mut_key()
     }
 }
 
-impl Drop for MasterKey {
+struct LockedKeyPage {
+    ptr: NonNull<u8>,
+    len: usize,
+    layout: Layout,
+}
+
+impl LockedKeyPage {
+    fn new_zeroed() -> anyhow::Result<Self> {
+        let page = system_page_size();
+        let layout =
+            Layout::from_size_align(page, page).context("invalid master key page layout")?;
+        // Safety invariant: `layout` is non-zero and page-aligned; the returned allocation is
+        // owned only by this `LockedKeyPage` and is zero-filled before any key material is read.
+        let ptr = unsafe { alloc_zeroed(layout) };
+        let ptr = NonNull::new(ptr).context("failed to allocate master key page")?;
+        Ok(Self {
+            ptr,
+            len: page,
+            layout,
+        })
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        self.ptr.as_ptr()
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn as_key(&self) -> &[u8; MASTER_KEY_BYTES] {
+        // Safety invariant: `ptr` points to a live allocation of at least one page, and the first
+        // 32 bytes are reserved exclusively for the master key for this object's lifetime.
+        unsafe { &*(self.ptr.as_ptr().cast::<[u8; MASTER_KEY_BYTES]>()) }
+    }
+
+    fn as_mut_key(&mut self) -> &mut [u8; MASTER_KEY_BYTES] {
+        // Safety invariant: `&mut self` proves unique access to this dedicated page, whose first
+        // 32 bytes are reserved exclusively for the master key.
+        unsafe { &mut *(self.ptr.as_ptr().cast::<[u8; MASTER_KEY_BYTES]>()) }
+    }
+}
+
+impl Drop for LockedKeyPage {
     fn drop(&mut self) {
-        self.key.as_mut().zeroize();
-        unlock_memory(self.key.as_ptr(), MASTER_KEY_BYTES);
+        // Safety invariant: the page is still exclusively owned here; zeroizing the full page
+        // clears the key bytes before `munlock` and before returning the allocation to the heap.
+        unsafe {
+            std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len).zeroize();
+        }
+        unlock_memory(self.ptr.as_ptr(), self.len);
+        // Safety invariant: this is the same layout returned by `new_zeroed`, and the page has
+        // not been deallocated elsewhere.
+        unsafe {
+            dealloc(self.ptr.as_ptr(), self.layout);
+        }
     }
 }
 
@@ -154,10 +208,11 @@ impl FileStore {
 
     /// Return the existing master key, or error if missing/corrupt.
     pub fn get(&self) -> anyhow::Result<MasterKey> {
+        validate_parent_directory_mode(&self.path)?;
         validate_file_mode(&self.path)?;
         let mut file = File::open(&self.path).with_context(|| "master key not found")?;
 
-        let mut key = MasterKey::zeroed_locked();
+        let mut key = MasterKey::zeroed_locked()?;
         file.read_exact(key.as_mut_bytes())
             .with_context(|| "master key has invalid length")?;
         let mut extra = [0u8; 1];
@@ -199,7 +254,7 @@ impl FileStore {
     fn create_atomic(&self) -> anyhow::Result<()> {
         self.ensure_parent()?;
 
-        let key = MasterKey::generate_locked();
+        let key = MasterKey::generate_locked()?;
         let parent = self
             .path
             .parent()
@@ -224,7 +279,9 @@ impl FileStore {
             .parent()
             .context("master key path has no parent")?;
         fs::create_dir_all(parent).context("failed to create master key directory")?;
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).ok();
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+            .context("failed to secure master key directory")?;
+        validate_directory_mode(parent)?;
         Ok(())
     }
 }
@@ -265,6 +322,20 @@ fn validate_file_mode(path: &Path) -> anyhow::Result<()> {
         bail!("master key mode is too open");
     }
     Ok(())
+}
+
+fn validate_directory_mode(path: &Path) -> anyhow::Result<()> {
+    let metadata = fs::metadata(path).context("failed to stat master key directory")?;
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        bail!("master key directory mode is too open");
+    }
+    Ok(())
+}
+
+fn validate_parent_directory_mode(path: &Path) -> anyhow::Result<()> {
+    let parent = path.parent().context("master key path has no parent")?;
+    validate_directory_mode(parent)
 }
 
 #[cfg(target_os = "linux")]
@@ -308,16 +379,27 @@ fn unlock_memory(_ptr: *const u8, _len: usize) {}
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn page_span(ptr: *const u8, len: usize) -> (usize, usize) {
-    // Safety invariant: `sysconf(_SC_PAGESIZE)` reads process configuration and does not
-    // dereference user pointers. A bad return falls back to the common 4096-byte page.
-    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    let page = usize::try_from(page)
-        .ok()
-        .filter(|p| *p > 0)
-        .unwrap_or(4096);
+    let page = system_page_size();
     let start = (ptr as usize / page) * page;
     let end = (ptr as usize + len).div_ceil(page) * page;
     (start, end.saturating_sub(start))
+}
+
+fn system_page_size() -> usize {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        // Safety invariant: `sysconf(_SC_PAGESIZE)` reads process configuration and does not
+        // dereference user pointers. A bad return falls back to the common 4096-byte page.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        usize::try_from(page)
+            .ok()
+            .filter(|p| *p > 0)
+            .unwrap_or(4096)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        4096
+    }
 }
 
 #[cfg(test)]
@@ -351,6 +433,28 @@ mod tests {
         store.get_or_create().unwrap();
         fs::set_permissions(store.path(), fs::Permissions::from_mode(0o644)).unwrap();
         assert!(store.get().is_err());
+    }
+
+    #[test]
+    fn refuses_loose_parent_directory_on_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileStore::new(tmp.path().join("machine.key"));
+        fs::write(store.path(), [1u8; MASTER_KEY_BYTES]).unwrap();
+        fs::set_permissions(store.path(), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o777)).unwrap();
+
+        assert!(store.get().is_err());
+    }
+
+    #[test]
+    fn master_keys_use_dedicated_pages() {
+        let first = MasterKey::generate_locked().unwrap();
+        let second = MasterKey::generate_locked().unwrap();
+        let page = system_page_size();
+        let first_page = first.as_bytes().as_ptr() as usize / page;
+        let second_page = second.as_bytes().as_ptr() as usize / page;
+
+        assert_ne!(first_page, second_page);
     }
 
     #[test]

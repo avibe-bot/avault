@@ -13,6 +13,10 @@ use std::io::{self, Read};
 use std::process::{Command, ExitCode, Stdio};
 use zeroize::{Zeroize, Zeroizing};
 
+const MAX_STDIN_SECRET_BYTES: usize = 1024 * 1024;
+const MAX_STDIN_ENVELOPE_BYTES: usize = 2 * 1024 * 1024;
+const STDIN_READ_CHUNK_BYTES: usize = 8192;
+
 const USAGE: &str = "\
 avault — Avibe Vaults custody core
 
@@ -174,13 +178,13 @@ fn key_export_cmd() -> anyhow::Result<u8> {
 fn key_import_cmd(args: &[OsString]) -> anyhow::Result<u8> {
     let force = parse_flag(args, "--force")?;
     let mut input = read_stdin_zeroizing().context("failed to read key import JSON from stdin")?;
-    let request: KeyImportRequest =
-        serde_json::from_slice(input.as_slice()).context("key import JSON is invalid")?;
+    let mut passphrase =
+        import_passphrase_from_json(input.as_slice()).context("key import JSON is invalid")?;
+    let blob = import_blob_from_json(input.as_slice()).context("key import JSON is invalid")?;
     input.zeroize();
 
-    let mut passphrase = Zeroizing::new(request.passphrase.into_bytes());
     trim_trailing_newlines(passphrase.as_mut());
-    let key = avault_core::import_master_key(&request.blob, passphrase.as_slice())
+    let key = avault_core::import_master_key(&blob, passphrase.as_slice())
         .context("key import failed")?;
     passphrase.zeroize();
 
@@ -192,10 +196,229 @@ fn key_import_cmd(args: &[OsString]) -> anyhow::Result<u8> {
     Ok(0)
 }
 
-#[derive(serde::Deserialize)]
-struct KeyImportRequest {
-    passphrase: String,
-    blob: ExportBlob,
+fn import_blob_from_json(input: &[u8]) -> anyhow::Result<ExportBlob> {
+    let value_start = find_json_field_value(input, b"blob")?;
+    let value_end = json_value_end(input, value_start)?;
+    serde_json::from_slice(&input[value_start..value_end]).context("key import blob is invalid")
+}
+
+fn import_passphrase_from_json(input: &[u8]) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+    let passphrase_start = find_json_field_value(input, b"passphrase")?;
+    if input.get(passphrase_start) != Some(&b'"') {
+        bail!("key import passphrase must be a string");
+    }
+    decode_json_string_bytes(&input[passphrase_start..])
+}
+
+fn find_json_field_value(input: &[u8], field: &[u8]) -> anyhow::Result<usize> {
+    let mut index = skip_json_ws(input, 0);
+    if input.get(index) != Some(&b'{') {
+        bail!("key import JSON must be an object");
+    }
+    index += 1;
+
+    loop {
+        index = skip_json_ws(input, index);
+        if input.get(index) == Some(&b'}') {
+            bail!("key import JSON missing required field");
+        }
+        if input.get(index) != Some(&b'"') {
+            bail!("key import JSON object key expected");
+        }
+
+        let key_start = index;
+        let key = decode_json_string_bytes(&input[key_start..])?;
+        let after_key = json_string_end(&input[key_start..])? + key_start;
+        index = after_key;
+
+        let colon = skip_json_ws(input, index);
+        if input.get(colon) != Some(&b':') {
+            bail!("key import JSON is invalid");
+        }
+        let value = skip_json_ws(input, colon + 1);
+        if key.as_slice() == field {
+            return Ok(value);
+        }
+
+        index = skip_json_ws(input, json_value_end(input, value)?);
+        match input.get(index) {
+            Some(b',') => index += 1,
+            Some(b'}') => bail!("key import JSON missing required field"),
+            _ => bail!("key import JSON is invalid"),
+        }
+    }
+}
+
+fn decode_json_string_bytes(input: &[u8]) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+    if input.first() != Some(&b'"') {
+        bail!("JSON string expected");
+    }
+
+    let mut out = Zeroizing::new(Vec::with_capacity(input.len().min(MAX_STDIN_SECRET_BYTES)));
+    let mut index = 1;
+    while index < input.len() {
+        match input[index] {
+            b'"' => return Ok(out),
+            b'\\' => {
+                index += 1;
+                let escaped = *input.get(index).context("unterminated JSON escape")?;
+                match escaped {
+                    b'"' => out.push(b'"'),
+                    b'\\' => out.push(b'\\'),
+                    b'/' => out.push(b'/'),
+                    b'b' => out.push(0x08),
+                    b'f' => out.push(0x0c),
+                    b'n' => out.push(b'\n'),
+                    b'r' => out.push(b'\r'),
+                    b't' => out.push(b'\t'),
+                    b'u' => {
+                        let (scalar, consumed) = decode_json_unicode_escape(input, index + 1)?;
+                        let mut utf8 = [0u8; 4];
+                        out.extend_from_slice(scalar.encode_utf8(&mut utf8).as_bytes());
+                        index += consumed;
+                    }
+                    _ => bail!("invalid JSON escape"),
+                }
+            }
+            byte if byte < 0x20 => bail!("invalid control byte in JSON string"),
+            byte => out.push(byte),
+        }
+        if out.len() > MAX_STDIN_SECRET_BYTES {
+            bail!("stdin secret input exceeds the supported size limit");
+        }
+        index += 1;
+    }
+    bail!("unterminated JSON string");
+}
+
+fn decode_json_unicode_escape(input: &[u8], start: usize) -> anyhow::Result<(char, usize)> {
+    let first = decode_hex_quad(input, start)?;
+    if (0xD800..=0xDBFF).contains(&first) {
+        if input.get(start + 4) != Some(&b'\\') || input.get(start + 5) != Some(&b'u') {
+            bail!("invalid JSON surrogate pair");
+        }
+        let second = decode_hex_quad(input, start + 6)?;
+        if !(0xDC00..=0xDFFF).contains(&second) {
+            bail!("invalid JSON surrogate pair");
+        }
+        let codepoint = 0x10000 + (((first - 0xD800) as u32) << 10) + (second - 0xDC00) as u32;
+        Ok((
+            char::from_u32(codepoint).context("invalid JSON unicode escape")?,
+            10,
+        ))
+    } else if (0xDC00..=0xDFFF).contains(&first) {
+        bail!("invalid JSON surrogate pair");
+    } else {
+        Ok((
+            char::from_u32(first as u32).context("invalid JSON unicode escape")?,
+            4,
+        ))
+    }
+}
+
+fn decode_hex_quad(input: &[u8], start: usize) -> anyhow::Result<u16> {
+    let bytes = input
+        .get(start..start + 4)
+        .context("short JSON unicode escape")?;
+    let mut value = 0u16;
+    for byte in bytes {
+        value = (value << 4) | u16::from(hex_value(*byte)?);
+    }
+    Ok(value)
+}
+
+fn hex_value(byte: u8) -> anyhow::Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => bail!("invalid JSON unicode escape"),
+    }
+}
+
+fn json_string_end(input: &[u8]) -> anyhow::Result<usize> {
+    if input.first() != Some(&b'"') {
+        bail!("JSON string expected");
+    }
+    let mut index = 1;
+    while index < input.len() {
+        match input[index] {
+            b'"' => return Ok(index + 1),
+            b'\\' => {
+                index += 1;
+                if input.get(index).is_none() {
+                    bail!("unterminated JSON escape");
+                }
+            }
+            byte if byte < 0x20 => bail!("invalid control byte in JSON string"),
+            _ => {}
+        }
+        index += 1;
+    }
+    bail!("unterminated JSON string");
+}
+
+fn json_value_end(input: &[u8], start: usize) -> anyhow::Result<usize> {
+    match input.get(start).copied().context("missing JSON value")? {
+        b'"' => Ok(start + json_string_end(&input[start..])?),
+        b'{' | b'[' => json_compound_end(input, start),
+        b'-' | b'0'..=b'9' => Ok(json_scalar_end(input, start)),
+        b't' if input.get(start..start + 4) == Some(b"true") => Ok(start + 4),
+        b'f' if input.get(start..start + 5) == Some(b"false") => Ok(start + 5),
+        b'n' if input.get(start..start + 4) == Some(b"null") => Ok(start + 4),
+        _ => bail!("invalid JSON value"),
+    }
+}
+
+fn json_compound_end(input: &[u8], start: usize) -> anyhow::Result<usize> {
+    let mut stack = vec![input[start]];
+    let mut index = start + 1;
+    while index < input.len() {
+        match input[index] {
+            b'"' => index += json_string_end(&input[index..])?,
+            b'{' | b'[' => {
+                stack.push(input[index]);
+                index += 1;
+            }
+            b'}' => {
+                if stack.pop() != Some(b'{') {
+                    bail!("invalid JSON object");
+                }
+                index += 1;
+                if stack.is_empty() {
+                    return Ok(index);
+                }
+            }
+            b']' => {
+                if stack.pop() != Some(b'[') {
+                    bail!("invalid JSON array");
+                }
+                index += 1;
+                if stack.is_empty() {
+                    return Ok(index);
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    bail!("unterminated JSON value");
+}
+
+fn json_scalar_end(input: &[u8], mut index: usize) -> usize {
+    while matches!(
+        input.get(index),
+        Some(b'-' | b'+' | b'.' | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z')
+    ) {
+        index += 1;
+    }
+    index
+}
+
+fn skip_json_ws(input: &[u8], mut index: usize) -> usize {
+    while matches!(input.get(index), Some(b' ' | b'\n' | b'\r' | b'\t')) {
+        index += 1;
+    }
+    index
 }
 
 fn parse_required_option(args: &[OsString], flag: &str) -> anyhow::Result<String> {
@@ -265,9 +488,32 @@ fn parse_flag(args: &[OsString], flag: &str) -> anyhow::Result<bool> {
 }
 
 fn read_stdin_zeroizing() -> anyhow::Result<Zeroizing<Vec<u8>>> {
-    let mut buf = Zeroizing::new(Vec::new());
-    io::stdin().read_to_end(buf.as_mut())?;
-    Ok(buf)
+    read_zeroizing_to_cap(io::stdin(), MAX_STDIN_SECRET_BYTES)
+}
+
+fn read_zeroizing_to_cap(
+    mut reader: impl Read,
+    max_len: usize,
+) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+    let mut out = Zeroizing::new(Vec::with_capacity(max_len));
+    let mut scratch = Zeroizing::new([0u8; STDIN_READ_CHUNK_BYTES]);
+
+    while out.len() < max_len {
+        let remaining = max_len - out.len();
+        let read_len = remaining.min(scratch.len());
+        let n = reader.read(&mut scratch[..read_len])?;
+        if n == 0 {
+            return Ok(out);
+        }
+        out.extend_from_slice(&scratch[..n]);
+        scratch[..n].zeroize();
+    }
+
+    let mut extra = Zeroizing::new([0u8; 1]);
+    match reader.read(extra.as_mut())? {
+        0 => Ok(out),
+        _ => bail!("stdin secret input exceeds the supported size limit"),
+    }
 }
 
 fn read_envelope(path: Option<&str>) -> anyhow::Result<Zeroizing<Vec<u8>>> {
@@ -275,12 +521,63 @@ fn read_envelope(path: Option<&str>) -> anyhow::Result<Zeroizing<Vec<u8>>> {
         Some(path) => fs::read(path)
             .map(Zeroizing::new)
             .context("failed to read envelope file"),
-        None => read_stdin_zeroizing().context("failed to read envelope JSON from stdin"),
+        None => read_zeroizing_to_cap(io::stdin(), MAX_STDIN_ENVELOPE_BYTES)
+            .context("failed to read envelope JSON from stdin"),
     }
 }
 
 fn trim_trailing_newlines(buf: &mut Vec<u8>) {
     while matches!(buf.last(), Some(b'\n' | b'\r')) {
         buf.pop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stdin_reader_accepts_exact_cap() {
+        let input = vec![7u8; 16];
+        let out = read_zeroizing_to_cap(input.as_slice(), 16).unwrap();
+
+        assert_eq!(out.as_slice(), input.as_slice());
+        assert!(out.capacity() >= 16);
+    }
+
+    #[test]
+    fn stdin_reader_rejects_past_cap() {
+        let input = vec![7u8; 17];
+
+        assert!(read_zeroizing_to_cap(input.as_slice(), 16).is_err());
+    }
+
+    #[test]
+    fn import_passphrase_decodes_json_escapes_without_root_value() {
+        let input = br#"{"blob":{"passphrase":"not-this"},"passphrase":"line\n\uD83D\uDD11"}"#;
+        let passphrase = import_passphrase_from_json(input).unwrap();
+
+        assert_eq!(passphrase.as_slice(), "line\n🔑".as_bytes());
+    }
+
+    #[test]
+    fn import_blob_ignores_nested_passphrase_fields() {
+        let input = br#"{
+            "passphrase":"secret",
+            "blob":{
+                "scheme":"machine-key-export-v1",
+                "kdf":"scrypt",
+                "n":32768,
+                "r":8,
+                "p":1,
+                "salt":"c2FsdHlzYWx0eXNhbHQh",
+                "nonce":"KCkqKywtLi8wMTIz",
+                "ciphertext":"tPZK1A2HjfEGQHGTIaLP0fexWVdzlWPip9Ze0b909RrXyIjE/1sj0YZFTYnOxflB",
+                "passphrase":"not-this"
+            }
+        }"#;
+        let blob = import_blob_from_json(input).unwrap();
+
+        assert_eq!(blob.scheme, "machine-key-export-v1");
     }
 }
