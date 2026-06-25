@@ -8,6 +8,7 @@ use avault_core::{ExportBlob, Sealed};
 use avault_store::{Backend, FileStore};
 use std::env;
 use std::ffi::OsString;
+use std::fs;
 use std::io::{self, Read};
 use std::process::{Command, ExitCode, Stdio};
 use zeroize::{Zeroize, Zeroizing};
@@ -17,7 +18,7 @@ avault — Avibe Vaults custody core
 
 USAGE:
     avault seal --name NAME
-    avault deliver run --name NAME --env VAR -- COMMAND [ARGS...]
+    avault deliver run --name NAME --env VAR [--envelope-file PATH] -- COMMAND [ARGS...]
     avault key export
     avault key import [--force]
     avault version
@@ -100,29 +101,42 @@ fn deliver_run_cmd(args: &[OsString]) -> anyhow::Result<u8> {
         bail!("deliver run requires a command");
     }
 
-    let name = parse_required_option(options, "--name")?;
-    let env_name = parse_required_option(options, "--env")?;
+    let run_options = parse_deliver_run_options(options)?;
+    let name = run_options.name;
+    let env_name = run_options.env_name;
+    let envelope_file = run_options.envelope_file;
     if env_name.contains('=') || env_name.is_empty() {
         bail!("invalid env var name");
     }
 
+    let envelope_stdin = envelope_file.is_none();
+    let envelope = read_envelope(envelope_file.as_deref())?;
     let sealed: Sealed =
-        serde_json::from_slice(&read_stdin_bytes()?).context("envelope JSON is invalid")?;
+        serde_json::from_slice(envelope.as_slice()).context("envelope JSON is invalid")?;
     let master = avault_store::load_master_key(Backend::File)?;
     let mut plaintext =
         avault_core::open(master.as_bytes(), &name, &sealed).context("open failed")?;
 
-    let env_value = std::str::from_utf8(plaintext.as_slice())
-        .context("secret value is not valid UTF-8 for env delivery")?;
-    let status = Command::new(&command[0])
-        .args(&command[1..])
-        .env(&env_name, env_value)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .context("failed to run child command")?;
+    let mut child = {
+        let env_value = std::str::from_utf8(plaintext.as_slice())
+            .context("secret value is not valid UTF-8 for env delivery")?;
+        let mut child = Command::new(&command[0]);
+        child.args(&command[1..]).env(&env_name, env_value);
+        if envelope_stdin {
+            child.stdin(Stdio::null());
+        } else {
+            child.stdin(Stdio::inherit());
+        }
+        child
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .context("failed to run child command")?
+    };
     plaintext.zeroize();
+    drop(plaintext);
+    drop(master);
+    let status = child.wait().context("failed to wait for child command")?;
 
     Ok(status.code().unwrap_or(1).try_into().unwrap_or(1))
 }
@@ -152,9 +166,9 @@ fn key_export_cmd() -> anyhow::Result<u8> {
 
 fn key_import_cmd(args: &[OsString]) -> anyhow::Result<u8> {
     let force = parse_flag(args, "--force")?;
-    let mut input = read_stdin_bytes().context("failed to read key import JSON from stdin")?;
+    let mut input = read_stdin_zeroizing().context("failed to read key import JSON from stdin")?;
     let request: KeyImportRequest =
-        serde_json::from_slice(&input).context("key import JSON is invalid")?;
+        serde_json::from_slice(input.as_slice()).context("key import JSON is invalid")?;
     input.zeroize();
 
     let mut passphrase = Zeroizing::new(request.passphrase.into_bytes());
@@ -191,6 +205,45 @@ fn parse_required_option(args: &[OsString], flag: &str) -> anyhow::Result<String
     bail!("{flag} is required");
 }
 
+struct DeliverRunOptions {
+    name: String,
+    env_name: String,
+    envelope_file: Option<String>,
+}
+
+fn parse_deliver_run_options(args: &[OsString]) -> anyhow::Result<DeliverRunOptions> {
+    let mut name = None;
+    let mut env_name = None;
+    let mut envelope_file = None;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index]
+            .to_str()
+            .context("deliver run options must be valid UTF-8")?;
+        let target = match flag {
+            "--name" => &mut name,
+            "--env" => &mut env_name,
+            "--envelope-file" => &mut envelope_file,
+            other => bail!("unknown deliver run option: {other}"),
+        };
+        if target.is_some() {
+            bail!("{flag} was provided more than once");
+        }
+        let value = args
+            .get(index + 1)
+            .and_then(|s| s.to_str())
+            .with_context(|| format!("{flag} requires a value"))?;
+        *target = Some(value.to_string());
+        index += 2;
+    }
+
+    Ok(DeliverRunOptions {
+        name: name.context("--name is required")?,
+        env_name: env_name.context("--env is required")?,
+        envelope_file,
+    })
+}
+
 fn parse_flag(args: &[OsString], flag: &str) -> anyhow::Result<bool> {
     let mut seen = false;
     for arg in args {
@@ -211,6 +264,15 @@ fn read_stdin_bytes() -> anyhow::Result<Vec<u8>> {
     let mut buf = Vec::new();
     io::stdin().read_to_end(&mut buf)?;
     Ok(buf)
+}
+
+fn read_envelope(path: Option<&str>) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+    match path {
+        Some(path) => fs::read(path)
+            .map(Zeroizing::new)
+            .context("failed to read envelope file"),
+        None => read_stdin_zeroizing().context("failed to read envelope JSON from stdin"),
+    }
 }
 
 fn trim_trailing_newlines(buf: &mut Vec<u8>) {

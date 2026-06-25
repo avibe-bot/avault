@@ -110,6 +110,8 @@ impl FileStore {
         let mut file = File::open(&self.path).with_context(|| "master key not found")?;
 
         let mut key = Box::new(Zeroizing::new([0u8; MASTER_KEY_BYTES]));
+        harden_process_memory();
+        lock_memory(key.as_ptr(), MASTER_KEY_BYTES);
         file.read_exact(key.as_mut().as_mut())
             .with_context(|| "master key has invalid length")?;
         let mut extra = [0u8; 1];
@@ -118,32 +120,42 @@ impl FileStore {
             Ok(_) => bail!("master key has invalid length"),
             Err(err) => return Err(err).context("failed to validate master key length"),
         }
-        harden_process_memory();
-        lock_memory(key.as_ptr(), MASTER_KEY_BYTES);
         let key = MasterKey { key };
         Ok(key)
     }
 
     /// Import a master key, refusing to overwrite unless `force` is true.
     pub fn import(&self, key: &[u8; MASTER_KEY_BYTES], force: bool) -> anyhow::Result<()> {
+        self.ensure_parent()?;
         if self.path.exists() && !force {
             bail!("master key already exists");
         }
-        self.ensure_parent()?;
-        let tmp_path = self.path.with_extension("tmp");
-        {
-            let mut tmp = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp_path)
-                .context("failed to create temporary master key file")?;
-            tmp.write_all(key)
-                .context("failed to write temporary master key file")?;
-            tmp.sync_all().ok();
+
+        let parent = self
+            .path
+            .parent()
+            .context("master key path has no parent")?;
+        let mut tmp = tempfile::Builder::new()
+            .prefix(".machine.")
+            .suffix(".tmp")
+            .tempfile_in(parent)
+            .context("failed to create temporary master key file")?;
+        tmp.as_file_mut()
+            .write_all(key)
+            .context("failed to write temporary master key file")?;
+        tmp.as_file_mut()
+            .sync_all()
+            .context("failed to sync temporary master key file")?;
+
+        if force {
+            tmp.persist(&self.path)
+                .map_err(|err| err.error)
+                .context("failed to install imported master key")?;
+        } else {
+            tmp.persist_noclobber(&self.path)
+                .map_err(|err| err.error)
+                .context("master key already exists")?;
         }
-        fs::rename(&tmp_path, &self.path).context("failed to install imported master key")?;
         validate_file_mode(&self.path)?;
         Ok(())
     }
@@ -160,7 +172,7 @@ impl FileStore {
             Ok(mut file) => {
                 file.write_all(key.as_ref())
                     .context("failed to write new master key")?;
-                file.sync_all().ok();
+                file.sync_all().context("failed to sync new master key")?;
                 Ok(())
             }
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
@@ -207,8 +219,8 @@ fn lock_memory(ptr: *const u8, len: usize) {
     // `MasterKey`; `mlock` and `madvise` do not mutate Rust-visible contents. Failures are
     // best-effort because unprivileged systems may cap `RLIMIT_MEMLOCK`.
     unsafe {
-        libc::mlock(base.cast(), span);
-        libc::madvise(base.cast(), span, libc::MADV_DONTDUMP);
+        libc::mlock((base as *const u8).cast(), span);
+        libc::madvise((base as *mut u8).cast(), span, libc::MADV_DONTDUMP);
     }
 }
 
@@ -297,5 +309,21 @@ mod tests {
         assert!(store.import(&key, false).is_err());
         store.import(&key, true).unwrap();
         assert_eq!(store.get().unwrap().as_bytes(), &key);
+    }
+
+    #[test]
+    fn import_does_not_reuse_stale_temp_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileStore::new(tmp.path().join("machine.key"));
+        let stale_tmp = tmp.path().join("machine.tmp");
+        fs::write(&stale_tmp, [3u8; MASTER_KEY_BYTES]).unwrap();
+        fs::set_permissions(&stale_tmp, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let key = [9u8; MASTER_KEY_BYTES];
+        store.import(&key, false).unwrap();
+        assert_eq!(store.get().unwrap().as_bytes(), &key);
+        let mode = fs::metadata(store.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert!(stale_tmp.exists());
     }
 }

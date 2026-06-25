@@ -104,6 +104,49 @@ fn deliver_run_returns_child_exit_code() {
 }
 
 #[test]
+fn envelope_file_preserves_child_stdin() {
+    let home = tempfile::tempdir().unwrap();
+    let input_file = home.path().join("child-input.txt");
+    let envelope_file = home.path().join("envelope.json");
+    fs::write(&input_file, b"child-stdin").unwrap();
+
+    let mut seal = avault()
+        .arg("seal")
+        .arg("--name")
+        .arg("OPENAI_API_KEY")
+        .env("AVAULT_HOME", home.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    seal.stdin.as_mut().unwrap().write_all(b"s3cr3t").unwrap();
+    let seal_output = seal.wait_with_output().unwrap();
+    assert!(seal_output.status.success());
+    fs::write(&envelope_file, &seal_output.stdout).unwrap();
+
+    let output = avault()
+        .arg("deliver")
+        .arg("run")
+        .arg("--name")
+        .arg("OPENAI_API_KEY")
+        .arg("--env")
+        .arg("SECRET_VALUE")
+        .arg("--envelope-file")
+        .arg(&envelope_file)
+        .arg("--")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg(r#"read line; test "$SECRET_VALUE" = "s3cr3t" && printf "$line""#)
+        .env("AVAULT_HOME", home.path())
+        .stdin(fs::File::open(&input_file).unwrap())
+        .stdout(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"child-stdin");
+}
+
+#[test]
 fn child_exit_2_is_distinct_from_avault_internal_failure() {
     let home = tempfile::tempdir().unwrap();
 
@@ -297,6 +340,28 @@ fn key_export_requires_existing_master_key() {
         .unwrap();
     let output = export.wait_with_output().unwrap();
     assert!(!output.status.success());
+    assert!(!home.path().join("machine.key").exists());
+}
+
+#[test]
+fn key_import_rejects_malformed_json() {
+    let home = tempfile::tempdir().unwrap();
+    let mut import = avault()
+        .arg("key")
+        .arg("import")
+        .env("AVAULT_HOME", home.path())
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    import
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(br#"{"passphrase":"secret","#)
+        .unwrap();
+    let output = import.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(70));
     assert!(!home.path().join("machine.key").exists());
 }
 

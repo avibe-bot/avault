@@ -52,6 +52,7 @@ pub struct Sealed {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct WrapMeta {
+    #[serde(default = "default_wrap_meta_version")]
     v: u8,
     scheme: String,
     wrapped_dek: String,
@@ -201,8 +202,10 @@ pub fn import_master_key(
     let nonce = decode_nonce(&blob.nonce, "nonce")?;
     let ciphertext = unb64(&blob.ciphertext, "ciphertext")?;
     let kek = derive_kek_scrypt(passphrase, &salt, blob.n, blob.r, blob.p)?;
-    let key = decrypt_with_key(&kek, &nonce, &ciphertext, &[])
-        .context("import failed (wrong passphrase or corrupt export)")?;
+    let key = Zeroizing::new(
+        decrypt_with_key(&kek, &nonce, &ciphertext, &[])
+            .context("import failed (wrong passphrase or corrupt export)")?,
+    );
     if key.len() != KEY_BYTES {
         bail!("imported key has invalid length");
     }
@@ -310,6 +313,10 @@ fn slice_to_key(key: &[u8]) -> anyhow::Result<&[u8; KEY_BYTES]> {
     key.try_into().map_err(|_| anyhow!("invalid key length"))
 }
 
+fn default_wrap_meta_version() -> u8 {
+    WRAP_META_VERSION
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,6 +393,22 @@ mod tests {
             nonce: "MDEyMzQ1Njc4OTo7".to_string(),
             wrap_meta: json!({
                 "v": 1,
+                "scheme": WRAP_SCHEME,
+                "wrapped_dek": "suj8cHJp0VSVnU1txzlNBBmnMD/TUGlEHy4kjvt+g7RlXgPlB6d7YQpDbhPKDEg7",
+                "dek_nonce": "QEFCQ0RFRkdISUpL"
+            })
+            .to_string(),
+        };
+        let opened = open(&MASTER_KEY, "OPENAI_API_KEY", &sealed).unwrap();
+        assert_eq!(opened.as_slice(), b"p0-python-value");
+    }
+
+    #[test]
+    fn opens_documented_p0_wrap_meta_without_version() {
+        let sealed = Sealed {
+            ciphertext: "gbSQ4CgEA//jJu56fOvXZE0hKkc9LktZoM+58v2Dsw==".to_string(),
+            nonce: "MDEyMzQ1Njc4OTo7".to_string(),
+            wrap_meta: json!({
                 "scheme": WRAP_SCHEME,
                 "wrapped_dek": "suj8cHJp0VSVnU1txzlNBBmnMD/TUGlEHy4kjvt+g7RlXgPlB6d7YQpDbhPKDEg7",
                 "dek_nonce": "QEFCQ0RFRkdISUpL"

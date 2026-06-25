@@ -30,6 +30,7 @@ P1 implements:
 ```sh
 avault seal --name OPENAI_API_KEY < value.txt
 avault deliver run --name OPENAI_API_KEY --env OPENAI_API_KEY -- env
+avault deliver run --name OPENAI_API_KEY --env OPENAI_API_KEY --envelope-file envelope.json -- env
 avault key export < passphrase.txt
 avault key import [--force] < import-request.json
 ```
@@ -45,9 +46,11 @@ read-compatible only.
 The P1 file store uses `$AVAULT_HOME/machine.key` when `AVAULT_HOME` is set, or
 `$HOME/.avibe/state/vault/machine.key` by default, matching the P0 Python basename.
 
-`deliver run` reads envelope JSON from stdin, opens it with the local master key,
-injects the value into the requested env var for the child command, inherits stdio,
-and exits with the child's exit code. There is no plaintext-printing `open` command.
+`deliver run` reads envelope JSON from stdin by default, opens it with the local
+master key, injects the value into the requested env var for the child command,
+inherits stdout/stderr, and exits with the child's exit code. Because stdin is used
+for the envelope in that mode, the child gets null stdin; use `--envelope-file` when
+the child must inherit avault's stdin. There is no plaintext-printing `open` command.
 
 `key export` reads a passphrase from stdin and emits the P0-compatible
 `machine-key-export-v1` JSON blob. `key import` reads JSON from stdin:
