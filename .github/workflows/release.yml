@@ -45,19 +45,23 @@ jobs:
             exit 1
           fi
 
-      - name: Cache cargo registry and build artifacts
+      - name: Cache cargo registry sources
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
-            ~/.cargo/bin/
             ~/.cargo/registry/index/
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
-            target/
           key: ${{ runner.os }}-${{ matrix.rust_target }}-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ hashFiles('**/Cargo.toml') }}
           restore-keys: |
             ${{ runner.os }}-${{ matrix.rust_target }}-cargo-
             ${{ runner.os }}-cargo-
+
+      - name: Install musl toolchain
+        if: matrix.rust_target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
 
       - name: Install Rust target
         run: rustup target add "${{ matrix.rust_target }}"
