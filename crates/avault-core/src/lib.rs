@@ -26,8 +26,10 @@ mod blind_box;
 mod signing;
 
 pub use blind_box::{
-    derive_blind_box_keypair_from_master, generate_blind_box_keypair, BlindBox, BlindBoxContext,
-    BlindBoxKeypair, BLIND_BOX_AAD_DOMAIN, BLIND_BOX_HPKE_INFO, BLIND_BOX_SCHEME,
+    blind_box_public_key_from_seed, derive_blind_box_keypair_from_master,
+    generate_blind_box_keypair, generate_blind_box_keypair_seed, open_blind_box_with_seed,
+    BlindBox, BlindBoxContext, BlindBoxKeypair, BLIND_BOX_AAD_DOMAIN, BLIND_BOX_HPKE_INFO,
+    BLIND_BOX_SCHEME,
 };
 pub use signing::{
     LocalSignerProvider, SignatureResult, SignatureScheme, SignerProvider,

@@ -230,6 +230,16 @@ pub fn generate_blind_box_keypair() -> BlindBoxKeypair {
     derive_blind_box_keypair(ikm.as_ref())
 }
 
+/// Generate a fresh seed for an in-memory blind-box receiver keypair.
+///
+/// The resident agent stores this seed in a locked page and derives the HPKE keypair
+/// only for individual public-key/open operations.
+pub fn generate_blind_box_keypair_seed() -> Zeroizing<[u8; KEY_BYTES]> {
+    let mut ikm = Zeroizing::new([0u8; KEY_BYTES]);
+    OsRng.fill_bytes(ikm.as_mut());
+    ikm
+}
+
 /// Derive the one-shot CLI receiver keypair from the machine master key.
 ///
 /// The resident agent will use a fresh in-memory keypair for its process lifetime.
@@ -250,6 +260,28 @@ fn derive_blind_box_keypair(ikm: &[u8]) -> BlindBoxKeypair {
         private_key,
         public_key,
     }
+}
+
+/// Return the public key and fingerprint for a receiver seed.
+pub fn blind_box_public_key_from_seed(seed: &[u8; KEY_BYTES]) -> (String, String) {
+    let keypair = derive_blind_box_keypair(seed);
+    let public_key = keypair.public_key_b64();
+    let fingerprint = keypair.fingerprint_hex();
+    drop(keypair);
+    (public_key, fingerprint)
+}
+
+/// Open a blind box by deriving the HPKE private key from a receiver seed only
+/// for this operation.
+pub fn open_blind_box_with_seed(
+    seed: &[u8; KEY_BYTES],
+    blind_box: &BlindBox,
+    context: &BlindBoxContext,
+) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+    let keypair = derive_blind_box_keypair(seed);
+    let opened = keypair.open(blind_box, context);
+    drop(keypair);
+    opened
 }
 
 fn open_blind_box_with_private_key(

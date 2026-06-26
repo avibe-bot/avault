@@ -697,9 +697,9 @@ reject remaining HTTP control bytes before ureq receives a header copy. Output i
 JSON: `{"status":200,"headers":{...},"body":"..."}`. Fetch uses bounded connect,
 read, write, and overall timeouts; transport errors are sanitized so injected
 credentials cannot appear in stderr, and the response body is capped. Before
-returning the body, avault performs a best-effort verbatim byte redaction of the
-credential. This only covers direct substring echoes; encoded/transformed echoes
-are intentionally left to the `allowed_hosts` policy boundary.
+returning the body/headers, avault performs a best-effort redaction of the
+credential bytes plus URL-form-encoded equivalents (`+` and `%XX` variants).
+Transformed echoes remain bounded by the `allowed_hosts` policy boundary.
 
 `deliver inject` accepts a target file, a format, and a secret array:
 

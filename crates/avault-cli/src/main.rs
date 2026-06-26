@@ -4,7 +4,7 @@
 
 use anyhow::{anyhow, bail, Context};
 #[cfg(unix)]
-use avault_core::BlindBoxKeypair;
+use avault_core::open_blind_box_with_seed;
 use avault_core::{
     BlindBox, BlindBoxContext, ExportBlob, LocalSignerProvider, Sealed, SignatureScheme,
     SignerProvider,
@@ -1162,6 +1162,7 @@ fn redact_fetch_body(
 ) -> anyhow::Result<()> {
     for needle in redaction_needles {
         redact_verbatim_bytes(body, needle.as_slice())?;
+        redact_form_encoded_equivalent_bytes(body, needle.as_slice())?;
     }
     Ok(())
 }
@@ -1204,18 +1205,14 @@ fn redact_fetch_header_text(
     value: &str,
     redaction_needles: &[Zeroizing<Vec<u8>>],
 ) -> anyhow::Result<String> {
-    if redaction_needles.iter().all(|needle| {
-        needle.is_empty()
-            || !value
-                .as_bytes()
-                .windows(needle.len())
-                .any(|window| window == needle.as_slice())
-    }) {
-        return Ok(value.to_string());
-    }
     let mut bytes = value.as_bytes().to_vec();
+    let original_len = bytes.len();
     for needle in redaction_needles {
         redact_verbatim_bytes(&mut bytes, needle.as_slice())?;
+        redact_form_encoded_equivalent_bytes(&mut bytes, needle.as_slice())?;
+    }
+    if bytes.len() == original_len && bytes.as_slice() == value.as_bytes() {
+        return Ok(value.to_string());
     }
     match String::from_utf8(bytes) {
         Ok(value) => Ok(value),
@@ -1226,6 +1223,87 @@ fn redact_fetch_header_text(
                 "fetch response header is not valid UTF-8 after redaction"
             ))
         }
+    }
+}
+
+fn redact_form_encoded_equivalent_bytes(body: &mut Vec<u8>, needle: &[u8]) -> anyhow::Result<()> {
+    const REDACTION: &[u8] = FETCH_REDACTION.as_bytes();
+    if needle.is_empty() {
+        return Ok(());
+    }
+    let matches = find_form_encoded_equivalent_ranges(body, needle);
+    if matches.is_empty() {
+        return Ok(());
+    }
+    let removed: usize = matches.iter().map(|(start, end)| end - start).sum();
+    let output_len = body
+        .len()
+        .checked_sub(removed)
+        .and_then(|len| len.checked_add(matches.len() * REDACTION.len()))
+        .context("redacted fetch body size overflowed")?;
+    if output_len > MAX_FETCH_BODY_BYTES {
+        bail!("fetch response body exceeds size limit");
+    }
+
+    let mut cursor = 0usize;
+    let mut redacted = Zeroizing::new(Vec::with_capacity(output_len));
+    for (start, end) in matches {
+        redacted.extend_from_slice(&body[cursor..start]);
+        redacted.extend_from_slice(REDACTION);
+        cursor = end;
+    }
+    redacted.extend_from_slice(&body[cursor..]);
+    body.zeroize();
+    body.clear();
+    body.extend_from_slice(&redacted);
+    Ok(())
+}
+
+fn find_form_encoded_equivalent_ranges(body: &[u8], needle: &[u8]) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut search_start = 0usize;
+    while search_start < body.len() {
+        let mut body_index = search_start;
+        let mut needle_index = 0usize;
+        while needle_index < needle.len() && body_index < body.len() {
+            let Some((decoded, next_body_index)) = decode_form_encoded_byte(body, body_index)
+            else {
+                break;
+            };
+            if decoded != needle[needle_index] {
+                break;
+            }
+            body_index = next_body_index;
+            needle_index += 1;
+        }
+        if needle_index == needle.len() && body_index > search_start {
+            ranges.push((search_start, body_index));
+            search_start = body_index;
+        } else {
+            search_start += 1;
+        }
+    }
+    ranges
+}
+
+fn decode_form_encoded_byte(input: &[u8], index: usize) -> Option<(u8, usize)> {
+    match *input.get(index)? {
+        b'+' => Some((b' ', index + 1)),
+        b'%' => {
+            let high = from_hex(*input.get(index + 1)?)?;
+            let low = from_hex(*input.get(index + 2)?)?;
+            Some(((high << 4) | low, index + 3))
+        }
+        byte => Some((byte, index + 1)),
+    }
+}
+
+fn from_hex(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -2154,9 +2232,6 @@ impl AgentState {
         {
             self.grants.clear();
         }
-        let expiry_cutoff = now.checked_add(max_block).unwrap_or(now);
-        self.grants
-            .retain(|_, grant| grant.expires_at > expiry_cutoff);
     }
 
     fn get_grant(&mut self, scope: &GrantKey) -> anyhow::Result<&GrantEntry> {
@@ -2322,7 +2397,10 @@ fn run_agent(options: AgentOptions, input: &mut impl Read) -> anyhow::Result<u8>
             }
         }
     };
-    let keypair = avault_core::generate_blind_box_keypair();
+    let seed = avault_core::generate_blind_box_keypair_seed();
+    let locked_keypair_seed =
+        MasterKey::from_bytes(&seed).context("failed to lock blind-box receiver key")?;
+    drop(seed);
     let listener = bind_agent_socket(&options.socket_path)?;
     listener
         .set_nonblocking(true)
@@ -2351,7 +2429,7 @@ fn run_agent(options: AgentOptions, input: &mut impl Read) -> anyhow::Result<u8>
             match read_agent_frame(&mut stream, &mut state) {
                 Ok(Some(frame)) => {
                     let (response, refresh_activity) =
-                        handle_agent_frame(frame.as_slice(), &keypair, &mut state);
+                        handle_agent_frame(frame.as_slice(), &locked_keypair_seed, &mut state);
                     if refresh_activity {
                         state.record_activity();
                     }
@@ -2417,7 +2495,7 @@ fn ensure_agent_socket_parent(parent: &Path) -> anyhow::Result<()> {
         }
     }
     validate_agent_runtime_directory(parent)?;
-    validate_agent_home_ancestors(parent)?;
+    validate_agent_socket_ancestors(parent)?;
     Ok(())
 }
 
@@ -2443,20 +2521,32 @@ fn validate_agent_runtime_directory(path: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(unix)]
-fn validate_agent_home_ancestors(parent: &Path) -> anyhow::Result<()> {
-    let Ok(home) = user_home_dir() else {
-        return Ok(());
-    };
+fn validate_agent_socket_ancestors(parent: &Path) -> anyhow::Result<()> {
     let mut current = parent.parent();
     while let Some(path) = current {
-        if path == home {
+        if path.parent().is_none() {
             break;
         }
-        if !path.starts_with(&home) {
-            break;
-        }
-        validate_agent_runtime_directory(path)?;
+        validate_agent_socket_ancestor(path)?;
         current = path.parent();
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_agent_socket_ancestor(path: &Path) -> anyhow::Result<()> {
+    let metadata = fs::metadata(path).context("failed to stat agent socket ancestor")?;
+    if !metadata.is_dir() {
+        bail!("agent socket ancestor is not a directory");
+    }
+    let uid = metadata.uid();
+    if uid != 0 && uid != avault_store::effective_uid() {
+        bail!("agent socket ancestor is not owned by root or the current user");
+    }
+    let mode = metadata.permissions().mode();
+    let is_sticky = mode & 0o1000 != 0;
+    if mode & 0o022 != 0 && !is_sticky {
+        bail!("agent socket ancestor is writable by other users");
     }
     Ok(())
 }
@@ -2464,10 +2554,10 @@ fn validate_agent_home_ancestors(parent: &Path) -> anyhow::Result<()> {
 #[cfg(unix)]
 fn handle_agent_frame(
     frame: &[u8],
-    keypair: &BlindBoxKeypair,
+    keypair_seed: &MasterKey,
     state: &mut AgentState,
 ) -> (serde_json::Value, bool) {
-    match handle_agent_frame_inner(frame, keypair, state) {
+    match handle_agent_frame_inner(frame, keypair_seed, state) {
         Ok(response) => response,
         Err(err) => (
             serde_json::to_value(AgentResponse::<serde_json::Value> {
@@ -2484,17 +2574,21 @@ fn handle_agent_frame(
 #[cfg(unix)]
 fn handle_agent_frame_inner(
     frame: &[u8],
-    keypair: &BlindBoxKeypair,
+    keypair_seed: &MasterKey,
     state: &mut AgentState,
 ) -> anyhow::Result<(serde_json::Value, bool)> {
     let request: AgentRequest =
         serde_json::from_slice(frame).context("agent frame JSON is invalid")?;
     match request {
         AgentRequest::Pubkey => Ok((
-            agent_ok(PubkeyOutput {
-                public_key: keypair.public_key_b64(),
-                fingerprint: keypair.fingerprint_hex(),
-            })?,
+            {
+                let (public_key, fingerprint) =
+                    avault_core::blind_box_public_key_from_seed(keypair_seed.as_bytes());
+                agent_ok(PubkeyOutput {
+                    public_key,
+                    fingerprint,
+                })?
+            },
             false,
         )),
         AgentRequest::Grant(request) => {
@@ -2577,9 +2671,9 @@ fn handle_agent_frame_inner(
                 if deks.contains_key(&key) {
                     bail!("duplicate grant DEK name");
                 }
-                let opened = keypair
-                    .open(&dek.dek_blindbox, &context)
-                    .context("DEK blind-box open failed")?;
+                let opened =
+                    open_blind_box_with_seed(keypair_seed.as_bytes(), &dek.dek_blindbox, &context)
+                        .context("DEK blind-box open failed")?;
                 let released_dek = zeroizing_vec_to_key32(opened, "released DEK")?;
                 let locked =
                     MasterKey::from_bytes(&released_dek).context("failed to lock released DEK")?;

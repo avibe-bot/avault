@@ -1083,6 +1083,30 @@ fn second_agent_refuses_live_socket() {
 }
 
 #[test]
+fn agent_rejects_socket_under_world_writable_ancestor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("shared");
+    let run = root.join("private").join("run");
+    fs::create_dir_all(&run).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o777)).unwrap();
+    fs::set_permissions(root.join("private"), fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&run, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let output = avault()
+        .arg("agent")
+        .arg("--socket")
+        .arg(run.join("avault.sock"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("socket ancestor"));
+}
+
+#[test]
 fn agent_closes_idle_partial_frame_and_accepts_next_client() {
     let tmp = tempfile::tempdir().unwrap();
     let socket = tmp.path().join("run").join("avault.sock");
@@ -1517,6 +1541,78 @@ fn agent_deliver_fetch_rejects_one_shot_dek_fields() {
     );
     assert_eq!(rejected["ok"], false);
     assert!(!rejected["error"].as_str().unwrap().is_empty());
+
+    let _ = agent.kill();
+    let _ = agent.wait();
+}
+
+#[test]
+fn agent_fast_fetch_keeps_unexpired_grant() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("run").join("avault.sock");
+    let mut agent = spawn_agent(&socket, 60);
+    let mut stream = connect_agent(&socket);
+    let pubkey = agent_request(&mut stream, json!({"type": "pubkey"}));
+    let public_key = pubkey["result"]["public_key"].as_str().unwrap();
+    let dek = [0x5bu8; 32];
+    let approval_nonce = b"agent-fast-fetch";
+    let approval_expires_at = future_expiry();
+    let grant = agent_request(
+        &mut stream,
+        json!({
+            "type": "grant",
+            "scope_type": "session",
+            "scope_ref": "fast-fetch",
+            "ttl_secs": 20,
+            "deks": [
+                {
+                    "name": "API_TOKEN",
+                    "dek_blindbox": fixed_blind_box(
+                        public_key,
+                        &dek,
+                        &aad_agent_deliver("session", "fast-fetch", "API_TOKEN", approval_nonce, approval_expires_at, 20)
+                    ),
+                    "approval": approval_json(approval_nonce, approval_expires_at)
+                }
+            ]
+        }),
+    );
+    assert_eq!(grant["ok"], true);
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .unwrap();
+        }
+    });
+    let envelope = envelope_encrypted_with_dek("API_TOKEN", &dek, b"fast-token");
+    for _ in 0..2 {
+        let response = agent_request(
+            &mut stream,
+            json!({
+                "type": "deliver",
+                "scope_type": "session",
+                "scope_ref": "fast-fetch",
+                "mode": "fetch",
+                "name": "API_TOKEN",
+                "envelope": envelope.clone(),
+                "request": {
+                    "method": "GET",
+                    "url": format!("http://127.0.0.1:{}/resource", addr.port()),
+                    "allowed_hosts": ["127.0.0.1"],
+                    "inject": {"type": "bearer"}
+                }
+            }),
+        );
+        assert_eq!(response["ok"], true);
+    }
+    server.join().unwrap();
 
     let _ = agent.kill();
     let _ = agent.wait();
@@ -2405,6 +2501,62 @@ fn deliver_fetch_redacts_url_encoded_query_credential() {
     assert!(headers
         .values()
         .all(|value| !value.as_str().unwrap().contains("a%2Fb+token")));
+}
+
+#[test]
+fn deliver_fetch_redacts_equivalent_query_credential_encodings() {
+    let home = tempfile::tempdir().unwrap();
+    let sealed = seal_secret(home.path().join("vault").as_path(), "API_TOKEN", b"a b/+");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = stream.read(&mut buf).unwrap();
+        let body = b"one=a%20b%2f%2b two=a+b%2F%2B";
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nLocation: /resource?api_key=a%20b%2f%2b\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        stream.write_all(body).unwrap();
+    });
+    let request = json!({
+        "name": "API_TOKEN",
+        "envelope": sealed,
+        "request": {
+            "method": "GET",
+            "url": format!("http://127.0.0.1:{}/resource", addr.port()),
+            "allowed_hosts": ["127.0.0.1"],
+            "inject": {"type": "query", "name": "api_key"}
+        }
+    });
+
+    let mut fetch = avault()
+        .arg("deliver")
+        .arg("fetch")
+        .env("AVAULT_HOME", home.path().join("vault"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    fetch
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let output = fetch.wait_with_output().unwrap();
+    server.join().unwrap();
+    assert!(output.status.success());
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let body = response["body"].as_str().unwrap();
+    assert_eq!(body, "one=[avault-redacted] two=[avault-redacted]");
+    let headers = response["headers"].as_object().unwrap();
+    assert!(headers
+        .values()
+        .all(|value| !value.as_str().unwrap().contains("a%20b%2f%2b")));
 }
 
 #[test]
