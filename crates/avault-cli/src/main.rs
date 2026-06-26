@@ -1,12 +1,10 @@
 //! `avault` — the binary. Avibe's only path to key material.
 //!
-//! One-shot CLI: control via argv/JSON, bulk blobs via stdin, results via stdout.
-//! The resident `agent` remains a future transport.
+//! P1 is a one-shot CLI: control via argv/JSON, bulk blobs via stdin, results via stdout.
+//! P2 keeps `pubkey`, `sign`, and `agent` as stubs.
 
 use anyhow::{anyhow, bail, Context};
-use avault_core::{
-    BlindBox, ExportBlob, LocalSignerProvider, Sealed, SignatureScheme, SignerProvider,
-};
+use avault_core::{ExportBlob, Sealed};
 use avault_store::{Backend, FileStore};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -18,7 +16,6 @@ use std::io::{self, Read, Write};
 use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
-use std::str::FromStr;
 use std::time::Duration;
 use url::{Host, Url};
 use zeroize::{Zeroize, Zeroizing};
@@ -35,20 +32,17 @@ avault — Avibe Vaults custody core
 
 USAGE:
     avault seal --name NAME
-    avault seal --name NAME --blind-box
     avault deliver run --name NAME --env VAR [--envelope-file PATH] -- COMMAND [ARGS...]
     avault deliver run -- COMMAND [ARGS...] < run-secrets.json
     avault deliver fetch < fetch-request.json
     avault deliver inject < inject-request.json
     avault key export
     avault key import [--force]
-    avault pubkey
-    avault sign < sign-request.json
     avault version
 
 P1 reads secret values, envelopes, and passphrases from stdin. Plaintext never belongs in argv.
 deliver fetch requires request.allowed_hosts before attaching a credential.
-agent remains a P2 resident-process stub.
+P2 stubs: pubkey, sign, agent.
 ";
 
 fn main() -> ExitCode {
@@ -81,9 +75,7 @@ fn run(args: Vec<OsString>) -> anyhow::Result<u8> {
         "seal" => seal_cmd(&args[1..]),
         "deliver" => deliver_cmd(&args[1..]),
         "key" => key_cmd(&args[1..]),
-        "pubkey" => pubkey_cmd(&args[1..]),
-        "sign" => sign_cmd(&args[1..]),
-        "agent" => {
+        "pubkey" | "sign" | "agent" => {
             eprintln!("avault: '{cmd}' is a P2 stub and is not implemented in P1");
             Ok(70)
         }
@@ -96,184 +88,16 @@ fn run(args: Vec<OsString>) -> anyhow::Result<u8> {
 }
 
 fn seal_cmd(args: &[OsString]) -> anyhow::Result<u8> {
-    let options = parse_seal_options(args)?;
-    let (sealed, mut value) = if options.blind_box {
-        let input = read_json_stdin("failed to read blind-box JSON from stdin")?;
-        let blind_box: BlindBox =
-            serde_json::from_slice(input.as_slice()).context("blind-box JSON is invalid")?;
-        let master = avault_store::load_master_key(Backend::File)?;
-        let keypair = avault_core::derive_blind_box_keypair_from_master(master.as_bytes());
-        let value = keypair.open(&blind_box).context("blind-box open failed")?;
-        drop(keypair);
-        let sealed = avault_core::seal(master.as_bytes(), &options.name, value.as_slice())
-            .context("seal failed")?;
-        drop(master);
-        (sealed, value)
-    } else {
-        let value = read_stdin_zeroizing().context("failed to read plaintext value from stdin")?;
-        let master = avault_store::load_or_create_master_key(Backend::File)?;
-        let sealed = avault_core::seal(master.as_bytes(), &options.name, value.as_slice())
-            .context("seal failed")?;
-        drop(master);
-        (sealed, value)
-    };
+    let name = parse_required_option(args, "--name")?;
+    let mut value = read_stdin_zeroizing().context("failed to read plaintext value from stdin")?;
+    let master = avault_store::load_or_create_master_key(Backend::File)?;
+    let sealed =
+        avault_core::seal(master.as_bytes(), &name, value.as_slice()).context("seal failed")?;
+    drop(master);
     value.zeroize();
     serde_json::to_writer(io::stdout(), &sealed).context("failed to write envelope JSON")?;
     println!();
     Ok(0)
-}
-
-#[derive(Debug)]
-struct SealOptions {
-    name: String,
-    blind_box: bool,
-}
-
-fn parse_seal_options(args: &[OsString]) -> anyhow::Result<SealOptions> {
-    let mut name = None;
-    let mut blind_box = false;
-    let mut index = 0;
-    while index < args.len() {
-        let flag = args[index]
-            .to_str()
-            .context("seal options must be valid UTF-8")?;
-        match flag {
-            "--name" => {
-                if name.is_some() {
-                    bail!("--name was provided more than once");
-                }
-                let value = args
-                    .get(index + 1)
-                    .and_then(|s| s.to_str())
-                    .context("--name requires a value")?;
-                name = Some(value.to_string());
-                index += 2;
-            }
-            "--blind-box" => {
-                if blind_box {
-                    bail!("--blind-box was provided more than once");
-                }
-                blind_box = true;
-                index += 1;
-            }
-            other => bail!("unknown seal option: {other}"),
-        }
-    }
-    Ok(SealOptions {
-        name: name.context("--name is required")?,
-        blind_box,
-    })
-}
-
-#[derive(Debug, Serialize)]
-struct PubkeyOutput {
-    public_key: String,
-    fingerprint: String,
-}
-
-fn pubkey_cmd(args: &[OsString]) -> anyhow::Result<u8> {
-    if !args.is_empty() {
-        bail!("pubkey takes no options");
-    }
-    let master = avault_store::load_or_create_master_key(Backend::File)?;
-    let keypair = avault_core::derive_blind_box_keypair_from_master(master.as_bytes());
-    let output = PubkeyOutput {
-        public_key: keypair.public_key_b64(),
-        fingerprint: keypair.fingerprint_hex(),
-    };
-    drop(keypair);
-    drop(master);
-    serde_json::to_writer(io::stdout(), &output).context("failed to write pubkey JSON")?;
-    println!();
-    Ok(0)
-}
-
-#[derive(Debug, Deserialize)]
-struct SignInput {
-    name: String,
-    key_envelope: Sealed,
-    digest: String,
-    scheme: String,
-    #[serde(default)]
-    dek_blindbox: Option<BlindBox>,
-}
-
-#[derive(Debug, Serialize)]
-struct SignOutput {
-    signature: String,
-    recovery_id: Option<u8>,
-}
-
-fn sign_cmd(args: &[OsString]) -> anyhow::Result<u8> {
-    if !args.is_empty() {
-        bail!("sign reads its JSON request from stdin and takes no options");
-    }
-    let input = read_json_stdin("failed to read sign JSON from stdin")?;
-    let request: SignInput =
-        serde_json::from_slice(input.as_slice()).context("sign JSON is invalid")?;
-    let digest = decode_hex_32(&request.digest, "digest")?;
-    let scheme = SignatureScheme::from_str(&request.scheme)?;
-
-    let key_plaintext = if let Some(dek_blindbox) = &request.dek_blindbox {
-        let master = avault_store::load_master_key(Backend::File)?;
-        let keypair = avault_core::derive_blind_box_keypair_from_master(master.as_bytes());
-        let dek_plaintext = keypair
-            .open(dek_blindbox)
-            .context("DEK blind-box open failed")?;
-        drop(keypair);
-        drop(master);
-        let dek = zeroizing_vec_to_key32(dek_plaintext, "released DEK")?;
-        let opened = avault_core::open_with_dek(&dek, &request.name, &request.key_envelope)
-            .context("key envelope open failed")?;
-        drop(dek);
-        opened
-    } else {
-        let master = avault_store::load_master_key(Backend::File)?;
-        let opened = avault_core::open(master.as_bytes(), &request.name, &request.key_envelope)
-            .context("key envelope open failed")?;
-        drop(master);
-        opened
-    };
-    let mut private_key = zeroizing_vec_to_key32(key_plaintext, "signing key")?;
-
-    let signer = LocalSignerProvider;
-    let result = signer
-        .sign_digest(scheme, &private_key, &digest)
-        .context("signing failed")?;
-    private_key.zeroize();
-    drop(private_key);
-
-    let output = SignOutput {
-        signature: hex::encode(result.signature),
-        recovery_id: result.recovery_id,
-    };
-    serde_json::to_writer(io::stdout(), &output).context("failed to write signature JSON")?;
-    println!();
-    Ok(0)
-}
-
-fn decode_hex_32(text: &str, label: &str) -> anyhow::Result<[u8; 32]> {
-    if text.len() != 64 {
-        bail!("{label} must be 32 bytes of hex");
-    }
-    let bytes = hex::decode(text).with_context(|| format!("{label} is not valid hex"))?;
-    bytes
-        .try_into()
-        .map_err(|_| anyhow!("{label} must be 32 bytes of hex"))
-}
-
-fn zeroizing_vec_to_key32(
-    mut value: Zeroizing<Vec<u8>>,
-    label: &str,
-) -> anyhow::Result<Zeroizing<[u8; 32]>> {
-    if value.len() != 32 {
-        value.zeroize();
-        bail!("{label} has invalid length");
-    }
-    let mut out = Zeroizing::new([0u8; 32]);
-    out.as_mut().copy_from_slice(value.as_slice());
-    value.zeroize();
-    Ok(out)
 }
 
 fn deliver_cmd(args: &[OsString]) -> anyhow::Result<u8> {
@@ -1337,6 +1161,21 @@ fn skip_json_ws(input: &[u8], mut index: usize) -> usize {
         index += 1;
     }
     index
+}
+
+fn parse_required_option(args: &[OsString], flag: &str) -> anyhow::Result<String> {
+    let mut index = 0;
+    while index < args.len() {
+        if args[index] == flag {
+            let value = args
+                .get(index + 1)
+                .and_then(|s| s.to_str())
+                .with_context(|| format!("{flag} requires a value"))?;
+            return Ok(value.to_string());
+        }
+        index += 1;
+    }
+    bail!("{flag} is required");
 }
 
 struct DeliverRunOptions {

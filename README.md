@@ -2,10 +2,10 @@
 
 A small, hardened **Rust key-custody core** for [Avibe](https://github.com/avibe-bot/avibe) Vaults — the one component that ever holds a key or performs cryptography, so the agent (and Python) never do.
 
-> **Status: P2 Phase A core.** The standard-tier Rust crypto core, cross-platform
-> file master-key store, one-shot delivery surface, blind-box create path, and
-> secp256k1 signing verbs are implemented. The resident grant agent and hardware
-> stores remain future work.
+> **Status: P1.1 standard-tier core.** The standard-tier Rust crypto core,
+> cross-platform file master-key store, and one-shot CLI delivery surface are implemented.
+> The resident agent, pubkey/blind-box receiver, signer, protected tier, and
+> hardware stores remain P2+.
 
 ## Why
 
@@ -26,7 +26,7 @@ avault makes the split real:
 
 ## Interface (deliberately narrow)
 
-Implemented CLI surface:
+P1.1 implements:
 
 ```sh
 avault seal --name OPENAI_API_KEY < value.txt
@@ -37,9 +37,6 @@ avault deliver fetch < fetch-request.json
 avault deliver inject < inject-request.json
 avault key export < passphrase.txt
 avault key import [--force] < import-request.json
-avault pubkey
-avault seal --name OPENAI_API_KEY --blind-box < blind-box.json
-avault sign < sign-request.json
 ```
 
 `seal` reads the value from stdin and writes envelope JSON on stdout:
@@ -132,36 +129,14 @@ Unix and a protected owner-only DACL on Windows. `yaml` and `toml` remain deferr
 }
 ```
 
-`pubkey` emits `{public_key, fingerprint}` for HPKE blind boxes. `seal --blind-box`
-reads `{"scheme":"hpke-x25519-hkdfsha256-aes256gcm-v1","enc":"...","ct":"..."}`
-from stdin and returns the normal `{ciphertext, nonce, wrap_meta}` envelope.
-The one-shot CLI derives the receiver keypair from the local master key so `pubkey`
-and `seal --blind-box` work across processes without persisting a new private key;
-the resident agent later uses a fresh in-memory keypair for its process lifetime.
-
-`sign` reads:
-
-```json
-{
-  "name": "ETH_SIGNING_KEY",
-  "key_envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." },
-  "digest": "<hex 32-byte digest>",
-  "scheme": "ecdsa-secp256k1-recoverable",
-  "dek_blindbox": null
-}
-```
-
-Supported schemes are `ecdsa-secp256k1-recoverable`, `ecdsa-secp256k1-der`, and
-`schnorr-secp256k1-bip340`. Output is `{"signature":"<hex>","recovery_id":0|null}`.
-avault signs exactly the caller-provided digest; chain-specific sighash construction
-stays outside avault.
+P2 stubs: `pubkey`, `sign`, and `agent`.
 
 ## How Avibe talks to it
 
 Like the `askill` dependency: ensured by `vibe runtime prepare`, resolved on `PATH`, shown in Settings · Dependencies. Two transports:
 
 - **CLI subprocess** (P1) — argv/JSON in, blobs via stdin, results via stdout.
-- **Resident agent** (future) — unix socket at `~/.avibe/run/avault.sock` (0600), length-prefixed JSON, authorized by `SO_PEERCRED` / `LOCAL_PEERCRED` (no shared token).
+- **Resident agent** (P2) — unix socket at `~/.avibe/run/avault.sock` (0600), length-prefixed JSON, authorized by `SO_PEERCRED` / `LOCAL_PEERCRED` (no shared token).
 
 ## Layout
 
@@ -186,8 +161,8 @@ cargo clippy --all-targets
 
 - **P1** — `avault-core` + CLI + cross-platform file store; Rust takes the standard-tier seal/open. Closes the Python memory-hygiene gap.
 - **P1.1** — complete standard-tier delivery: multi-secret run, brokered fetch, and atomic dotenv/json inject.
-- **P2 Phase A** — blind-box create, secp256k1 digest signing, and pinned JSON contracts.
-- **Future** — resident agent + `SO_PEERCRED` + scope-grant DEK cache, passphrase/hardware stores, and external signer providers.
+- **P2** — resident agent + `SO_PEERCRED` + scope-grant DEK cache + secp256k1 signer; hardware-store backends.
+- **P3** — multi-factor (passkey-PRF, TPM, KMS); external signer (hardware wallet / WalletConnect).
 
 ## License
 
