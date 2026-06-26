@@ -557,10 +557,12 @@ fn one_shot_sign_operation_hash(scheme: &str, digest: &[u8; 32]) -> [u8; 32] {
     BlindBoxContext::operation_hash(&[b"sign", scheme.as_bytes(), digest.as_slice()])
 }
 
+#[cfg(unix)]
 fn agent_deliver_operation_hash(name: &str) -> [u8; 32] {
     BlindBoxContext::operation_hash(&[b"agent-deliver", name.as_bytes()])
 }
 
+#[cfg(unix)]
 fn agent_sign_operation_hash(scheme: &str, digest: &[u8; 32]) -> [u8; 32] {
     BlindBoxContext::operation_hash(&[b"agent-sign", scheme.as_bytes(), digest.as_slice()])
 }
