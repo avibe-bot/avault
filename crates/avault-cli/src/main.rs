@@ -26,13 +26,14 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
+#[cfg(unix)]
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
 use std::str::FromStr;
+use std::time::Duration;
 #[cfg(unix)]
-use std::time::Instant;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use url::{Host, Url};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -332,7 +333,7 @@ struct SignInput {
     #[serde(default)]
     dek_blindbox: Option<BlindBox>,
     #[serde(default)]
-    approval: Option<ApprovalContextInput>,
+    approval: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -406,6 +407,7 @@ fn zeroizing_vec_to_key32(
     Ok(out)
 }
 
+#[cfg(unix)]
 fn parse_approval_context(input: &ApprovalContextInput) -> anyhow::Result<ApprovalContext> {
     let nonce = B64
         .decode(input.nonce.as_bytes())
@@ -419,14 +421,6 @@ fn parse_approval_context(input: &ApprovalContextInput) -> anyhow::Result<Approv
     })
 }
 
-fn validate_approval_not_expired(expires_at_unix: u64) -> anyhow::Result<()> {
-    let now = current_unix_secs()?;
-    if expires_at_unix <= now {
-        bail!("approval is expired");
-    }
-    Ok(())
-}
-
 #[cfg(unix)]
 fn approval_expiry_instant(expires_at_unix: u64) -> anyhow::Result<Instant> {
     let now_unix = current_unix_secs()?;
@@ -438,6 +432,16 @@ fn approval_expiry_instant(expires_at_unix: u64) -> anyhow::Result<Instant> {
         .context("approval expiration is invalid")
 }
 
+#[cfg(unix)]
+fn validate_approval_not_expired(expires_at_unix: u64) -> anyhow::Result<()> {
+    let now = current_unix_secs()?;
+    if expires_at_unix <= now {
+        bail!("approval is expired");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn current_unix_secs() -> anyhow::Result<u64> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -527,7 +531,7 @@ struct EnvSecretInput {
     #[serde(default)]
     dek_blindbox: Option<BlindBox>,
     #[serde(default)]
-    approval: Option<ApprovalContextInput>,
+    approval: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -541,7 +545,7 @@ struct NamedSecretInput {
     #[serde(default)]
     dek_blindbox: Option<BlindBox>,
     #[serde(default)]
-    approval: Option<ApprovalContextInput>,
+    approval: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -551,16 +555,18 @@ struct FetchInput {
     #[serde(default)]
     dek_blindbox: Option<BlindBox>,
     #[serde(default)]
-    approval: Option<ApprovalContextInput>,
+    approval: Option<serde_json::Value>,
     request: FetchRequest,
 }
 
+#[cfg(unix)]
 #[derive(Debug, Clone, Deserialize)]
 struct ApprovalContextInput {
     nonce: String,
     expires_at_unix: u64,
 }
 
+#[cfg(unix)]
 struct ApprovalContext {
     nonce: Vec<u8>,
     expires_at_unix: u64,
@@ -716,7 +722,7 @@ fn open_one_shot_secret(
     name: &str,
     envelope: &Sealed,
     dek_blindbox: Option<&BlindBox>,
-    approval: Option<&ApprovalContextInput>,
+    approval: Option<&serde_json::Value>,
     unlock: &StoreUnlock,
     loaded_master: Option<&MasterKey>,
 ) -> anyhow::Result<Zeroizing<Vec<u8>>> {
@@ -736,7 +742,7 @@ fn open_one_shot_secret(
 
 fn reject_one_shot_protected_fields(
     dek_blindbox: Option<&BlindBox>,
-    approval: Option<&ApprovalContextInput>,
+    approval: Option<&serde_json::Value>,
 ) -> anyhow::Result<()> {
     if dek_blindbox.is_some() || approval.is_some() {
         bail!("protected DEK blind boxes require the resident agent");
@@ -2566,7 +2572,7 @@ fn open_named_secrets_with_grant(
 #[cfg(unix)]
 fn reject_agent_one_shot_secret_fields(
     dek_blindbox: Option<&BlindBox>,
-    approval: Option<&ApprovalContextInput>,
+    approval: Option<&serde_json::Value>,
 ) -> anyhow::Result<()> {
     if dek_blindbox.is_some() || approval.is_some() {
         bail!("agent delivery uses cached grants and rejects one-shot DEK fields");
