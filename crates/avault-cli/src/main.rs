@@ -1,57 +1,34 @@
 //! `avault` — the binary. Avibe's only path to key material.
 //!
 //! One-shot CLI: control via argv/JSON, bulk blobs via stdin, results via stdout.
+//! The resident `agent` remains a future transport.
 
 use anyhow::{anyhow, bail, Context};
-#[cfg(unix)]
-use avault_core::BlindBoxKeypair;
 use avault_core::{
     BlindBox, ExportBlob, LocalSignerProvider, Sealed, SignatureScheme, SignerProvider,
 };
-#[cfg(unix)]
-use avault_store::MasterKey;
 use avault_store::{Backend, FileStore};
 use serde::{Deserialize, Serialize};
-#[cfg(unix)]
-use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read, Write};
 #[cfg(unix)]
-use std::os::fd::AsRawFd;
-#[cfg(unix)]
-use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
-#[cfg(unix)]
-use std::os::unix::net::{UnixListener, UnixStream};
-#[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
-#[cfg(unix)]
-use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
 use std::str::FromStr;
 use std::time::Duration;
-#[cfg(unix)]
-use std::time::Instant;
 use url::{Host, Url};
 use zeroize::{Zeroize, Zeroizing};
 
 const MAX_STDIN_SECRET_BYTES: usize = 1024 * 1024;
 const MAX_STDIN_ENVELOPE_BYTES: usize = 2 * 1024 * 1024;
 const STDIN_READ_CHUNK_BYTES: usize = 8192;
-#[cfg(unix)]
-const MAX_AGENT_FRAME_BYTES: usize = 2 * 1024 * 1024;
 const FETCH_CONNECT_TIMEOUT_SECS: u64 = 10;
 const FETCH_TOTAL_TIMEOUT_SECS: u64 = 30;
 const MAX_FETCH_BODY_BYTES: usize = 8 * 1024 * 1024;
-#[cfg(unix)]
-const DEFAULT_AGENT_GRANT_TTL_SECS: u64 = 300;
-#[cfg(unix)]
-const DEFAULT_AGENT_IDLE_TIMEOUT_SECS: u64 = 300;
-#[cfg(unix)]
-const AGENT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 const USAGE: &str = "\
 avault — Avibe Vaults custody core
@@ -67,11 +44,11 @@ USAGE:
     avault key import [--force]
     avault pubkey
     avault sign < sign-request.json
-    avault agent [--socket PATH] [--idle-timeout-secs SECS]
     avault version
 
 P1 reads secret values, envelopes, and passphrases from stdin. Plaintext never belongs in argv.
 deliver fetch requires request.allowed_hosts before attaching a credential.
+agent remains a P2 resident-process stub.
 ";
 
 fn main() -> ExitCode {
@@ -106,7 +83,10 @@ fn run(args: Vec<OsString>) -> anyhow::Result<u8> {
         "key" => key_cmd(&args[1..]),
         "pubkey" => pubkey_cmd(&args[1..]),
         "sign" => sign_cmd(&args[1..]),
-        "agent" => agent_cmd(&args[1..]),
+        "agent" => {
+            eprintln!("avault: '{cmd}' is a P2 stub and is not implemented in P1");
+            Ok(70)
+        }
         other => {
             eprintln!("avault: unknown command '{other}'\n");
             print!("{USAGE}");
@@ -254,28 +234,22 @@ fn sign_cmd(args: &[OsString]) -> anyhow::Result<u8> {
         drop(master);
         opened
     };
-    let output = sign_digest_with_key(scheme, &digest, key_plaintext)?;
-    serde_json::to_writer(io::stdout(), &output).context("failed to write signature JSON")?;
-    println!();
-    Ok(0)
-}
-
-fn sign_digest_with_key(
-    scheme: SignatureScheme,
-    digest: &[u8; 32],
-    key_plaintext: Zeroizing<Vec<u8>>,
-) -> anyhow::Result<SignOutput> {
     let mut private_key = zeroizing_vec_to_key32(key_plaintext, "signing key")?;
+
     let signer = LocalSignerProvider;
     let result = signer
-        .sign_digest(scheme, &private_key, digest)
+        .sign_digest(scheme, &private_key, &digest)
         .context("signing failed")?;
     private_key.zeroize();
     drop(private_key);
-    Ok(SignOutput {
+
+    let output = SignOutput {
         signature: hex::encode(result.signature),
         recovery_id: result.recovery_id,
-    })
+    };
+    serde_json::to_writer(io::stdout(), &output).context("failed to write signature JSON")?;
+    println!();
+    Ok(0)
 }
 
 fn decode_hex_32(text: &str, label: &str) -> anyhow::Result<[u8; 32]> {
@@ -340,7 +314,6 @@ fn deliver_run_cmd(args: &[OsString]) -> anyhow::Result<u8> {
             name: run_options.name,
             env: run_options.env_name,
             envelope: sealed,
-            dek_blindbox: None,
         }];
         run_child_with_secret_env(command, secrets, envelope_stdin)
     }
@@ -351,8 +324,6 @@ struct EnvSecretInput {
     name: String,
     env: String,
     envelope: Sealed,
-    #[serde(default)]
-    dek_blindbox: Option<BlindBox>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -363,16 +334,12 @@ struct NamedSecretInput {
     #[serde(default)]
     key: Option<String>,
     envelope: Sealed,
-    #[serde(default)]
-    dek_blindbox: Option<BlindBox>,
 }
 
 #[derive(Debug, Deserialize)]
 struct FetchInput {
     name: String,
     envelope: Sealed,
-    #[serde(default)]
-    dek_blindbox: Option<BlindBox>,
     request: FetchRequest,
 }
 
@@ -435,15 +402,7 @@ fn run_child_with_secret_env(
         bail!("deliver run requires at least one secret");
     }
 
-    let opened = open_env_secrets(secrets)?;
-    run_child_with_opened_env(command, opened, envelope_stdin)
-}
-
-fn run_child_with_opened_env(
-    command: &[OsString],
-    mut opened: Vec<OpenedSecret>,
-    envelope_stdin: bool,
-) -> anyhow::Result<u8> {
+    let mut opened = open_env_secrets(secrets)?;
     let mut child = {
         let mut child = Command::new(&command[0]);
         child.args(&command[1..]);
@@ -474,6 +433,7 @@ fn run_child_with_opened_env(
 }
 
 fn open_env_secrets(secrets: Vec<EnvSecretInput>) -> anyhow::Result<Vec<OpenedSecret>> {
+    let master = avault_store::load_master_key(Backend::File)?;
     let mut opened = Vec::with_capacity(secrets.len());
     let mut seen = BTreeSet::new();
     for secret in secrets {
@@ -481,42 +441,15 @@ fn open_env_secrets(secrets: Vec<EnvSecretInput>) -> anyhow::Result<Vec<OpenedSe
         if !seen.insert(secret.env.clone()) {
             bail!("duplicate env var name");
         }
-        let plaintext =
-            open_one_shot_secret(&secret.name, &secret.envelope, secret.dek_blindbox.as_ref())
-                .with_context(|| format!("open failed for {}", secret.name))?;
+        let plaintext = avault_core::open(master.as_bytes(), &secret.name, &secret.envelope)
+            .with_context(|| format!("open failed for {}", secret.name))?;
         opened.push(OpenedSecret {
             name: secret.env,
             plaintext,
         });
     }
+    drop(master);
     Ok(opened)
-}
-
-fn open_one_shot_secret(
-    name: &str,
-    envelope: &Sealed,
-    dek_blindbox: Option<&BlindBox>,
-) -> anyhow::Result<Zeroizing<Vec<u8>>> {
-    if let Some(dek_blindbox) = dek_blindbox {
-        let master = avault_store::load_master_key(Backend::File)?;
-        let keypair = avault_core::derive_blind_box_keypair_from_master(master.as_bytes());
-        let dek_plaintext = keypair
-            .open(dek_blindbox)
-            .context("DEK blind-box open failed")?;
-        drop(keypair);
-        drop(master);
-        let dek = zeroizing_vec_to_key32(dek_plaintext, "released DEK")?;
-        let opened =
-            avault_core::open_with_dek(&dek, name, envelope).context("envelope open failed")?;
-        drop(dek);
-        Ok(opened)
-    } else {
-        let master = avault_store::load_master_key(Backend::File)?;
-        let opened =
-            avault_core::open(master.as_bytes(), name, envelope).context("envelope open failed")?;
-        drop(master);
-        Ok(opened)
-    }
 }
 
 impl Zeroize for OpenedSecret {
@@ -533,23 +466,6 @@ fn deliver_fetch_cmd(args: &[OsString]) -> anyhow::Result<u8> {
     let input = read_json_stdin("failed to read deliver fetch JSON from stdin")?;
     let fetch: FetchInput =
         serde_json::from_slice(input.as_slice()).context("deliver fetch JSON is invalid")?;
-    let (_url, is_loopback) = validate_fetch_input(&fetch)?;
-
-    let mut secret =
-        open_one_shot_secret(&fetch.name, &fetch.envelope, fetch.dek_blindbox.as_ref())
-            .context("open failed")?;
-    let output = execute_fetch_request(fetch.request, &mut secret, is_loopback)
-        .context("fetch request failed")?;
-    secret.zeroize();
-    drop(secret);
-
-    let exit_code = fetch_output_exit_code(&output);
-    serde_json::to_writer(io::stdout(), &output).context("failed to write fetch response JSON")?;
-    println!();
-    Ok(exit_code)
-}
-
-fn validate_fetch_input(fetch: &FetchInput) -> anyhow::Result<(Url, bool)> {
     let url = Url::parse(&fetch.request.url).context("fetch url is invalid")?;
     let is_loopback = is_loopback_url(&url);
     validate_fetch_url(&url)?;
@@ -569,18 +485,16 @@ fn validate_fetch_input(fetch: &FetchInput) -> anyhow::Result<(Url, bool)> {
             reject_query_conflict(&url, name)?;
         }
     }
-    Ok((url, is_loopback))
-}
 
-fn execute_fetch_request(
-    request: FetchRequest,
-    secret: &mut Zeroizing<Vec<u8>>,
-    is_loopback: bool,
-) -> anyhow::Result<FetchOutput> {
+    let master = avault_store::load_master_key(Backend::File)?;
+    let mut secret = avault_core::open(master.as_bytes(), &fetch.name, &fetch.envelope)
+        .context("open failed")?;
+    drop(master);
+
     let mut secret_header: Option<(String, Zeroizing<String>)> = None;
-    let mut target_url = Zeroizing::new(request.url.clone());
+    let mut target_url = Zeroizing::new(fetch.request.url.clone());
     let mut redaction_needle: Option<Zeroizing<Vec<u8>>> = None;
-    match &request.inject {
+    match &fetch.request.inject {
         FetchInject::Bearer => {
             let credential =
                 fetch_header_credential_bytes(secret.as_slice(), "fetch bearer credential")?;
@@ -610,31 +524,31 @@ fn execute_fetch_request(
             if !secret.is_empty() {
                 redaction_needle = Some(Zeroizing::new(secret.as_slice().to_vec()));
             }
-            target_url = build_secret_query_url(&request.url, name, secret_text)?;
+            target_url = build_secret_query_url(&fetch.request.url, name, secret_text)?;
         }
     }
     secret.zeroize();
+    drop(secret);
 
     let output = perform_fetch(
-        &request.method,
+        &fetch.request.method,
         &mut target_url,
-        &request.headers,
+        &fetch.request.headers,
         secret_header,
-        request.body,
+        fetch.request.body,
         is_loopback,
         redaction_needle.as_deref().map(Vec::as_slice),
     )
     .context("fetch request failed")?;
     drop(redaction_needle);
-    Ok(output)
-}
-
-fn fetch_output_exit_code(output: &FetchOutput) -> u8 {
-    if (200..=299).contains(&output.status) {
+    let exit_code = if (200..=299).contains(&output.status) {
         0
     } else {
         1
-    }
+    };
+    serde_json::to_writer(io::stdout(), &output).context("failed to write fetch response JSON")?;
+    println!();
+    Ok(exit_code)
 }
 
 fn perform_fetch(
@@ -818,6 +732,7 @@ fn deliver_inject_cmd(args: &[OsString]) -> anyhow::Result<u8> {
 }
 
 fn open_named_secrets(secrets: Vec<NamedSecretInput>) -> anyhow::Result<Vec<OpenedSecret>> {
+    let master = avault_store::load_master_key(Backend::File)?;
     let mut opened = Vec::with_capacity(secrets.len());
     let mut seen = BTreeSet::new();
     for secret in secrets {
@@ -829,14 +744,14 @@ fn open_named_secrets(secrets: Vec<NamedSecretInput>) -> anyhow::Result<Vec<Open
         if !seen.insert(target_name.clone()) {
             bail!("duplicate secret target name");
         }
-        let plaintext =
-            open_one_shot_secret(&secret.name, &secret.envelope, secret.dek_blindbox.as_ref())
-                .with_context(|| format!("open failed for {}", secret.name))?;
+        let plaintext = avault_core::open(master.as_bytes(), &secret.name, &secret.envelope)
+            .with_context(|| format!("open failed for {}", secret.name))?;
         opened.push(OpenedSecret {
             name: target_name,
             plaintext,
         });
     }
+    drop(master);
     Ok(opened)
 }
 
@@ -1473,711 +1388,6 @@ fn parse_flag(args: &[OsString], flag: &str) -> anyhow::Result<bool> {
         }
     }
     Ok(seen)
-}
-
-#[derive(Debug)]
-#[cfg(unix)]
-struct AgentOptions {
-    socket_path: PathBuf,
-    idle_timeout: Duration,
-}
-
-#[cfg(unix)]
-fn agent_cmd(args: &[OsString]) -> anyhow::Result<u8> {
-    let options = parse_agent_options(args)?;
-    run_agent(options)
-}
-
-#[cfg(not(unix))]
-fn agent_cmd(_args: &[OsString]) -> anyhow::Result<u8> {
-    bail!("avault agent is only supported on Unix platforms")
-}
-
-#[cfg(unix)]
-fn parse_agent_options(args: &[OsString]) -> anyhow::Result<AgentOptions> {
-    let mut socket_path = None;
-    let mut idle_timeout_secs = DEFAULT_AGENT_IDLE_TIMEOUT_SECS;
-    let mut index = 0;
-    while index < args.len() {
-        let flag = args[index]
-            .to_str()
-            .context("agent options must be valid UTF-8")?;
-        match flag {
-            "--socket" => {
-                if socket_path.is_some() {
-                    bail!("--socket was provided more than once");
-                }
-                let value = args
-                    .get(index + 1)
-                    .and_then(|s| s.to_str())
-                    .context("--socket requires a value")?;
-                socket_path = Some(PathBuf::from(value));
-                index += 2;
-            }
-            "--idle-timeout-secs" => {
-                let value = args
-                    .get(index + 1)
-                    .and_then(|s| s.to_str())
-                    .context("--idle-timeout-secs requires a value")?;
-                idle_timeout_secs = value
-                    .parse::<u64>()
-                    .context("--idle-timeout-secs must be an integer")?;
-                if idle_timeout_secs == 0 {
-                    bail!("--idle-timeout-secs must be positive");
-                }
-                index += 2;
-            }
-            other => bail!("unknown agent option: {other}"),
-        }
-    }
-
-    Ok(AgentOptions {
-        socket_path: socket_path.unwrap_or(default_agent_socket_path()?),
-        idle_timeout: Duration::from_secs(idle_timeout_secs),
-    })
-}
-
-#[cfg(unix)]
-fn default_agent_socket_path() -> anyhow::Result<PathBuf> {
-    Ok(user_home_dir()?
-        .join(".avibe")
-        .join("run")
-        .join("avault.sock"))
-}
-
-#[cfg(unix)]
-fn user_home_dir() -> anyhow::Result<PathBuf> {
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .context("HOME is not set")
-}
-
-#[cfg(unix)]
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct GrantKey {
-    scope_type: String,
-    scope_ref: String,
-}
-
-#[cfg(unix)]
-struct GrantEntry {
-    expires_at: Instant,
-    deks: HashMap<String, MasterKey>,
-}
-
-#[cfg(unix)]
-struct AgentState {
-    grants: HashMap<GrantKey, GrantEntry>,
-    last_activity: Instant,
-    idle_timeout: Duration,
-}
-
-#[cfg(unix)]
-impl AgentState {
-    fn new(idle_timeout: Duration) -> Self {
-        Self {
-            grants: HashMap::new(),
-            last_activity: Instant::now(),
-            idle_timeout,
-        }
-    }
-
-    fn record_activity(&mut self) {
-        self.last_activity = Instant::now();
-        self.purge();
-    }
-
-    fn purge(&mut self) {
-        let now = Instant::now();
-        if now.duration_since(self.last_activity) >= self.idle_timeout {
-            self.grants.clear();
-        }
-        self.grants.retain(|_, grant| grant.expires_at > now);
-    }
-
-    fn get_grant(&mut self, scope: &GrantKey) -> anyhow::Result<&GrantEntry> {
-        self.purge();
-        self.grants
-            .get(scope)
-            .context("grant is missing or expired")
-    }
-}
-
-#[cfg(unix)]
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum AgentRequest {
-    Pubkey,
-    Grant(AgentGrantRequest),
-    Release(AgentScopeRequest),
-    Revoke(AgentScopeRequest),
-    Deliver(AgentDeliverRequest),
-    Sign(AgentSignRequest),
-}
-
-#[cfg(unix)]
-#[derive(Debug, Deserialize)]
-struct AgentScopeRequest {
-    scope_type: String,
-    scope_ref: String,
-}
-
-#[cfg(unix)]
-#[derive(Debug, Deserialize)]
-struct AgentGrantRequest {
-    scope_type: String,
-    scope_ref: String,
-    ttl_secs: Option<u64>,
-    deks: Vec<AgentDekInput>,
-}
-
-#[cfg(unix)]
-#[derive(Debug, Deserialize)]
-struct AgentDekInput {
-    name: String,
-    dek_blindbox: BlindBox,
-}
-
-#[cfg(unix)]
-#[derive(Debug, Deserialize)]
-struct AgentDeliverRequest {
-    scope_type: String,
-    scope_ref: String,
-    #[serde(flatten)]
-    mode: AgentDeliverMode,
-}
-
-#[cfg(unix)]
-#[derive(Debug, Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case")]
-enum AgentDeliverMode {
-    Run {
-        command: Vec<String>,
-        secrets: Vec<EnvSecretInput>,
-    },
-    Fetch {
-        name: String,
-        envelope: Sealed,
-        request: FetchRequest,
-    },
-    Inject(InjectInput),
-}
-
-#[cfg(unix)]
-#[derive(Debug, Deserialize)]
-struct AgentSignRequest {
-    scope_type: String,
-    scope_ref: String,
-    name: String,
-    key_envelope: Sealed,
-    digest: String,
-    scheme: String,
-}
-
-#[cfg(unix)]
-#[derive(Debug, Serialize)]
-struct AgentResponse<T: Serialize> {
-    ok: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<T>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-}
-
-#[cfg(unix)]
-#[derive(Debug, Serialize)]
-struct AgentGrantOutput {
-    granted: usize,
-    ttl_secs: u64,
-}
-
-#[cfg(unix)]
-#[derive(Debug, Serialize)]
-struct AgentReleaseOutput {
-    released: bool,
-}
-
-#[cfg(unix)]
-#[derive(Debug, Serialize)]
-struct AgentRunOutput {
-    exit_code: u8,
-}
-
-#[cfg(unix)]
-fn run_agent(options: AgentOptions) -> anyhow::Result<u8> {
-    avault_store::harden_process_memory();
-    let keypair = avault_core::generate_blind_box_keypair();
-    let listener = bind_agent_socket(&options.socket_path)?;
-    listener
-        .set_nonblocking(true)
-        .context("failed to configure agent socket")?;
-    let mut state = AgentState::new(options.idle_timeout);
-
-    loop {
-        state.purge();
-        let (mut stream, _) = match listener.accept() {
-            Ok(accepted) => accepted,
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(AGENT_POLL_INTERVAL);
-                continue;
-            }
-            Err(err) => return Err(err).context("failed to accept agent connection"),
-        };
-        stream
-            .set_read_timeout(Some(AGENT_POLL_INTERVAL))
-            .context("failed to configure agent connection")?;
-        if let Err(err) = authorize_peer(&stream) {
-            let _ = write_agent_error_frame(&mut stream, &err);
-            continue;
-        }
-        loop {
-            state.purge();
-            match read_agent_frame(&mut stream, &mut state) {
-                Ok(Some(frame)) => {
-                    state.record_activity();
-                    let response = handle_agent_frame(frame.as_slice(), &keypair, &mut state);
-                    if write_agent_json_frame(&mut stream, &response).is_err() {
-                        break;
-                    }
-                }
-                Ok(None) => break,
-                Err(err) => {
-                    let _ = write_agent_error_frame(&mut stream, &err);
-                    break;
-                }
-            }
-        }
-    }
-}
-
-#[cfg(unix)]
-fn bind_agent_socket(path: &Path) -> anyhow::Result<UnixListener> {
-    let parent = path
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    ensure_agent_socket_parent(parent)?;
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_socket() => {
-            fs::remove_file(path).context("failed to remove stale agent socket")?;
-        }
-        Ok(_) => bail!("agent socket path already exists and is not a socket"),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err).context("failed to inspect agent socket path"),
-    }
-
-    let listener = UnixListener::bind(path).context("failed to bind agent socket")?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .context("failed to secure agent socket")?;
-    Ok(listener)
-}
-
-#[cfg(unix)]
-fn ensure_agent_socket_parent(parent: &Path) -> anyhow::Result<()> {
-    if !parent.exists() {
-        fs::create_dir_all(parent).context("failed to create agent runtime directory")?;
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-            .context("failed to secure agent runtime directory")?;
-        return Ok(());
-    }
-    let metadata = fs::metadata(parent).context("failed to stat agent runtime directory")?;
-    if !metadata.is_dir() {
-        bail!("agent runtime path parent is not a directory");
-    }
-    if metadata.uid() != unsafe_geteuid() {
-        bail!("agent runtime directory is not owned by the current user");
-    }
-    if metadata.permissions().mode() & 0o077 != 0 {
-        bail!("agent runtime directory mode is too open");
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn handle_agent_frame(
-    frame: &[u8],
-    keypair: &BlindBoxKeypair,
-    state: &mut AgentState,
-) -> serde_json::Value {
-    match handle_agent_frame_inner(frame, keypair, state) {
-        Ok(value) => value,
-        Err(err) => serde_json::to_value(AgentResponse::<serde_json::Value> {
-            ok: false,
-            result: None,
-            error: Some(err.to_string()),
-        })
-        .expect("agent error response serializes"),
-    }
-}
-
-#[cfg(unix)]
-fn handle_agent_frame_inner(
-    frame: &[u8],
-    keypair: &BlindBoxKeypair,
-    state: &mut AgentState,
-) -> anyhow::Result<serde_json::Value> {
-    let request: AgentRequest =
-        serde_json::from_slice(frame).context("agent frame JSON is invalid")?;
-    match request {
-        AgentRequest::Pubkey => agent_ok(PubkeyOutput {
-            public_key: keypair.public_key_b64(),
-            fingerprint: keypair.fingerprint_hex(),
-        }),
-        AgentRequest::Grant(request) => {
-            if request.deks.is_empty() {
-                bail!("grant requires at least one DEK");
-            }
-            let ttl_secs = request.ttl_secs.unwrap_or(DEFAULT_AGENT_GRANT_TTL_SECS);
-            if ttl_secs == 0 {
-                bail!("grant ttl_secs must be positive");
-            }
-            let mut deks = HashMap::with_capacity(request.deks.len());
-            for dek in request.deks {
-                if deks.contains_key(&dek.name) {
-                    bail!("duplicate grant DEK name");
-                }
-                let opened = keypair
-                    .open(&dek.dek_blindbox)
-                    .context("DEK blind-box open failed")?;
-                let released_dek = zeroizing_vec_to_key32(opened, "released DEK")?;
-                let locked =
-                    MasterKey::from_bytes(&released_dek).context("failed to lock released DEK")?;
-                drop(released_dek);
-                deks.insert(dek.name, locked);
-            }
-            let granted = deks.len();
-            let key = GrantKey {
-                scope_type: request.scope_type,
-                scope_ref: request.scope_ref,
-            };
-            state.grants.insert(
-                key,
-                GrantEntry {
-                    expires_at: Instant::now() + Duration::from_secs(ttl_secs),
-                    deks,
-                },
-            );
-            agent_ok(AgentGrantOutput { granted, ttl_secs })
-        }
-        AgentRequest::Release(request) | AgentRequest::Revoke(request) => {
-            let key = grant_key_from_scope(request)?;
-            let released = state.grants.remove(&key).is_some();
-            agent_ok(AgentReleaseOutput { released })
-        }
-        AgentRequest::Deliver(request) => {
-            let scope = GrantKey {
-                scope_type: request.scope_type,
-                scope_ref: request.scope_ref,
-            };
-            let grant = state.get_grant(&scope)?;
-            match request.mode {
-                AgentDeliverMode::Run { command, secrets } => {
-                    if command.is_empty() {
-                        bail!("deliver run requires a command");
-                    }
-                    let command: Vec<OsString> = command.into_iter().map(OsString::from).collect();
-                    let opened = open_env_secrets_with_grant(secrets, grant)?;
-                    let exit_code = run_child_with_opened_env(&command, opened, true)?;
-                    agent_ok(AgentRunOutput { exit_code })
-                }
-                AgentDeliverMode::Fetch {
-                    name,
-                    envelope,
-                    request,
-                } => {
-                    let fetch = FetchInput {
-                        name,
-                        envelope,
-                        dek_blindbox: None,
-                        request,
-                    };
-                    let (_url, is_loopback) = validate_fetch_input(&fetch)?;
-                    let mut secret = open_secret_with_grant(&fetch.name, &fetch.envelope, grant)
-                        .context("open failed")?;
-                    let output = execute_fetch_request(fetch.request, &mut secret, is_loopback)
-                        .context("fetch request failed")?;
-                    secret.zeroize();
-                    agent_ok(output)
-                }
-                AgentDeliverMode::Inject(inject) => {
-                    write_inject_from_opened(inject, open_named_secrets_with_grant, grant)?;
-                    agent_ok(serde_json::json!({ "ok": true }))
-                }
-            }
-        }
-        AgentRequest::Sign(request) => {
-            let scope = GrantKey {
-                scope_type: request.scope_type,
-                scope_ref: request.scope_ref,
-            };
-            let grant = state.get_grant(&scope)?;
-            let digest = decode_hex_32(&request.digest, "digest")?;
-            let scheme = SignatureScheme::from_str(&request.scheme)?;
-            let key_plaintext = open_secret_with_grant(&request.name, &request.key_envelope, grant)
-                .context("key envelope open failed")?;
-            let output = sign_digest_with_key(scheme, &digest, key_plaintext)?;
-            agent_ok(output)
-        }
-    }
-}
-
-#[cfg(unix)]
-fn agent_ok<T: Serialize>(result: T) -> anyhow::Result<serde_json::Value> {
-    serde_json::to_value(AgentResponse {
-        ok: true,
-        result: Some(result),
-        error: None,
-    })
-    .context("failed to encode agent response")
-}
-
-#[cfg(unix)]
-fn grant_key_from_scope(scope: AgentScopeRequest) -> anyhow::Result<GrantKey> {
-    if scope.scope_type.is_empty() || scope.scope_ref.is_empty() {
-        bail!("scope_type and scope_ref are required");
-    }
-    Ok(GrantKey {
-        scope_type: scope.scope_type,
-        scope_ref: scope.scope_ref,
-    })
-}
-
-#[cfg(unix)]
-fn open_env_secrets_with_grant(
-    secrets: Vec<EnvSecretInput>,
-    grant: &GrantEntry,
-) -> anyhow::Result<Vec<OpenedSecret>> {
-    let mut opened = Vec::with_capacity(secrets.len());
-    let mut seen = BTreeSet::new();
-    for secret in secrets {
-        validate_shell_name(&secret.env, "env var name")?;
-        if !seen.insert(secret.env.clone()) {
-            bail!("duplicate env var name");
-        }
-        let plaintext = open_secret_with_grant(&secret.name, &secret.envelope, grant)
-            .with_context(|| format!("open failed for {}", secret.name))?;
-        opened.push(OpenedSecret {
-            name: secret.env,
-            plaintext,
-        });
-    }
-    Ok(opened)
-}
-
-#[cfg(unix)]
-fn open_named_secrets_with_grant(
-    secrets: Vec<NamedSecretInput>,
-    grant: &GrantEntry,
-) -> anyhow::Result<Vec<OpenedSecret>> {
-    let mut opened = Vec::with_capacity(secrets.len());
-    let mut seen = BTreeSet::new();
-    for secret in secrets {
-        let target_name = secret
-            .key
-            .or(secret.env)
-            .unwrap_or_else(|| secret.name.clone());
-        validate_shell_name(&target_name, "secret target name")?;
-        if !seen.insert(target_name.clone()) {
-            bail!("duplicate secret target name");
-        }
-        let plaintext = open_secret_with_grant(&secret.name, &secret.envelope, grant)
-            .with_context(|| format!("open failed for {}", secret.name))?;
-        opened.push(OpenedSecret {
-            name: target_name,
-            plaintext,
-        });
-    }
-    Ok(opened)
-}
-
-#[cfg(unix)]
-fn open_secret_with_grant(
-    name: &str,
-    envelope: &Sealed,
-    grant: &GrantEntry,
-) -> anyhow::Result<Zeroizing<Vec<u8>>> {
-    let dek = grant
-        .deks
-        .get(name)
-        .context("grant does not cover secret")?;
-    avault_core::open_with_dek(dek.as_bytes(), name, envelope).context("envelope open failed")
-}
-
-#[cfg(unix)]
-fn write_inject_from_opened(
-    inject: InjectInput,
-    opener: fn(Vec<NamedSecretInput>, &GrantEntry) -> anyhow::Result<Vec<OpenedSecret>>,
-    grant: &GrantEntry,
-) -> anyhow::Result<()> {
-    if inject.secrets.is_empty() {
-        bail!("deliver inject requires at least one secret");
-    }
-    let format = inject.format.to_ascii_lowercase();
-    if format != "dotenv" && format != "json" {
-        bail!("deliver inject format is not implemented in P1.1");
-    }
-    let mut opened = opener(inject.secrets, grant)?;
-    let mut rendered = render_inject_file(&opened, &format)?;
-    opened.zeroize();
-    drop(opened);
-
-    avault_store::atomic_write_secret_file(&inject.path, rendered.as_slice())
-        .context("failed to write inject file")?;
-    rendered.zeroize();
-    Ok(())
-}
-
-#[cfg(unix)]
-fn read_agent_frame(
-    stream: &mut UnixStream,
-    state: &mut AgentState,
-) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
-    let mut len_buf = [0u8; 4];
-    match read_exact_agent(stream, &mut len_buf, state) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(err) => return Err(err).context("failed to read agent frame length"),
-    }
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len == 0 || len > MAX_AGENT_FRAME_BYTES {
-        bail!("agent frame size is invalid");
-    }
-    let mut frame = Zeroizing::new(vec![0u8; len]);
-    read_exact_agent(stream, frame.as_mut_slice(), state).context("failed to read agent frame")?;
-    Ok(Some(frame))
-}
-
-#[cfg(unix)]
-fn read_exact_agent(
-    stream: &mut UnixStream,
-    mut buf: &mut [u8],
-    state: &mut AgentState,
-) -> io::Result<()> {
-    while !buf.is_empty() {
-        match stream.read(buf) {
-            Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
-            Ok(n) => {
-                let tmp = buf;
-                buf = &mut tmp[n..];
-            }
-            Err(err)
-                if err.kind() == std::io::ErrorKind::WouldBlock
-                    || err.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                state.purge();
-            }
-            Err(err) => return Err(err),
-        }
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn write_agent_json_frame<T: Serialize>(stream: &mut UnixStream, value: &T) -> anyhow::Result<()> {
-    let bytes = serde_json::to_vec(value).context("failed to encode agent frame")?;
-    write_agent_frame(stream, &bytes)
-}
-
-#[cfg(unix)]
-fn write_agent_error_frame(stream: &mut UnixStream, err: &anyhow::Error) -> anyhow::Result<()> {
-    write_agent_json_frame(
-        stream,
-        &AgentResponse::<serde_json::Value> {
-            ok: false,
-            result: None,
-            error: Some(err.to_string()),
-        },
-    )
-}
-
-#[cfg(unix)]
-fn write_agent_frame(stream: &mut UnixStream, bytes: &[u8]) -> anyhow::Result<()> {
-    let len: u32 = bytes
-        .len()
-        .try_into()
-        .context("agent frame exceeds supported size")?;
-    stream
-        .write_all(&len.to_be_bytes())
-        .context("failed to write agent frame length")?;
-    stream
-        .write_all(bytes)
-        .context("failed to write agent frame")?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn authorize_peer(stream: &UnixStream) -> anyhow::Result<()> {
-    let peer_uid = peer_uid(stream)?;
-    let current_uid = unsafe_geteuid();
-    if peer_uid != current_uid {
-        bail!("agent peer uid is not authorized");
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn peer_uid(stream: &UnixStream) -> anyhow::Result<u32> {
-    let fd = stream.as_raw_fd();
-    let mut cred = std::mem::MaybeUninit::<libc::ucred>::zeroed();
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // Safety invariant: `fd` is a live Unix stream socket. `getsockopt(SO_PEERCRED)` writes only
-    // kernel peer-credential metadata into the stack buffer so the agent can reject other users
-    // before any secret-bearing frame is honored.
-    let rc = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            cred.as_mut_ptr().cast(),
-            &mut len,
-        )
-    };
-    if rc != 0 {
-        bail!("failed to read peer credentials");
-    }
-    // Safety invariant: `getsockopt` succeeded and initialized `cred`.
-    let cred = unsafe { cred.assume_init() };
-    Ok(cred.uid)
-}
-
-#[cfg(target_os = "macos")]
-fn peer_uid(stream: &UnixStream) -> anyhow::Result<u32> {
-    let fd = stream.as_raw_fd();
-    let mut cred = std::mem::MaybeUninit::<libc::xucred>::zeroed();
-    let mut len = std::mem::size_of::<libc::xucred>() as libc::socklen_t;
-    // Safety invariant: `fd` is a live Unix stream socket. `getsockopt(LOCAL_PEERCRED)` writes
-    // only kernel peer-credential metadata into the stack buffer so same-uid authorization does
-    // not depend on a shared secret in Python.
-    let rc = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_LOCAL,
-            libc::LOCAL_PEERCRED,
-            cred.as_mut_ptr().cast(),
-            &mut len,
-        )
-    };
-    if rc != 0 {
-        bail!("failed to read peer credentials");
-    }
-    // Safety invariant: `getsockopt` succeeded and initialized `cred`.
-    let cred = unsafe { cred.assume_init() };
-    if cred.cr_version != libc::XUCRED_VERSION {
-        bail!("peer credentials have unsupported version");
-    }
-    Ok(cred.cr_uid)
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn peer_uid(_stream: &UnixStream) -> anyhow::Result<u32> {
-    bail!("agent peer credentials are unsupported on this Unix platform")
-}
-
-#[cfg(unix)]
-fn unsafe_geteuid() -> u32 {
-    // Safety invariant: `geteuid` reads process identity metadata only. The agent uses this to
-    // compare the kernel-reported peer uid against its own uid before processing frames.
-    unsafe { libc::geteuid() }
 }
 
 fn read_stdin_zeroizing() -> anyhow::Result<Zeroizing<Vec<u8>>> {

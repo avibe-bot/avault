@@ -55,7 +55,6 @@ dependencies = [
  "base64",
  "hex",
  "hpke",
- "libc",
  "serde",
  "serde_json",
  "sha2",
