@@ -1,5 +1,12 @@
 #![cfg(unix)]
 
+use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::{Aes256Gcm, Nonce};
+use base64::Engine;
+use hpke::{
+    aead::AesGcm256, kdf::HkdfSha256, kem::X25519HkdfSha256, single_shot_seal, Deserializable,
+    OpModeS, Serializable,
+};
 use serde_json::json;
 use std::fs;
 use std::io::{Read, Write};
@@ -56,6 +63,92 @@ fn p0_no_aad_envelope() -> serde_json::Value {
     })
 }
 
+fn fixed_blind_box(public_key: &str, plaintext: &[u8]) -> serde_json::Value {
+    struct FixedRng([u8; 32], u64);
+    impl hpke::rand_core::RngCore for FixedRng {
+        fn next_u32(&mut self) -> u32 {
+            let mut out = [0u8; 4];
+            self.fill_bytes(&mut out);
+            u32::from_le_bytes(out)
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            let mut out = [0u8; 8];
+            self.fill_bytes(&mut out);
+            u64::from_le_bytes(out)
+        }
+
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            use sha2::Digest;
+            let mut written = 0usize;
+            while written < dest.len() {
+                let mut input = [0u8; 40];
+                input[..32].copy_from_slice(&self.0);
+                input[32..].copy_from_slice(&self.1.to_le_bytes());
+                let block = sha2::Sha256::digest(input);
+                let n = (dest.len() - written).min(block.len());
+                dest[written..written + n].copy_from_slice(&block[..n]);
+                written += n;
+                self.1 = self.1.wrapping_add(1);
+            }
+        }
+    }
+    impl hpke::rand_core::CryptoRng for FixedRng {}
+
+    let public_key_bytes = base64::engine::general_purpose::STANDARD
+        .decode(public_key)
+        .unwrap();
+    let public_key =
+        <X25519HkdfSha256 as hpke::Kem>::PublicKey::from_bytes(&public_key_bytes).unwrap();
+    let mut rng = FixedRng([0x42u8; 32], 0);
+    let (enc, ct) = single_shot_seal::<AesGcm256, HkdfSha256, X25519HkdfSha256, _>(
+        &OpModeS::Base,
+        &public_key,
+        b"avault:blind-box:v1",
+        plaintext,
+        b"hpke-x25519-hkdfsha256-aes256gcm-v1",
+        &mut rng,
+    )
+    .unwrap();
+
+    json!({
+        "scheme": "hpke-x25519-hkdfsha256-aes256gcm-v1",
+        "enc": base64::engine::general_purpose::STANDARD.encode(enc.to_bytes()),
+        "ct": base64::engine::general_purpose::STANDARD.encode(ct)
+    })
+}
+
+fn p2_vectors() -> serde_json::Value {
+    serde_json::from_str(include_str!("../../../tests/vectors/p2_core_crypto.json")).unwrap()
+}
+
+fn envelope_encrypted_with_dek(name: &str, dek: &[u8; 32], value: &[u8]) -> serde_json::Value {
+    let nonce = [0x11u8; 12];
+    let mut aad = Vec::with_capacity(name.len() + "machine-aesgcm-v1".len() + 1);
+    aad.extend_from_slice(name.as_bytes());
+    aad.extend_from_slice(b"machine-aesgcm-v1");
+    aad.push(1);
+    let ciphertext = Aes256Gcm::new(dek.into())
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            aes_gcm::aead::Payload {
+                msg: value,
+                aad: &aad,
+            },
+        )
+        .unwrap();
+    json!({
+        "ciphertext": base64::engine::general_purpose::STANDARD.encode(ciphertext),
+        "nonce": base64::engine::general_purpose::STANDARD.encode(nonce),
+        "wrap_meta": json!({
+            "v": 1,
+            "scheme": "machine-aesgcm-v1",
+            "wrapped_dek": "",
+            "dek_nonce": ""
+        }).to_string()
+    })
+}
+
 #[test]
 fn seal_and_deliver_run_roundtrip() {
     let home = tempfile::tempdir().unwrap();
@@ -107,6 +200,161 @@ fn seal_and_deliver_run_roundtrip() {
     let deliver_output = deliver.wait_with_output().unwrap();
     assert!(deliver_output.status.success());
     assert_eq!(deliver_output.stdout, b"ok");
+}
+
+#[test]
+fn pubkey_and_blind_box_seal_roundtrip() {
+    let home = tempfile::tempdir().unwrap();
+    write_p0_master(&home.path().join("vault"));
+
+    let output = avault()
+        .arg("pubkey")
+        .env("AVAULT_HOME", home.path().join("vault"))
+        .stdout(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let pubkey: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let vector = p2_vectors();
+    assert_eq!(pubkey["public_key"], vector["blind_box"]["public_key"]);
+    assert_eq!(pubkey["fingerprint"], vector["blind_box"]["fingerprint"]);
+
+    let blind_box = fixed_blind_box(pubkey["public_key"].as_str().unwrap(), b"blind-value");
+    let mut seal = avault()
+        .arg("seal")
+        .arg("--name")
+        .arg("BLIND_SECRET")
+        .arg("--blind-box")
+        .env("AVAULT_HOME", home.path().join("vault"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    seal.stdin
+        .as_mut()
+        .unwrap()
+        .write_all(blind_box.to_string().as_bytes())
+        .unwrap();
+    let seal_output = seal.wait_with_output().unwrap();
+    assert!(seal_output.status.success());
+
+    let mut deliver = avault()
+        .arg("deliver")
+        .arg("run")
+        .arg("--name")
+        .arg("BLIND_SECRET")
+        .arg("--env")
+        .arg("SECRET_VALUE")
+        .arg("--")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg(r#"test "$SECRET_VALUE" = "blind-value" && printf ok"#)
+        .env("AVAULT_HOME", home.path().join("vault"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    deliver
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(&seal_output.stdout)
+        .unwrap();
+    let deliver_output = deliver.wait_with_output().unwrap();
+    assert!(deliver_output.status.success());
+    assert_eq!(deliver_output.stdout, b"ok");
+}
+
+#[test]
+fn sign_matches_shared_vectors_for_all_schemes() {
+    let home = tempfile::tempdir().unwrap();
+    write_p0_master(&home.path().join("vault"));
+    let vector = p2_vectors();
+    let signing = &vector["signing"];
+    let private_key = hex::decode(signing["private_key_hex"].as_str().unwrap()).unwrap();
+    let key_envelope = seal_secret(&home.path().join("vault"), "ETH_SIGNING_KEY", &private_key);
+
+    for scheme in signing["schemes"].as_array().unwrap() {
+        let request = json!({
+            "name": "ETH_SIGNING_KEY",
+            "key_envelope": key_envelope,
+            "digest": signing["digest_hex"],
+            "scheme": scheme["scheme"]
+        });
+        let mut sign = avault()
+            .arg("sign")
+            .env("AVAULT_HOME", home.path().join("vault"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        sign.stdin
+            .as_mut()
+            .unwrap()
+            .write_all(request.to_string().as_bytes())
+            .unwrap();
+        let output = sign.wait_with_output().unwrap();
+        assert!(output.status.success());
+        let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        if scheme["scheme"] == "schnorr-secp256k1-bip340" {
+            assert_eq!(response["signature"].as_str().unwrap().len(), 128);
+            assert_eq!(response["recovery_id"], serde_json::Value::Null);
+        } else {
+            assert_eq!(response["signature"], scheme["signature_hex"]);
+            assert_eq!(response["recovery_id"], scheme["recovery_id"]);
+        }
+    }
+}
+
+#[test]
+fn protected_sign_uses_dek_blindbox() {
+    let home = tempfile::tempdir().unwrap();
+    write_p0_master(&home.path().join("vault"));
+    let vector = p2_vectors();
+    let signing = &vector["signing"];
+    let private_key = hex::decode(signing["private_key_hex"].as_str().unwrap()).unwrap();
+    let dek = [0x99u8; 32];
+    let key_envelope = envelope_encrypted_with_dek("PROTECTED_KEY", &dek, &private_key);
+
+    let output = avault()
+        .arg("pubkey")
+        .env("AVAULT_HOME", home.path().join("vault"))
+        .stdout(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let pubkey: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let dek_blindbox = fixed_blind_box(pubkey["public_key"].as_str().unwrap(), &dek);
+    let expected = signing["schemes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|scheme| scheme["scheme"] == "ecdsa-secp256k1-der")
+        .unwrap();
+    let request = json!({
+        "name": "PROTECTED_KEY",
+        "key_envelope": key_envelope,
+        "digest": signing["digest_hex"],
+        "scheme": "ecdsa-secp256k1-der",
+        "dek_blindbox": dek_blindbox
+    });
+    let mut sign = avault()
+        .arg("sign")
+        .env("AVAULT_HOME", home.path().join("vault"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    sign.stdin
+        .as_mut()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let output = sign.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["signature"], expected["signature_hex"]);
+    assert_eq!(response["recovery_id"], serde_json::Value::Null);
 }
 
 #[test]
