@@ -498,9 +498,10 @@ These are starting recommendations, not frozen choices — items #2 (envelope) a
 | `key export` / `key import` | passphrase (stdin) | encrypted backup / ok | back up, migrate, restore the master key |
 
 Phase A implements the core blind-box opener and secp256k1 signer plus one-shot CLI
-verbs. The resident agent later adds `grant` / `release`: cache a scope's DEK-set
-for a TTL so repeated uses in-window skip re-unlock. Signing is chain-agnostic:
-callers provide the exact 32-byte digest/sighash and select the signature encoding.
+verbs. Phase B adds the resident agent transport plus `grant` / `release`: cache a
+scope's DEK-set for a TTL so repeated uses in-window skip re-unlock. Signing is
+chain-agnostic: callers provide the exact 32-byte digest/sighash and select the
+signature encoding.
 
 ### Phase A blind-box and signing schemas
 
@@ -597,7 +598,10 @@ test deterministic.
 
 All P1.1 delivery inputs are JSON on stdin. The `envelope` object is the persisted
 `{ciphertext, nonce, wrap_meta}` shape. The `name` field is the secret name used for
-AAD. Values never appear in argv.
+AAD. Values never appear in argv. Phase B adds an optional `dek_blindbox` field to
+the one-shot delivery schemas; when present, avault opens that blind box to obtain
+the 32-byte per-record DEK and opens the envelope with `open_with_dek` instead of
+the standard-tier master key.
 
 `deliver run` accepts a JSON array and spawns exactly one child:
 
@@ -606,7 +610,8 @@ AAD. Values never appear in argv.
   {
     "name": "OPENAI_API_KEY",
     "env": "OPENAI_API_KEY",
-    "envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." }
+    "envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." },
+    "dek_blindbox": null
   }
 ]
 ```
@@ -620,6 +625,7 @@ The legacy single-secret form remains available:
 {
   "name": "GITHUB_TOKEN",
   "envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." },
+  "dek_blindbox": null,
   "request": {
     "method": "GET",
     "url": "https://api.github.com/user",
@@ -657,7 +663,8 @@ are intentionally left to the `allowed_hosts` policy boundary.
     {
       "name": "OPENAI_API_KEY",
       "key": "OPENAI_API_KEY",
-      "envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." }
+      "envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." },
+      "dek_blindbox": null
     }
   ]
 }
@@ -674,6 +681,183 @@ Two modes, the same integration touchpoints as `askill`. **Both channels carry o
 
 - **P1 — CLI subprocess (askill-shaped).** Avibe spawns the `avault` binary. Control args via argv/JSON; **bulk blobs (blind boxes, ciphertext) via stdin** (kept out of argv so they don't show in `ps`); results via **stdout JSON**. The `run` child inherits stdio. One-shot: use the key, zeroize, exit.
 - **P2 — resident agent (unix socket).** `avault agent` listens on `~/.avibe/run/avault.sock` (0600) and exchanges **length-prefixed JSON frames**. Authorization is **`SO_PEERCRED` (Linux) / `LOCAL_PEERCRED` (macOS)**: `avault` reads the connecting peer's uid/pid to confirm it is the same-user Avibe daemon — **no shared token**, so no decrypt-authorizing secret is re-introduced into Python. The agent is resident so it can hold the grant DEK-cache and act as the signing oracle (keys held across calls).
+
+Each agent frame is a 4-byte unsigned big-endian JSON byte length followed by
+that many UTF-8 JSON bytes. Frames are processed sequentially on a connection;
+there is no request-id multiplexing in Phase B. Every response is one frame:
+
+```json
+{ "ok": true, "result": { "...": "..." } }
+```
+
+or:
+
+```json
+{ "ok": false, "error": "what failed, never secret bytes" }
+```
+
+`pubkey` publishes the agent's fresh in-memory receiver keypair:
+
+```json
+{ "type": "pubkey" }
+```
+
+Response `result` is the same object as the CLI `pubkey` output:
+
+```json
+{
+  "public_key": "<base64 raw 32-byte X25519 public key>",
+  "fingerprint": "<lowercase hex SHA-256 of the raw public key>"
+}
+```
+
+This key is generated at agent start, never written to disk, and changes on
+restart. Protected-tier callers must re-pin / re-attest it per agent lifetime
+(§11.4).
+
+`grant` opens browser-sealed DEKs to the agent's current pubkey and caches them by
+scope until the fixed TTL expires. The TTL is strict and does not slide; idle
+timeout or process restart also clears the cache. DEKs are stored in the same
+dedicated locked 32-byte pages as master keys. The cached name is the persisted
+secret name used for envelope AAD.
+
+```json
+{
+  "type": "grant",
+  "scope_type": "session",
+  "scope_ref": "ses_123",
+  "ttl_secs": 300,
+  "deks": [
+    {
+      "name": "OPENAI_API_KEY",
+      "dek_blindbox": {
+        "scheme": "hpke-x25519-hkdfsha256-aes256gcm-v1",
+        "enc": "...",
+        "ct": "..."
+      }
+    }
+  ]
+}
+```
+
+Response:
+
+```json
+{ "ok": true, "result": { "granted": 1, "ttl_secs": 300 } }
+```
+
+`release` and `revoke` are aliases. They drop and zeroize the grant if present:
+
+```json
+{ "type": "release", "scope_type": "session", "scope_ref": "ses_123" }
+```
+
+Response:
+
+```json
+{ "ok": true, "result": { "released": true } }
+```
+
+Agent `deliver` uses a cached DEK selected by `{scope_type, scope_ref, name}`. It
+never accepts a `dek_blindbox` on deliver frames; the DEK must already be covered
+by a grant.
+
+`deliver` run:
+
+```json
+{
+  "type": "deliver",
+  "scope_type": "session",
+  "scope_ref": "ses_123",
+  "mode": "run",
+  "command": ["/usr/bin/env", "python3", "sync.py"],
+  "secrets": [
+    {
+      "name": "OPENAI_API_KEY",
+      "env": "OPENAI_API_KEY",
+      "envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." }
+    }
+  ]
+}
+```
+
+Response:
+
+```json
+{ "ok": true, "result": { "exit_code": 0 } }
+```
+
+`deliver` fetch:
+
+```json
+{
+  "type": "deliver",
+  "scope_type": "session",
+  "scope_ref": "ses_123",
+  "mode": "fetch",
+  "name": "GITHUB_TOKEN",
+  "envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." },
+  "request": {
+    "method": "GET",
+    "url": "https://api.github.com/user",
+    "allowed_hosts": ["api.github.com"],
+    "inject": { "type": "bearer" }
+  }
+}
+```
+
+Response `result` is the normal fetch output:
+
+```json
+{ "status": 200, "headers": { "...": "..." }, "body": "..." }
+```
+
+`deliver` inject:
+
+```json
+{
+  "type": "deliver",
+  "scope_type": "session",
+  "scope_ref": "ses_123",
+  "mode": "inject",
+  "path": "/path/to/secrets.env",
+  "format": "dotenv",
+  "secrets": [
+    {
+      "name": "OPENAI_API_KEY",
+      "key": "OPENAI_API_KEY",
+      "envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." }
+    }
+  ]
+}
+```
+
+Response:
+
+```json
+{ "ok": true, "result": { "ok": true } }
+```
+
+Agent `sign` likewise uses the cached DEK named by `name` to open the signing-key
+envelope, signs the caller-provided digest, and wipes the private key immediately.
+
+```json
+{
+  "type": "sign",
+  "scope_type": "session",
+  "scope_ref": "ses_123",
+  "name": "ETH_SIGNING_KEY",
+  "key_envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." },
+  "digest": "<hex 32-byte digest>",
+  "scheme": "ecdsa-secp256k1-recoverable"
+}
+```
+
+Response `result` is the normal signature output:
+
+```json
+{ "signature": "<hex signature bytes>", "recovery_id": 0 }
+```
 
 ### Where avault's own keys live (esp. Linux without a Keychain)
 
