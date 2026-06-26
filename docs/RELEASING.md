@@ -28,11 +28,16 @@ This matches the distribution decision in `docs/DESIGN.md` Section 16, decision
 
 | Manifest target | Rust target | Runner |
 | --- | --- | --- |
-| `macos-arm64` | `aarch64-apple-darwin` | `macos-15` |
-| `linux-x64` | `x86_64-unknown-linux-musl` | `ubuntu-22.04` |
+| `macos-arm64` | `aarch64-apple-darwin` | `macos-14` |
+| `macos-x64` | `x86_64-apple-darwin` | `macos-13` |
+| `linux-x64` | `x86_64-unknown-linux-musl` | `ubuntu-latest` |
+| `linux-arm64` | `aarch64-unknown-linux-musl` | `ubuntu-24.04-arm` |
+| `windows-x64` | `x86_64-pc-windows-msvc` | `windows-latest` |
+| `windows-arm64` | `aarch64-pc-windows-msvc` | `windows-latest` |
 
-`linux-x64` is built with the musl target so Avibe can treat it as the generic
-x86_64 Linux artifact without inheriting an Ubuntu glibc baseline.
+Linux artifacts are built with musl targets so Avibe can treat them as generic
+Linux artifacts without inheriting an Ubuntu glibc baseline. `windows-arm64` is
+best-effort; every other target is required for a release.
 
 ## Artifact naming
 
@@ -43,13 +48,15 @@ avault-<version>-<target>.tar.gz
 avault-<version>-<target>.tar.gz.sha256
 ```
 
-The tarball contains a single executable named `avault`.
+The tarball contains a single executable: `avault` on Unix targets and
+`avault.exe` on Windows targets.
 
 For tag `v0.1.0`, examples are:
 
 ```text
 avault-0.1.0-macos-arm64.tar.gz
 avault-0.1.0-linux-x64.tar.gz
+avault-0.1.0-windows-x64.tar.gz
 ```
 
 ## Manifest format
@@ -66,8 +73,20 @@ version to each target asset and its SHA-256 digest:
         "asset": "avault-0.1.0-linux-x64.tar.gz",
         "sha256": "<hex sha256>"
       },
+      "linux-arm64": {
+        "asset": "avault-0.1.0-linux-arm64.tar.gz",
+        "sha256": "<hex sha256>"
+      },
       "macos-arm64": {
         "asset": "avault-0.1.0-macos-arm64.tar.gz",
+        "sha256": "<hex sha256>"
+      },
+      "macos-x64": {
+        "asset": "avault-0.1.0-macos-x64.tar.gz",
+        "sha256": "<hex sha256>"
+      },
+      "windows-x64": {
+        "asset": "avault-0.1.0-windows-x64.tar.gz",
         "sha256": "<hex sha256>"
       }
     }
@@ -79,9 +98,9 @@ The digest is the SHA-256 of the `.tar.gz` asset, not the unpacked binary.
 
 ## macOS signing and notarization
 
-The release workflow contains a disabled-by-default signing/notarization job for
-`macos-arm64`. The build job first uploads an unsigned macOS artifact. A separate
-fresh macOS runner downloads that artifact and only runs codesign/notarytool when
+The release workflow contains disabled-by-default signing/notarization jobs for
+the macOS targets. The build job first uploads unsigned macOS artifacts. Separate
+fresh macOS runners download those artifacts and only run codesign/notarytool when
 all required Apple Developer secrets are available:
 
 - `APPLE_CODESIGN_CERTIFICATE_P12`
