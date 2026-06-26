@@ -403,16 +403,23 @@ This is an internal store selection inside `avault`, not an Avibe-level plugin l
 
 | Phase | Scope | State |
 |---|---|---|
-| **P0** | Python standard tier: DB + envelope + delivery + `$<NAME>` (#631) | **done — keep & merge; not replaced before P1** |
-| **P1** | `avault-core` + CLI + cross-platform file store; Rust takes standard-tier seal/open; blind-box create; `vibe runtime prepare` ensure + Dependencies card. Closes the memory-hygiene gap. | done |
-| **P1.1** | Complete the standard-tier delivery surface so Avibe can route every value-open through `avault`: multi-secret `deliver run`, brokered `deliver fetch`, and atomic-file `deliver inject` (dotenv/json). | done |
-| **P2 Phase A** | HPKE blind-box open, `pubkey` / blind-box `seal`, secp256k1 digest signing, and pinned wire contracts. | current |
-| **Later seams** | Resident agent + `SO_PEERCRED`, scope-grant DEK cache, passphrase/hardware stores, and external `SignerProvider` implementations. | later |
+| **P0** | Python standard tier: DB + envelope + delivery + `$<NAME>` (#631) | superseded by P1 |
+| **P1 / P1.1** | `avault-core` + CLI + cross-platform file store; Rust takes standard-tier seal/open + `deliver run`/`fetch`/`inject`; `vibe runtime prepare` ensure + Dependencies card. Closes the memory-hygiene gap. | done |
+| **P2 — the final trust model, in one shot (no P3)** | Delivered as reviewable sub-phases that land independently but compose into the final design; nothing ships as a half-released transition state. | in progress |
+| · **Phase A** | HPKE blind-box `open` / `open_with_dek`, `pubkey`, `seal --blind-box`, secp256k1 digest signing (`ecdsa-secp256k1-recoverable` = ETH, `ecdsa-secp256k1-der` = BTC legacy/SegWit, `schnorr-secp256k1-bip340` = BTC Taproot), `SignerProvider` seam, pinned JSON contracts (Appendix C). | done (#6) |
+| · **Phase B** | Resident agent: unix socket + `SO_PEERCRED` / `LOCAL_PEERCRED`, fresh in-memory receiver keypair, scope-typed grant DEK-cache (strict TTL + idle-zeroize), signing oracle; protected-tier `deliver` (browser-released DEK blind box). | in progress |
+| · **Phase C** | `file + passphrase` master store (passphrase-wrapped master, unlock once at startup). | queued |
+| · **avibe + browser** | Same one-shot P2, separate tracks. Python: protected create/resolve, blind-box create relay, scope-typed grants, approval / secure-input cards, signing relay. Browser: HPKE seal, VMK/DEK with passkey-PRF + password, browser ETH/BTC signing. | in progress |
+| **Plugin seams** (not a phase) | Hardware stores (Keychain / Secure Enclave / TPM / KMS), external signers (hardware wallet / WalletConnect), MPC, and other curves (e.g. ed25519) — drop in behind the `KeyStore` / `SignerProvider` traits when the need or hardware is real. Adding one is a plugin, never a migration or a released transition. | as needed |
 
-**Phase A update:** the P2/P3 split is collapsed for the final Vaults trust model.
-This phase pins blind-box create and secp256k1 digest-signing contracts; resident
-grant transport, passphrase/hardware stores, and external signers remain later
-drop-in seams rather than a separate P3.
+**P2 is the entire final Vaults trust model, built in one shot — there is no separate P3
+and no half-released transition state.** It lands as reviewable sub-phases (avault A/B/C
+plus the avibe Python and browser tracks) that compose into the final design. The
+standard-create transient-plaintext-in-Python residual (§11.3) is eliminated by the
+blind-box create path (Phase A). Curves this round are **secp256k1** (ETH + BTC); ed25519
+is a direct local add when a chain needs it, not a plugin. The one-shot CLI derives its
+blind-box receiver key from the master (HKDF, domain-separated); the resident agent uses a
+fresh in-memory receiver keypair that the browser pins/attests (§11.4).
 
 ---
 
