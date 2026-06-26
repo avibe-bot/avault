@@ -305,6 +305,10 @@ fn fetch_operation_hash(request: &serde_json::Value) -> [u8; 32] {
 }
 
 fn inject_operation_hash(target_name: &str, format: &str, path: &std::path::Path) -> [u8; 32] {
+    let path = path.canonicalize().unwrap_or_else(|_| {
+        let parent = path.parent().unwrap().canonicalize().unwrap();
+        parent.join(path.file_name().unwrap())
+    });
     operation_hash(&[
         b"deliver-inject",
         target_name.as_bytes(),
@@ -2341,6 +2345,69 @@ fn protected_deliver_inject_uses_operation_bound_dek_blindbox() {
         fs::read_to_string(&output_path).unwrap(),
         "API_TOKEN='protected-inject'\n"
     );
+}
+
+#[test]
+fn protected_deliver_inject_rejects_replayed_blindbox_for_different_cwd() {
+    let home = tempfile::tempdir().unwrap();
+    let approved_cwd = tempfile::tempdir().unwrap();
+    let replay_cwd = tempfile::tempdir().unwrap();
+    write_p0_master(&home.path().join("vault"));
+    let dek = [0x7eu8; 32];
+    let envelope = envelope_encrypted_with_dek("API_TOKEN", &dek, b"protected-inject-cwd");
+    let pubkey_output = avault()
+        .arg("pubkey")
+        .env("AVAULT_HOME", home.path().join("vault"))
+        .stdout(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(pubkey_output.status.success());
+    let pubkey: serde_json::Value = serde_json::from_slice(&pubkey_output.stdout).unwrap();
+    let approval_nonce = b"inject-cwd-00001";
+    let approval_expires_at = future_expiry();
+    let approved_path = approved_cwd.path().join("secrets.env");
+    let dek_blindbox = fixed_blind_box(
+        pubkey["public_key"].as_str().unwrap(),
+        &dek,
+        &aad_deliver(
+            "API_TOKEN",
+            approval_nonce,
+            approval_expires_at,
+            &inject_operation_hash("API_TOKEN", "dotenv", &approved_path),
+        ),
+    );
+    let request = json!({
+        "path": "secrets.env",
+        "format": "dotenv",
+        "secrets": [
+            {
+                "name": "API_TOKEN",
+                "key": "API_TOKEN",
+                "envelope": envelope,
+                "dek_blindbox": dek_blindbox,
+                "approval": approval_json(approval_nonce, approval_expires_at)
+            }
+        ]
+    });
+
+    let mut inject = avault()
+        .arg("deliver")
+        .arg("inject")
+        .current_dir(replay_cwd.path())
+        .env("AVAULT_HOME", home.path().join("vault"))
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    inject
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let output = inject.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(70));
+    assert!(!replay_cwd.path().join("secrets.env").exists());
 }
 
 #[test]

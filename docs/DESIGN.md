@@ -551,7 +551,7 @@ their approval expiry. Current `purpose` and `operation_hash` values:
 | `seal --blind-box` | `seal` | `name` | empty |
 | one-shot protected `deliver run` | `deliver` | `name`, approval | `"deliver-run"`, env var name, current working directory, `PATH`, each UTF-8 command argv field |
 | one-shot protected `deliver fetch` | `deliver` | `name`, approval | `"deliver-fetch"`, method, url, canonical allowed hosts, canonical headers, body-or-empty, canonical inject |
-| one-shot protected `deliver inject` | `deliver` | `name`, approval | `"deliver-inject"`, rendered key/env name, lowercase format, UTF-8 path |
+| one-shot protected `deliver inject` | `deliver` | `name`, approval | `"deliver-inject"`, rendered key/env name, lowercase format, avault-resolved absolute UTF-8 path |
 | one-shot protected `sign` | `sign` | `name`, `sign_scheme`, `digest`, approval | `"sign"`, scheme, raw 32-byte digest |
 | agent delivery grant | `agent-deliver` | `scope_type`, `scope_ref`, `name`, approval, `ttl_secs` | `"agent-deliver"`, name, `ttl_secs_u64_be` |
 | agent signing grant | `agent-sign` | `scope_type`, `scope_ref`, `name`, `sign_scheme`, `digest`, approval, `ttl_secs` | `"agent-sign"`, scheme, raw 32-byte digest, `ttl_secs_u64_be` |
@@ -735,6 +735,9 @@ are intentionally left to the `allowed_hosts` policy boundary.
 `dotenv` and `json`; `yaml` and `toml` remain deferred. Files are written
 atomically through an owner-only temporary file, fsync, rename, and
 parent-directory fsync. Unix uses 0600; Windows uses a protected owner-only DACL.
+For protected one-shot inject, relative paths are resolved against avault's
+current working directory before opening the DEK blind box, and the approval
+hash binds the resolved absolute target path rather than the raw JSON string.
 
 ### Transport
 

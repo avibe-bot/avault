@@ -562,7 +562,8 @@ fn one_shot_inject_operation_hash(
     format: &str,
     path: &Path,
 ) -> anyhow::Result<[u8; 32]> {
-    let path = path
+    let resolved_path = resolve_inject_approval_path(path)?;
+    let path = resolved_path
         .to_str()
         .context("inject path must be valid UTF-8 for protected approval binding")?;
     Ok(BlindBoxContext::operation_hash(&[
@@ -571,6 +572,33 @@ fn one_shot_inject_operation_hash(
         format.as_bytes(),
         path.as_bytes(),
     ]))
+}
+
+fn resolve_inject_approval_path(path: &Path) -> anyhow::Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("failed to read current directory for protected approval binding")?
+            .join(path)
+    };
+    if let Ok(canonical) = absolute.canonicalize() {
+        return Ok(canonical);
+    }
+    let parent = absolute
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let parent = match parent {
+        Some(parent) => parent
+            .canonicalize()
+            .with_context(|| "inject path parent must exist for protected approval binding")?,
+        None => std::env::current_dir()
+            .context("failed to read current directory for protected approval binding")?,
+    };
+    let file_name = absolute
+        .file_name()
+        .context("inject path must include a file name for protected approval binding")?;
+    Ok(parent.join(file_name))
 }
 
 fn one_shot_sign_operation_hash(scheme: &str, digest: &[u8; 32]) -> [u8; 32] {
