@@ -40,7 +40,7 @@ P0 is correct for what it is, and it should ship as-is. This document is about *
 
 1. **In-memory key hygiene (Python).** The machine key is an immutable `bytes`: it cannot be zeroized, it is copied into OpenSSL (a copy we do not control), and it is exposed to swap / coredump / ptrace with no `mlock` / `PR_SET_DUMPABLE` guard. This is a structural limit of Python's object model (immutability + GC + interning), not a patchable code smell.
 2. **The protected tier needs a factor not on the machine.** P0 leans on a browser passkey, which is unavailable in headless / native / IM-only contexts.
-3. **The signing oracle is unbuilt.** Keypair signing (ETH-first) has a design seam (`SignerProvider`) but no implementation.
+3. **The signing oracle must stay outside Python.** Keypair signing (ETH/BTC secp256k1) belongs in `avault` behind the `SignerProvider` seam so Avibe can request signatures without ever receiving private keys.
 
 ### 1.3 Why a Rust custody core
 
@@ -198,7 +198,7 @@ Through-line legend: 🔓 plaintext · 📦 blind box (sealed to `avault`) · �
 1. Browser collects name + value; 🔓 plaintext is in the browser only.
 2. Browser **seals the value to `avault`'s pubkey** → 📦; `POST /api/vault/secrets` carries the blind box.
 3. Daemon relays 📦 to `avault` (it cannot open it).
-4. `avault`: open 📦 → read master key from store → fresh DEK → AES-256-GCM encrypt (random nonce, **AAD = `name + scheme + version`**) → wrap DEK under master key → zeroize plaintext + DEK → return 🔒 `{ciphertext, nonce, wrap_meta}`.
+4. `avault`: open 📦 → read/unlock master key from the selected store → fresh DEK → AES-256-GCM encrypt (random nonce, **AAD = `name + scheme + version`**) → wrap DEK under master key → zeroize plaintext + DEK → return 🔒 `{ciphertext, nonce, wrap_meta}`.
 5. Daemon writes the row to `vault_secrets` (ciphertext, wrap_meta, preview `…last4`, `protection=standard`, audit `created`). 🔒 only; no plaintext, no key persists in Python.
 
 **Protected tier:** step 2 is the **browser encrypting under the VMK** (it unlocks the VMK with the passkey/password first, or uses an existing VMK session) and the POST body is already 🔒. Python never sees plaintext at all.
@@ -260,23 +260,41 @@ On a protected unlock the browser releases the **per-record DEK** (scoped to the
 
 Browser seals the DEK to `avault`'s pubkey → 📦 → daemon relays → `avault` opens, decrypts the DB ciphertext with the DEK, and delivers. For a scope grant, the browser releases the scope's DEK-set; `avault` caches it for the TTL (resident agent, §12). The value materializes only inside `avault`.
 
-### 8.3 ETH signing — sign in the browser
+### 8.3 secp256k1 signing — sign a digest, not a transaction
 
-For a high-value (protected) ETH key, **sign in the browser** with `@noble/curves` secp256k1 (same `@noble` family we already use for `@noble/hashes` scrypt):
+`avault` is chain-agnostic: callers compute the exact 32-byte digest/sighash and
+choose a named secp256k1 output scheme. Phase A implements:
 
-- Browser unlocks the private key, signs the tx/message locally, and returns **only the signature** (public, non-secret) through the daemon.
-- The private key **never reaches `avault`, Python, or the machine.** Strongest posture; cost is no headless signing.
+- `ecdsa-secp256k1-recoverable` for ETH-style signatures (`r || s` plus recovery id).
+- `ecdsa-secp256k1-der` for BTC legacy/SegWit DER signatures.
+- `schnorr-secp256k1-bip340` for BTC Taproot.
+
+Standard-tier signing unwraps a signing-key envelope with the machine master key.
+Protected-tier signing opens a browser-released DEK blind box, uses that DEK to
+open the signing-key envelope, signs the digest, and wipes the private key. In all
+cases the private key never leaves `avault`; the output signature is public.
 
 Honest constraints:
 
-- **secp256k1 is not supported by Secure Enclave / passkeys (all P-256).** So an ETH key is a **software key gated by a hardware factor** (passkey provides the unlock gesture; the key itself runs in browser JS via `@noble`). Putting the private key in hardware requires a **hardware wallet (Ledger / WalletConnect)** — the `external` `SignerProvider`, deferred.
-- Browser JS heap holds the key briefly; typed `Uint8Array` can be wiped after use (better than Python's immutable `bytes`), and the exposure is one operation while the user is present.
+- **secp256k1 is not supported by Secure Enclave / passkeys (all P-256).** A local
+  secp256k1 key is therefore software key material once its envelope is opened.
+  Hardware-wallet / WalletConnect support belongs behind the deferred `external`
+  `SignerProvider` seam.
+- Protected-tier local signing still materializes the private key inside `avault`
+  for one operation. The protected boundary is that Python never receives the key
+  or plaintext and the machine cannot open the key envelope until the browser
+  releases the per-record DEK blind box.
 
 ### 8.4 If you want unattended signing
 
-Set the ETH key to the **standard tier** and have **`avault` sign** with a machine-rooted key (`avault` gains a secp256k1 signer). Weaker (the machine can sign while you are away) but enables automation. Choose the tier by the signing key's value.
+Set the signing key to the **standard tier** and have **`avault` sign** with a
+machine-rooted key. Weaker (the machine can sign while you are away) but enables
+automation. Choose the tier by the signing key's value.
 
-This maps onto the `SignerProvider` ladder: **local** (protected = browser-sign / standard = `avault`-sign) → **external** (hardware wallet, strongest, deferred) → **mpc** (deferred).
+This maps onto the `SignerProvider` ladder: **local** (`avault` opens the signing
+key envelope and signs) → **external** (hardware wallet, strongest, deferred) →
+**mpc** (deferred). Ed25519-class chains are a direct local extension later; they
+are out of scope for Phase A.
 
 Unifying principle:
 
@@ -356,7 +374,7 @@ Peer-cred gates *other users* and remote, not a same-uid process — which is co
 `avault-store` selects the strongest local store available. Order (strongest first):
 
 - **Hardware / cloud (strongest roots):** macOS **Keychain / Secure Enclave**, Linux **TPM 2.0** (seal/unseal, optional PCR/auth binding), cloud **KMS** KEK. Non-extractable keys; can also serve as protected-tier factors on the machine for the no-browser case. Best for servers that must **auto-restart unattended**.
-- **`file + passphrase` (P2 — the cloud/no-hardware sweet spot):** wrap the master key under a KEK derived from an operator passphrase (`scrypt` / Argon2id); store only `wrapped_master`, so **the plaintext master never touches disk**. Unlock **once at startup** (passphrase via stdin) into `mlock`'d memory. Same "wrap the root under a factor-KEK" idea as the protected-tier VMK, applied to the standard master. *Honest limits:* it defends **at-rest** (stolen disk / leaked backup / same-uid file read are useless without the passphrase) but **not the running machine** (after unlock the master is in memory); and it needs a human passphrase **per restart**, trading fully-unattended auto-restart for at-rest safety. Pairs with the resident agent (unlock once, hold in memory) or, for one-shot CLI on Linux, the **kernel keyring** (hold the unwrapped master between invocations; cleared on reboot).
+- **`file + passphrase` (P2 — the cloud/no-hardware sweet spot):** wrap the master key under a KEK derived from an operator passphrase (`scrypt` today, matching `key export`); store only `wrapped_master`, so **the plaintext master never touches disk**. Select it explicitly with `--store file-passphrase` (or `AVAULT_STORE=file-passphrase`). One-shot CLI commands read the store unlock passphrase from the **first stdin line**, then read the command's existing stdin payload from the remaining bytes. The resident agent uses `avault agent --store file-passphrase --unlock`, reads the passphrase once at startup, unlocks into `mlock`'d memory, and holds that master for the agent lifetime. Same "wrap the root under a factor-KEK" idea as the protected-tier VMK, applied to the standard master. *Honest limits:* it defends **at-rest** (stolen disk / leaked backup / same-uid file read are useless without the passphrase) but **not the running machine** (after unlock the master is in memory); and it needs a human passphrase **per restart**, trading fully-unattended auto-restart for at-rest safety.
 - **File store + memory lock — P1 baseline / floor:** works headless on Linux, macOS, and Windows. Unix uses a 0700 parent directory, 0600 key file, `mlock`, and no-coredump hardening. Windows uses a protected owner-only DACL on the key directory/key file plus best-effort `VirtualLock` and crash-dump hardening. Existing broad modes/ACLs are rejected rather than silently tightened. At-rest the key file is **plaintext** (protected only by the OS account + page-lock/no-coredump hardening), so it is the floor, not a strong at-rest guarantee.
 
 This is an internal store selection inside `avault`, not an Avibe-level plugin layer.
@@ -387,10 +405,10 @@ This is an internal store selection inside `avault`, not an Avibe-level plugin l
 |---|---|---|
 | **P0** | Python standard tier: DB + envelope + delivery + `$<NAME>` (#631) | superseded by P1 |
 | **P1 / P1.1** | `avault-core` + CLI + cross-platform file store; Rust takes standard-tier seal/open + `deliver run`/`fetch`/`inject`; `vibe runtime prepare` ensure + Dependencies card. Closes the memory-hygiene gap. | done |
-| **P2 — the final trust model, in one shot (no P3)** | Delivered as reviewable sub-phases that land independently but compose into the final design; nothing ships as a half-released transition state. | queued for reviewed re-submission |
-| · **Phase A** | HPKE blind-box `open` / `open_with_dek`, `pubkey`, `seal --blind-box`, secp256k1 digest signing (`ecdsa-secp256k1-recoverable` = ETH, `ecdsa-secp256k1-der` = BTC legacy/SegWit, `schnorr-secp256k1-bip340` = BTC Taproot), `SignerProvider` seam, pinned JSON contracts (Appendix C). | queued |
-| · **Phase B** | Resident agent: unix socket + `SO_PEERCRED` / `LOCAL_PEERCRED`, fresh in-memory receiver keypair, scope-typed grant DEK-cache (strict TTL + idle-zeroize), signing oracle; protected-tier `deliver` (browser-released DEK blind box). | queued |
-| · **Phase C** | `file + passphrase` master store (passphrase-wrapped master, unlock once at startup). | queued |
+| **P2 — the final trust model, in one shot (no P3)** | Delivered as one reviewed avault re-submission after the unreviewed Phase A/B merges were reverted; nothing ships as a half-released transition state. | in review |
+| · **Phase A** | HPKE blind-box `open` / `open_with_dek`, `pubkey`, `seal --blind-box`, secp256k1 digest signing (`ecdsa-secp256k1-recoverable` = ETH, `ecdsa-secp256k1-der` = BTC legacy/SegWit, `schnorr-secp256k1-bip340` = BTC Taproot), `SignerProvider` seam, pinned JSON contracts (Appendix C). | in review |
+| · **Phase B** | Resident agent: unix socket + `SO_PEERCRED` / `LOCAL_PEERCRED`, fresh in-memory receiver keypair, scope-typed grant DEK-cache (strict TTL + idle-zeroize), signing oracle; protected-tier `deliver` (browser-released DEK blind box). | in review |
+| · **Phase C** | `file + passphrase` master store (passphrase-wrapped master, unlock once at startup). | in review |
 | · **avibe + browser** | Same one-shot P2, separate tracks. Python: protected create/resolve, blind-box create relay, scope-typed grants, approval / secure-input cards, signing relay. Browser: HPKE seal, VMK/DEK with passkey-PRF + password, browser ETH/BTC signing. | in progress |
 | **Plugin seams** (not a phase) | Hardware stores (Keychain / Secure Enclave / TPM / KMS), external signers (hardware wallet / WalletConnect), MPC, and other curves (e.g. ed25519) — drop in behind the `KeyStore` / `SignerProvider` traits when the need or hardware is real. Adding one is a plugin, never a migration or a released transition. | as needed |
 
@@ -435,7 +453,7 @@ fresh in-memory receiver keypair that the browser pins/attests (§11.4).
 
 **Don't inherit (the ≈3.6k-LOC macOS shell):** the Keychain-only store, the SSH-agent user surface, FIDO2 enrollment, TOTP, the remote-sudo PAM path, the `VT_AUTH` shared-token channel, and the legacy `vt://mac` format.
 
-**Build fresh for us:** cross-platform store (file-store floor → keychain/SE/TPM/KMS), per-record standard/protected policy, `SO_PEERCRED` daemon authorization, scope-typed grants fed by UI/IM approval, the `name+scheme+version` AAD aligned to our columns, a secp256k1 signer, and the browser-sign path for protected ETH keys.
+**Build fresh for us:** cross-platform store (file-store floor → keychain/SE/TPM/KMS), per-record standard/protected policy, `SO_PEERCRED` daemon authorization, scope-typed grants fed by UI/IM approval, the `name+scheme+version` AAD aligned to our columns, a secp256k1 signer, and the `SignerProvider` seam for later external signers.
 
 Net: `vt` proves the model and donates the crypto shapes; `avault` is the clean, cross-platform, agent-shaped custody core those shapes belong in.
 
@@ -473,19 +491,167 @@ These are starting recommendations, not frozen choices — items #2 (envelope) a
 
 | Verb | Input | Output | Purpose |
 |---|---|---|---|
-| `pubkey` | — | X25519 public key + fingerprint | the browser fetches this before sealing a blind box (protected tier must pin / attest it) |
-| `seal` | blind box (the value) + name/scheme | envelope `{ciphertext, nonce, wrap_meta}` | standard-tier create: open box → wrap DEK under master → return ciphertext (never plaintext) |
-| `deliver` | envelope + mode (`run` / `fetch` / `inject`) + *optional* DEK blind box | exit code / response body | decrypt and deliver. No DEK ⇒ standard tier (master key); with DEK ⇒ protected tier (browser-released DEK) |
-| `sign` | key envelope + digest/tx + *optional* DEK blind box | signature (public) | standard-tier signing (secp256k1); the private key never leaves `avault` |
-| `key export` / `key import` | passphrase (stdin) | encrypted backup / ok | back up, migrate, restore the master key |
+| `pubkey` | — | X25519 public key + fingerprint | one-shot `pubkey` supports blind-box create; protected DEK release uses the resident agent's ephemeral `pubkey` frame |
+| `seal` | blind box (the value) + name/scheme | envelope `{ciphertext, nonce, wrap_meta}` | standard-tier create: open box → wrap DEK under master → return ciphertext (never plaintext). The CLI plaintext-stdin path remains for local `set` / fd passthrough. |
+| `deliver` | envelope + mode (`run` / `fetch` / `inject`) | exit code / response body / written file | one-shot standard-tier delivery uses the master key; protected delivery uses resident-agent grants, never inline DEK boxes |
+| `sign` | key envelope + name + 32-byte digest + scheme | signature (public) | one-shot standard-tier signing; protected signing uses resident-agent grants. The private key never leaves `avault` |
+| `key export` / `key import` | passphrase (stdin; if `--store file-passphrase`, first stdin line unlocks the store) | encrypted backup / ok | back up, migrate, restore the master key |
 
-The resident agent (P2) adds `grant` / `release`: cache a scope's DEK-set for a TTL so repeated uses in-window skip re-unlock. Standard-tier signing of an ETH key is `sign`; protected-tier ETH signing happens entirely in the browser and never reaches this interface.
+Phase A implements the core blind-box opener and secp256k1 signer plus one-shot CLI
+verbs. Phase B adds the resident agent transport plus `grant` / `release`: cache a
+scope's DEK-set for a TTL so repeated uses in-window skip re-unlock. Signing is
+chain-agnostic: callers provide the exact 32-byte digest/sighash and select the
+signature encoding.
+
+### Phase A blind-box and signing schemas
+
+Byte strings in this section are encoded as standard base64 unless explicitly
+marked hex. The HPKE blind-box ciphersuite is RFC 9180 Base mode with
+DHKEM-X25519-HKDF-SHA256, HKDF-SHA256, and AES-256-GCM. The JSON scheme identifier
+is `hpke-x25519-hkdfsha256-aes256gcm-v1`. HPKE `info` is the UTF-8 bytes
+`avault:blind-box:v1`.
+
+Every blind box is authenticated with operation-bound HPKE AAD; a box approved
+for one operation must not open for another name, scope, or signing digest. The
+AAD is:
+
+```text
+"avault:blind-box:aad:v1"
+  || field(purpose)
+  || field(name)
+  || field("machine-aesgcm-v1")
+  || field(0x01)
+  || field(scope_type or "")
+  || field(scope_ref or "")
+  || field(sign_scheme or "")
+  || field(digest or "")
+  || field(approval_nonce or "")
+  || field(approval_expires_at_unix_be or "")
+  || field(operation_hash or "")
+```
+
+`field(x)` is `uint32_be(len(x)) || x`. Strings are UTF-8 bytes; `digest` is the
+raw 32-byte signing digest, not hex text. `approval_expires_at_unix_be` is an
+8-byte unsigned big-endian Unix timestamp. `operation_hash` is the 32-byte
+SHA-256 digest of the approved operation fields encoded the same way:
+`SHA256(field(part0) || field(part1) || ...)`.
+
+Protected agent-grant DEK blind boxes require approval metadata:
+
+```json
+{ "nonce": "<base64 16..128 random bytes>", "expires_at_unix": 4102444800 }
+```
+
+The approval nonce/expiry are authenticated in the HPKE AAD. The resident agent
+rejects expired approvals and replayed grant nonces until their approval expiry.
+Protected DEK blind boxes are accepted only by the resident agent, whose receiver
+keypair is fresh in memory for that agent lifetime. The one-shot CLI rejects
+`dek_blindbox` / `approval` fields because its `pubkey` compatibility path is
+master-derived and therefore not ephemeral. Current `purpose` and
+`operation_hash` values:
+
+| Operation | `purpose` | Required AAD context | `operation_hash` fields |
+|---|---|---|---|
+| `seal --blind-box` | `seal` | `name` | empty |
+| agent delivery grant | `agent-deliver` | `scope_type`, `scope_ref`, `name`, approval, `ttl_secs` | `"agent-deliver"`, name, `ttl_secs_u64_be` |
+| agent signing grant | `agent-sign` | `scope_type`, `scope_ref`, `name`, `sign_scheme`, `digest`, approval, `ttl_secs` | `"agent-sign"`, scheme, raw 32-byte digest, `ttl_secs_u64_be` |
+
+These values and example AAD bytes are pinned in
+`tests/vectors/p2_core_crypto.json`.
+
+`pubkey` emits:
+
+```json
+{
+  "public_key": "<base64 raw 32-byte X25519 public key>",
+  "fingerprint": "<lowercase hex SHA-256 of the raw public key>"
+}
+```
+
+The resident agent uses a fresh in-memory X25519 receiver keypair for its process
+lifetime and never writes the private key to disk. The one-shot CLI cannot keep a
+random private key across separate `pubkey` and `seal` processes, so its
+compatibility path derives the receiver keypair from the local master key with
+HKDF and drops it after each operation. The derived private key is still never
+written or returned; the public key is stable for that master key and is only for
+the blind-box create path. Protected-tier DEK releases must use the resident
+agent's ephemeral `pubkey` frame.
+
+`seal --name NAME --blind-box` reads a blind box from stdin:
+
+```json
+{
+  "scheme": "hpke-x25519-hkdfsha256-aes256gcm-v1",
+  "enc": "<base64 HPKE encapsulated key>",
+  "ct": "<base64 HPKE ciphertext || tag>"
+}
+```
+
+It opens the blind box inside `avault`, then writes the normal persisted envelope:
+
+```json
+{
+  "ciphertext": "<base64 AES-GCM ciphertext || tag>",
+  "nonce": "<base64 12-byte value nonce>",
+  "wrap_meta": "{\"v\":1,\"scheme\":\"machine-aesgcm-v1\",\"wrapped_dek\":\"...\",\"dek_nonce\":\"...\"}"
+}
+```
+
+The legacy/local CLI path `seal --name NAME < value` remains available for direct
+file-descriptor passthrough from Avibe's local `set` path. In both paths, new
+envelopes authenticate value ciphertext with AAD
+`name || "machine-aesgcm-v1" || 0x01`.
+
+`sign` reads one JSON object from stdin:
+
+```json
+{
+  "name": "ETH_SIGNING_KEY",
+  "key_envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." },
+  "digest": "<lowercase or uppercase hex 32-byte digest>",
+  "scheme": "ecdsa-secp256k1-recoverable"
+}
+```
+
+`name` is required because it is the AAD name for `key_envelope`; omitting it would
+remove the envelope transplant protection. One-shot `sign` is standard-tier only:
+it unwraps the key envelope with the machine master key and rejects
+`dek_blindbox` / `approval` fields. Protected signing uses the resident agent's
+`grant` + `sign` frames; protected DEK opens require the normal
+`name || "machine-aesgcm-v1" || 0x01` envelope AAD and never take the P0
+empty-AAD read-compatibility fallback.
+
+Supported `scheme` values:
+
+| Scheme | Digest input | Signature output | `recovery_id` |
+|---|---|---|---|
+| `ecdsa-secp256k1-recoverable` | exactly 32 bytes, caller-computed | hex 64-byte `r || s`, low-S normalized | integer `0..3` |
+| `ecdsa-secp256k1-der` | exactly 32 bytes, caller-computed | hex DER-encoded ECDSA signature | `null` |
+| `schnorr-secp256k1-bip340` | exactly 32 bytes, caller-computed | hex 64-byte BIP340 Schnorr signature | `null` |
+
+Output:
+
+```json
+{
+  "signature": "<hex signature bytes>",
+  "recovery_id": 0
+}
+```
+
+Known-answer fixtures for HPKE open and all three signing schemes live in
+`tests/vectors/p2_core_crypto.json`; browser `@noble/curves` tests should assert
+the same vectors. Production Schnorr signing uses fresh auxiliary randomness;
+the fixture records `schnorr_aux_rand_hex` only to make the cross-implementation
+test deterministic.
 
 ### P1.1 CLI delivery schemas
 
 All P1.1 delivery inputs are JSON on stdin. The `envelope` object is the persisted
 `{ciphertext, nonce, wrap_meta}` shape. The `name` field is the secret name used for
-AAD. Values never appear in argv.
+AAD. Values never appear in argv. One-shot delivery is standard-tier only and
+rejects `dek_blindbox` / `approval` fields. Protected delivery uses the resident
+agent's `grant` + `deliver` frames; the protected DEK path is AAD-only, and the
+P0 empty-AAD fallback is only for old standard-tier master-key rows.
 
 `deliver run` accepts a JSON array and spawns exactly one child:
 
@@ -555,6 +721,7 @@ are intentionally left to the `allowed_hosts` policy boundary.
 `dotenv` and `json`; `yaml` and `toml` remain deferred. Files are written
 atomically through an owner-only temporary file, fsync, rename, and
 parent-directory fsync. Unix uses 0600; Windows uses a protected owner-only DACL.
+Protected inject uses the agent grant path and rejects inline one-shot DEK boxes.
 
 ### Transport
 
@@ -562,6 +729,216 @@ Two modes, the same integration touchpoints as `askill`. **Both channels carry o
 
 - **P1 — CLI subprocess (askill-shaped).** Avibe spawns the `avault` binary. Control args via argv/JSON; **bulk blobs (blind boxes, ciphertext) via stdin** (kept out of argv so they don't show in `ps`); results via **stdout JSON**. The `run` child inherits stdio. One-shot: use the key, zeroize, exit.
 - **P2 — resident agent (unix socket).** `avault agent` listens on `~/.avibe/run/avault.sock` (0600) and exchanges **length-prefixed JSON frames**. Authorization is **`SO_PEERCRED` (Linux) / `LOCAL_PEERCRED` (macOS)**: `avault` reads the connecting peer's uid/pid to confirm it is the same-user Avibe daemon — **no shared token**, so no decrypt-authorizing secret is re-introduced into Python. The agent is resident so it can hold the grant DEK-cache and act as the signing oracle (keys held across calls).
+
+Each agent frame is a 4-byte unsigned big-endian JSON byte length followed by
+that many UTF-8 JSON bytes. Frames are processed sequentially on a connection;
+there is no request-id multiplexing in Phase B. Every response is one frame:
+
+```json
+{ "ok": true, "result": { "...": "..." } }
+```
+
+or:
+
+```json
+{ "ok": false, "error": "what failed, never secret bytes" }
+```
+
+`pubkey` publishes the agent's fresh in-memory receiver keypair:
+
+```json
+{ "type": "pubkey" }
+```
+
+Response `result` is the same object as the CLI `pubkey` output:
+
+```json
+{
+  "public_key": "<base64 raw 32-byte X25519 public key>",
+  "fingerprint": "<lowercase hex SHA-256 of the raw public key>"
+}
+```
+
+This key is generated at agent start, never written to disk, and changes on
+restart. Protected-tier callers must re-pin / re-attest it per agent lifetime
+(§11.4).
+
+`grant` opens browser-sealed DEKs to the agent's current pubkey and caches them by
+scope until the fixed TTL expires. The TTL is strict and does not slide; idle
+timeout or process restart also clears the cache. DEKs are stored in the same
+dedicated locked 32-byte pages as master keys. Delivery DEKs are keyed by
+`{scope_type, scope_ref, name}`. Signing DEKs are keyed by
+`{scope_type, scope_ref, name, scheme, digest}` so one approved signing blind box
+cannot be replayed for a new digest.
+
+```json
+{
+  "type": "grant",
+  "scope_type": "session",
+  "scope_ref": "ses_123",
+  "ttl_secs": 300,
+  "deks": [
+    {
+      "name": "OPENAI_API_KEY",
+      "purpose": "deliver",
+      "dek_blindbox": {
+        "scheme": "hpke-x25519-hkdfsha256-aes256gcm-v1",
+        "enc": "...",
+        "ct": "..."
+      },
+      "approval": {
+        "nonce": "<base64 16..128 random bytes>",
+        "expires_at_unix": 4102444800
+      }
+    },
+    {
+      "name": "ETH_SIGNING_KEY",
+      "purpose": "sign",
+      "scheme": "ecdsa-secp256k1-recoverable",
+      "digest": "<hex 32-byte digest>",
+      "dek_blindbox": {
+        "scheme": "hpke-x25519-hkdfsha256-aes256gcm-v1",
+        "enc": "...",
+        "ct": "..."
+      },
+      "approval": {
+        "nonce": "<base64 16..128 random bytes>",
+        "expires_at_unix": 4102444800
+      }
+    }
+  ]
+}
+```
+
+Response:
+
+```json
+{ "ok": true, "result": { "granted": 2, "ttl_secs": 300 } }
+```
+
+`purpose` defaults to `deliver` for delivery grants. A delivery grant must not
+include `scheme` or `digest`; a signing grant must include both. `digest` is hex
+on the JSON wire, but the blind-box AAD authenticates the decoded 32-byte digest.
+`scope_type` and `scope_ref` must be non-empty. `ttl_secs` defaults to 300, must
+be positive, and is capped at 86400. The same normalized `ttl_secs` value is
+authenticated in each grant DEK blind box as an 8-byte unsigned big-endian field
+inside `operation_hash`, so a daemon cannot replay a shorter approved release
+into a longer agent grant. The effective grant expiry is the earlier of
+`ttl_secs` and the approval expiry; TTLs never slide.
+
+`release` and `revoke` are aliases. They drop and zeroize the grant if present:
+
+```json
+{ "type": "release", "scope_type": "session", "scope_ref": "ses_123" }
+```
+
+Response:
+
+```json
+{ "ok": true, "result": { "released": true } }
+```
+
+Agent `deliver` uses a cached DEK selected by `{scope_type, scope_ref, name}`. It
+never accepts a `dek_blindbox` on deliver frames; the DEK must already be covered
+by a grant.
+
+`deliver` run:
+
+```json
+{
+  "type": "deliver",
+  "scope_type": "session",
+  "scope_ref": "ses_123",
+  "mode": "run",
+  "command": ["/usr/bin/env", "python3", "sync.py"],
+  "secrets": [
+    {
+      "name": "OPENAI_API_KEY",
+      "env": "OPENAI_API_KEY",
+      "envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." }
+    }
+  ]
+}
+```
+
+Response:
+
+```json
+{ "ok": true, "result": { "exit_code": 0 } }
+```
+
+`deliver` fetch:
+
+```json
+{
+  "type": "deliver",
+  "scope_type": "session",
+  "scope_ref": "ses_123",
+  "mode": "fetch",
+  "name": "GITHUB_TOKEN",
+  "envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." },
+  "request": {
+    "method": "GET",
+    "url": "https://api.github.com/user",
+    "allowed_hosts": ["api.github.com"],
+    "inject": { "type": "bearer" }
+  }
+}
+```
+
+Response `result` is the normal fetch output:
+
+```json
+{ "status": 200, "headers": { "...": "..." }, "body": "..." }
+```
+
+`deliver` inject:
+
+```json
+{
+  "type": "deliver",
+  "scope_type": "session",
+  "scope_ref": "ses_123",
+  "mode": "inject",
+  "path": "/path/to/secrets.env",
+  "format": "dotenv",
+  "secrets": [
+    {
+      "name": "OPENAI_API_KEY",
+      "key": "OPENAI_API_KEY",
+      "envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." }
+    }
+  ]
+}
+```
+
+Response:
+
+```json
+{ "ok": true, "result": { "ok": true } }
+```
+
+Agent `sign` uses the cached signing DEK selected by
+`{scope_type, scope_ref, name, scheme, digest}` to open the signing-key envelope,
+signs the caller-provided digest, and wipes the private key immediately.
+
+```json
+{
+  "type": "sign",
+  "scope_type": "session",
+  "scope_ref": "ses_123",
+  "name": "ETH_SIGNING_KEY",
+  "key_envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." },
+  "digest": "<hex 32-byte digest>",
+  "scheme": "ecdsa-secp256k1-recoverable"
+}
+```
+
+Response `result` is the normal signature output:
+
+```json
+{ "signature": "<hex signature bytes>", "recovery_id": 0 }
+```
 
 ### Where avault's own keys live (esp. Linux without a Keychain)
 
