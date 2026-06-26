@@ -152,8 +152,12 @@ Unix and a protected owner-only DACL on Windows. `yaml` and `toml` remain deferr
 reads `{"scheme":"hpke-x25519-hkdfsha256-aes256gcm-v1","enc":"...","ct":"..."}`
 from stdin and returns the normal `{ciphertext, nonce, wrap_meta}` envelope.
 Blind boxes are authenticated with operation-bound HPKE AAD (`purpose`, `name`,
-scheme/version, optional scope, and signing digest), as pinned in
-`docs/DESIGN.md` and `tests/vectors/p2_core_crypto.json`.
+scheme/version, optional scope, approval nonce/expiry, and a hash of the approved
+operation such as command/fetch target/inject path/signing digest), as pinned in
+`docs/DESIGN.md` and `tests/vectors/p2_core_crypto.json`. Protected one-shot
+`dek_blindbox` inputs and resident-agent grant DEKs must include an `approval`
+object `{nonce, expires_at_unix}`; grant approval nonces are single-use until
+their approval expiry.
 The one-shot CLI derives the receiver keypair from the local master key so `pubkey`
 and `seal --blind-box` work across processes without persisting a new private key.
 The resident agent uses a fresh in-memory keypair for its process lifetime.
@@ -166,7 +170,8 @@ The resident agent uses a fresh in-memory keypair for its process lifetime.
   "key_envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." },
   "digest": "<hex 32-byte digest>",
   "scheme": "ecdsa-secp256k1-recoverable",
-  "dek_blindbox": null
+  "dek_blindbox": null,
+  "approval": null
 }
 ```
 

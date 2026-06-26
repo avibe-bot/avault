@@ -8,6 +8,7 @@ use hpke::{
     OpModeS, Serializable,
 };
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -65,46 +66,116 @@ fn p0_no_aad_envelope() -> serde_json::Value {
     })
 }
 
-fn blind_box_aad(
-    purpose: &str,
-    name: &str,
-    scope_type: &str,
-    scope_ref: &str,
-    scheme: &str,
-    digest: &[u8],
-) -> Vec<u8> {
+struct TestBlindBoxAad<'a> {
+    purpose: &'a str,
+    name: &'a str,
+    scope_type: &'a str,
+    scope_ref: &'a str,
+    scheme: &'a str,
+    digest: &'a [u8],
+    approval_nonce: &'a [u8],
+    approval_expires_at_unix: Option<u64>,
+    operation_hash: &'a [u8],
+}
+
+fn blind_box_aad(context: TestBlindBoxAad<'_>) -> Vec<u8> {
     fn push_field(out: &mut Vec<u8>, value: &[u8]) {
         out.extend_from_slice(&(value.len() as u32).to_be_bytes());
         out.extend_from_slice(value);
     }
     let mut out = Vec::new();
     out.extend_from_slice(b"avault:blind-box:aad:v1");
-    push_field(&mut out, purpose.as_bytes());
-    push_field(&mut out, name.as_bytes());
+    push_field(&mut out, context.purpose.as_bytes());
+    push_field(&mut out, context.name.as_bytes());
     push_field(&mut out, b"machine-aesgcm-v1");
     push_field(&mut out, &[1]);
-    push_field(&mut out, scope_type.as_bytes());
-    push_field(&mut out, scope_ref.as_bytes());
-    push_field(&mut out, scheme.as_bytes());
-    push_field(&mut out, digest);
+    push_field(&mut out, context.scope_type.as_bytes());
+    push_field(&mut out, context.scope_ref.as_bytes());
+    push_field(&mut out, context.scheme.as_bytes());
+    push_field(&mut out, context.digest);
+    push_field(&mut out, context.approval_nonce);
+    match context.approval_expires_at_unix {
+        Some(expires_at) => push_field(&mut out, &expires_at.to_be_bytes()),
+        None => push_field(&mut out, &[]),
+    }
+    push_field(&mut out, context.operation_hash);
     out
 }
 
 fn aad_seal(name: &str) -> Vec<u8> {
-    blind_box_aad("seal", name, "", "", "", &[])
+    blind_box_aad(TestBlindBoxAad {
+        purpose: "seal",
+        name,
+        scope_type: "",
+        scope_ref: "",
+        scheme: "",
+        digest: &[],
+        approval_nonce: &[],
+        approval_expires_at_unix: None,
+        operation_hash: &[],
+    })
 }
 
-fn aad_deliver(name: &str) -> Vec<u8> {
-    blind_box_aad("deliver", name, "", "", "", &[])
+fn aad_deliver(
+    name: &str,
+    approval_nonce: &[u8],
+    expires_at: u64,
+    operation_hash: &[u8],
+) -> Vec<u8> {
+    blind_box_aad(TestBlindBoxAad {
+        purpose: "deliver",
+        name,
+        scope_type: "",
+        scope_ref: "",
+        scheme: "",
+        digest: &[],
+        approval_nonce,
+        approval_expires_at_unix: Some(expires_at),
+        operation_hash,
+    })
 }
 
-fn aad_agent_deliver(scope_type: &str, scope_ref: &str, name: &str) -> Vec<u8> {
-    blind_box_aad("agent-deliver", name, scope_type, scope_ref, "", &[])
+fn aad_agent_deliver(
+    scope_type: &str,
+    scope_ref: &str,
+    name: &str,
+    approval_nonce: &[u8],
+    expires_at: u64,
+) -> Vec<u8> {
+    let operation_hash = operation_hash(&[b"agent-deliver", name.as_bytes()]);
+    blind_box_aad(TestBlindBoxAad {
+        purpose: "agent-deliver",
+        name,
+        scope_type,
+        scope_ref,
+        scheme: "",
+        digest: &[],
+        approval_nonce,
+        approval_expires_at_unix: Some(expires_at),
+        operation_hash: &operation_hash,
+    })
 }
 
-fn aad_sign(name: &str, scheme: &str, digest_hex: &str) -> Vec<u8> {
+fn aad_sign(
+    name: &str,
+    scheme: &str,
+    digest_hex: &str,
+    approval_nonce: &[u8],
+    expires_at: u64,
+) -> Vec<u8> {
     let digest = hex::decode(digest_hex).unwrap();
-    blind_box_aad("sign", name, "", "", scheme, &digest)
+    let operation_hash = operation_hash(&[b"sign", scheme.as_bytes(), digest.as_slice()]);
+    blind_box_aad(TestBlindBoxAad {
+        purpose: "sign",
+        name,
+        scope_type: "",
+        scope_ref: "",
+        scheme,
+        digest: &digest,
+        approval_nonce,
+        approval_expires_at_unix: Some(expires_at),
+        operation_hash: &operation_hash,
+    })
 }
 
 fn aad_agent_sign(
@@ -113,9 +184,106 @@ fn aad_agent_sign(
     name: &str,
     scheme: &str,
     digest_hex: &str,
+    approval_nonce: &[u8],
+    expires_at: u64,
 ) -> Vec<u8> {
     let digest = hex::decode(digest_hex).unwrap();
-    blind_box_aad("agent-sign", name, scope_type, scope_ref, scheme, &digest)
+    let operation_hash = operation_hash(&[b"agent-sign", scheme.as_bytes(), digest.as_slice()]);
+    blind_box_aad(TestBlindBoxAad {
+        purpose: "agent-sign",
+        name,
+        scope_type,
+        scope_ref,
+        scheme,
+        digest: &digest,
+        approval_nonce,
+        approval_expires_at_unix: Some(expires_at),
+        operation_hash: &operation_hash,
+    })
+}
+
+fn operation_hash(fields: &[&[u8]]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    for field in fields {
+        hasher.update((field.len() as u32).to_be_bytes());
+        hasher.update(field);
+    }
+    hasher.finalize().into()
+}
+
+fn approval_json(nonce: &[u8], expires_at: u64) -> serde_json::Value {
+    json!({
+        "nonce": base64::engine::general_purpose::STANDARD.encode(nonce),
+        "expires_at_unix": expires_at
+    })
+}
+
+fn future_expiry() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600
+}
+
+fn run_operation_hash(env: &str, command: &[&str]) -> [u8; 32] {
+    let mut fields = Vec::with_capacity(2 + command.len());
+    fields.push(b"deliver-run".as_slice());
+    fields.push(env.as_bytes());
+    fields.extend(command.iter().map(|arg| arg.as_bytes()));
+    operation_hash(&fields)
+}
+
+fn fetch_operation_hash(request: &serde_json::Value) -> [u8; 32] {
+    let method = request["method"].as_str().unwrap_or("");
+    let url = request["url"].as_str().unwrap_or("");
+    let empty = Vec::new();
+    let hosts = request["allowed_hosts"]
+        .as_array()
+        .unwrap_or(&empty)
+        .iter()
+        .map(|host| host.as_str().unwrap().to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let hosts = hosts.join("\0");
+    let headers = request["headers"]
+        .as_object()
+        .map(|headers| {
+            headers
+                .iter()
+                .map(|(name, value)| format!("{name}\0{}", value.as_str().unwrap()))
+                .collect::<Vec<_>>()
+                .join("\0")
+        })
+        .unwrap_or_default();
+    let body = request["body"].as_str().unwrap_or("");
+    let inject = match request.get("inject").and_then(|value| value.as_object()) {
+        Some(inject) if inject.get("type").and_then(|v| v.as_str()) == Some("header") => {
+            format!("header:{}", inject["name"].as_str().unwrap())
+        }
+        Some(inject) if inject.get("type").and_then(|v| v.as_str()) == Some("query") => {
+            format!("query:{}", inject["name"].as_str().unwrap())
+        }
+        _ => "bearer".to_string(),
+    };
+    operation_hash(&[
+        b"deliver-fetch",
+        method.as_bytes(),
+        url.as_bytes(),
+        hosts.as_bytes(),
+        headers.as_bytes(),
+        body.as_bytes(),
+        inject.as_bytes(),
+    ])
+}
+
+fn inject_operation_hash(target_name: &str, format: &str, path: &std::path::Path) -> [u8; 32] {
+    operation_hash(&[
+        b"deliver-inject",
+        target_name.as_bytes(),
+        format.as_bytes(),
+        path.to_str().unwrap().as_bytes(),
+    ])
 }
 
 fn fixed_blind_box(public_key: &str, plaintext: &[u8], aad: &[u8]) -> serde_json::Value {
@@ -572,6 +740,8 @@ fn protected_sign_uses_dek_blindbox() {
     let signing = &vector["signing"];
     let private_key = hex::decode(signing["private_key_hex"].as_str().unwrap()).unwrap();
     let dek = [0x99u8; 32];
+    let approval_nonce = b"protected-sign-1";
+    let approval_expires_at = future_expiry();
     let key_envelope = envelope_encrypted_with_dek("PROTECTED_KEY", &dek, &private_key);
 
     let output = avault()
@@ -589,6 +759,8 @@ fn protected_sign_uses_dek_blindbox() {
             "PROTECTED_KEY",
             "ecdsa-secp256k1-der",
             signing["digest_hex"].as_str().unwrap(),
+            approval_nonce,
+            approval_expires_at,
         ),
     );
     let expected = signing["schemes"]
@@ -602,7 +774,8 @@ fn protected_sign_uses_dek_blindbox() {
         "key_envelope": key_envelope,
         "digest": signing["digest_hex"],
         "scheme": "ecdsa-secp256k1-der",
-        "dek_blindbox": dek_blindbox
+        "dek_blindbox": dek_blindbox,
+        "approval": approval_json(approval_nonce, approval_expires_at)
     });
     let mut sign = avault()
         .arg("sign")
@@ -628,6 +801,13 @@ fn protected_deliver_run_uses_dek_blindbox() {
     let home = tempfile::tempdir().unwrap();
     write_p0_master(&home.path().join("vault"));
     let dek = [0x7bu8; 32];
+    let approval_nonce = b"protected-run-01";
+    let approval_expires_at = future_expiry();
+    let command = [
+        "/bin/sh",
+        "-c",
+        r#"test "$SECRET_VALUE" = "protected-run" && printf ok"#,
+    ];
     let envelope = envelope_encrypted_with_dek("PROTECTED_VALUE", &dek, b"protected-run");
     let pubkey_output = avault()
         .arg("pubkey")
@@ -640,14 +820,20 @@ fn protected_deliver_run_uses_dek_blindbox() {
     let dek_blindbox = fixed_blind_box(
         pubkey["public_key"].as_str().unwrap(),
         &dek,
-        &aad_deliver("PROTECTED_VALUE"),
+        &aad_deliver(
+            "PROTECTED_VALUE",
+            approval_nonce,
+            approval_expires_at,
+            &run_operation_hash("SECRET_VALUE", &command),
+        ),
     );
     let request = json!([
         {
             "name": "PROTECTED_VALUE",
             "env": "SECRET_VALUE",
             "envelope": envelope,
-            "dek_blindbox": dek_blindbox
+            "dek_blindbox": dek_blindbox,
+            "approval": approval_json(approval_nonce, approval_expires_at)
         }
     ]);
 
@@ -655,9 +841,7 @@ fn protected_deliver_run_uses_dek_blindbox() {
         .arg("deliver")
         .arg("run")
         .arg("--")
-        .arg("/bin/sh")
-        .arg("-c")
-        .arg(r#"test "$SECRET_VALUE" = "protected-run" && printf ok"#)
+        .args(command)
         .env("AVAULT_HOME", home.path().join("vault"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -675,6 +859,65 @@ fn protected_deliver_run_uses_dek_blindbox() {
 }
 
 #[test]
+fn protected_deliver_rejects_replayed_blindbox_for_different_command() {
+    let home = tempfile::tempdir().unwrap();
+    write_p0_master(&home.path().join("vault"));
+    let dek = [0x7cu8; 32];
+    let envelope = envelope_encrypted_with_dek("PROTECTED_VALUE", &dek, b"protected-run");
+    let pubkey_output = avault()
+        .arg("pubkey")
+        .env("AVAULT_HOME", home.path().join("vault"))
+        .stdout(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(pubkey_output.status.success());
+    let pubkey: serde_json::Value = serde_json::from_slice(&pubkey_output.stdout).unwrap();
+    let approval_nonce = b"replayed-run-001";
+    let approval_expires_at = future_expiry();
+    let approved_command = ["/bin/sh", "-c", "printf approved"];
+    let replayed_command = ["/bin/sh", "-c", "printf replayed"];
+    let dek_blindbox = fixed_blind_box(
+        pubkey["public_key"].as_str().unwrap(),
+        &dek,
+        &aad_deliver(
+            "PROTECTED_VALUE",
+            approval_nonce,
+            approval_expires_at,
+            &run_operation_hash("SECRET_VALUE", &approved_command),
+        ),
+    );
+    let request = json!([
+        {
+            "name": "PROTECTED_VALUE",
+            "env": "SECRET_VALUE",
+            "envelope": envelope,
+            "dek_blindbox": dek_blindbox,
+            "approval": approval_json(approval_nonce, approval_expires_at)
+        }
+    ]);
+
+    let mut deliver = avault()
+        .arg("deliver")
+        .arg("run")
+        .arg("--")
+        .args(replayed_command)
+        .env("AVAULT_HOME", home.path().join("vault"))
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    deliver
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let output = deliver.wait_with_output().unwrap();
+    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(70));
+}
+
+#[test]
 fn agent_grant_deliver_inject_release_roundtrip() {
     let tmp = tempfile::tempdir().unwrap();
     let socket = tmp.path().join("run").join("avault.sock");
@@ -686,6 +929,8 @@ fn agent_grant_deliver_inject_release_roundtrip() {
     assert_eq!(pubkey["ok"], true);
     let public_key = pubkey["result"]["public_key"].as_str().unwrap();
     let dek = [0x51u8; 32];
+    let approval_nonce = b"agent-deliver-01";
+    let approval_expires_at = future_expiry();
     let grant = agent_request(
         &mut stream,
         json!({
@@ -699,8 +944,9 @@ fn agent_grant_deliver_inject_release_roundtrip() {
                     "dek_blindbox": fixed_blind_box(
                         public_key,
                         &dek,
-                        &aad_agent_deliver("session", "agent-test", "API_TOKEN")
-                    )
+                        &aad_agent_deliver("session", "agent-test", "API_TOKEN", approval_nonce, approval_expires_at)
+                    ),
+                    "approval": approval_json(approval_nonce, approval_expires_at)
                 }
             ]
         }),
@@ -736,6 +982,38 @@ fn agent_grant_deliver_inject_release_roundtrip() {
     assert_eq!(released["ok"], true);
     assert_eq!(released["result"]["released"], true);
 
+    let replayed_grant = agent_request(
+        &mut stream,
+        json!({
+            "type": "grant",
+            "scope_type": "session",
+            "scope_ref": "agent-test",
+            "ttl_secs": 60,
+            "deks": [
+                {
+                    "name": "API_TOKEN",
+                    "dek_blindbox": fixed_blind_box(
+                        public_key,
+                        &dek,
+                        &aad_agent_deliver(
+                            "session",
+                            "agent-test",
+                            "API_TOKEN",
+                            approval_nonce,
+                            approval_expires_at
+                        )
+                    ),
+                    "approval": approval_json(approval_nonce, approval_expires_at)
+                }
+            ]
+        }),
+    );
+    assert_eq!(replayed_grant["ok"], false);
+    assert!(replayed_grant["error"]
+        .as_str()
+        .unwrap()
+        .contains("approval"));
+
     let denied = agent_request(
         &mut stream,
         json!({
@@ -752,6 +1030,110 @@ fn agent_grant_deliver_inject_release_roundtrip() {
     );
     assert_eq!(denied["ok"], false);
     assert!(denied["error"].as_str().unwrap().contains("grant"));
+
+    let _ = agent.kill();
+    let _ = agent.wait();
+}
+
+#[test]
+fn agent_rejects_empty_scope_and_excessive_ttl() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("run").join("avault.sock");
+    let mut agent = spawn_agent(&socket, 60);
+    let mut stream = connect_agent(&socket);
+    let pubkey = agent_request(&mut stream, json!({"type": "pubkey"}));
+    let public_key = pubkey["result"]["public_key"].as_str().unwrap();
+    let dek = [0x55u8; 32];
+    let approval_nonce = b"agent-bad-scope";
+    let approval_expires_at = future_expiry();
+    let dek_input = json!({
+        "name": "API_TOKEN",
+        "dek_blindbox": fixed_blind_box(
+            public_key,
+            &dek,
+            &aad_agent_deliver("session", "bad-test", "API_TOKEN", approval_nonce, approval_expires_at)
+        ),
+        "approval": approval_json(approval_nonce, approval_expires_at)
+    });
+
+    let empty_scope = agent_request(
+        &mut stream,
+        json!({
+            "type": "grant",
+            "scope_type": "",
+            "scope_ref": "bad-test",
+            "ttl_secs": 60,
+            "deks": [dek_input.clone()]
+        }),
+    );
+    assert_eq!(empty_scope["ok"], false);
+    assert!(empty_scope["error"]
+        .as_str()
+        .unwrap()
+        .contains("scope_type"));
+
+    let excessive_ttl = agent_request(
+        &mut stream,
+        json!({
+            "type": "grant",
+            "scope_type": "session",
+            "scope_ref": "bad-test",
+            "ttl_secs": u64::MAX,
+            "deks": [dek_input]
+        }),
+    );
+    assert_eq!(excessive_ttl["ok"], false);
+    assert!(excessive_ttl["error"].as_str().unwrap().contains("ttl"));
+
+    let _ = agent.kill();
+    let _ = agent.wait();
+}
+
+#[test]
+fn second_agent_refuses_live_socket() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("run").join("avault.sock");
+    let mut agent = spawn_agent(&socket, 60);
+    let _stream = connect_agent(&socket);
+
+    let output = avault()
+        .arg("agent")
+        .arg("--socket")
+        .arg(&socket)
+        .env("AVAULT_HOME", tmp.path().join("vault-second"))
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("already in use"));
+
+    let _ = agent.kill();
+    let _ = agent.wait();
+}
+
+#[test]
+fn agent_closes_idle_partial_frame_and_accepts_next_client() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("run").join("avault.sock");
+    let mut agent = spawn_agent(&socket, 60);
+    let mut partial = connect_agent(&socket);
+    partial.write_all(&10u32.to_be_bytes()).unwrap();
+    drop(partial);
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let mut stream = connect_agent(&socket);
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            agent_request(&mut stream, json!({"type": "pubkey"}))
+        })) {
+            Ok(response) => {
+                assert_eq!(response["ok"], true);
+                break;
+            }
+            Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(200)),
+            Err(_) => panic!("agent did not accept a new client after partial frame timeout"),
+        }
+    }
 
     let _ = agent.kill();
     let _ = agent.wait();
@@ -785,6 +1167,8 @@ fn agent_expires_grants_by_ttl() {
     let pubkey = agent_request(&mut stream, json!({"type": "pubkey"}));
     let public_key = pubkey["result"]["public_key"].as_str().unwrap();
     let dek = [0x52u8; 32];
+    let approval_nonce = b"agent-ttl-test01";
+    let approval_expires_at = future_expiry();
     let grant = agent_request(
         &mut stream,
         json!({
@@ -798,8 +1182,9 @@ fn agent_expires_grants_by_ttl() {
                     "dek_blindbox": fixed_blind_box(
                         public_key,
                         &dek,
-                        &aad_agent_deliver("session", "ttl-test", "API_TOKEN")
-                    )
+                        &aad_agent_deliver("session", "ttl-test", "API_TOKEN", approval_nonce, approval_expires_at)
+                    ),
+                    "approval": approval_json(approval_nonce, approval_expires_at)
                 }
             ]
         }),
@@ -841,6 +1226,8 @@ fn agent_signs_with_cached_dek_grant() {
     let signing = &vector["signing"];
     let private_key = hex::decode(signing["private_key_hex"].as_str().unwrap()).unwrap();
     let dek = [0x53u8; 32];
+    let approval_nonce = b"agent-sign-test1";
+    let approval_expires_at = future_expiry();
     let grant = agent_request(
         &mut stream,
         json!({
@@ -862,9 +1249,12 @@ fn agent_signs_with_cached_dek_grant() {
                             "sign-test",
                             "AGENT_SIGNING_KEY",
                             "ecdsa-secp256k1-der",
-                            signing["digest_hex"].as_str().unwrap()
+                            signing["digest_hex"].as_str().unwrap(),
+                            approval_nonce,
+                            approval_expires_at
                         )
-                    )
+                    ),
+                    "approval": approval_json(approval_nonce, approval_expires_at)
                 }
             ]
         }),
@@ -922,6 +1312,8 @@ fn agent_idle_timeout_clears_grants() {
     let pubkey = agent_request(&mut stream, json!({"type": "pubkey"}));
     let public_key = pubkey["result"]["public_key"].as_str().unwrap();
     let dek = [0x54u8; 32];
+    let approval_nonce = b"agent-idle-test1";
+    let approval_expires_at = future_expiry();
     let grant = agent_request(
         &mut stream,
         json!({
@@ -935,8 +1327,9 @@ fn agent_idle_timeout_clears_grants() {
                     "dek_blindbox": fixed_blind_box(
                         public_key,
                         &dek,
-                        &aad_agent_deliver("session", "idle-test", "API_TOKEN")
-                    )
+                        &aad_agent_deliver("session", "idle-test", "API_TOKEN", approval_nonce, approval_expires_at)
+                    ),
+                    "approval": approval_json(approval_nonce, approval_expires_at)
                 }
             ]
         }),
@@ -1370,6 +1763,202 @@ fn deliver_fetch_redacts_verbatim_echoed_credential() {
     assert_eq!(
         response["body"],
         "prefix [avault-redacted] suffix [avault-redacted]"
+    );
+}
+
+#[test]
+fn deliver_fetch_redacts_verbatim_echoed_credential_header() {
+    let home = tempfile::tempdir().unwrap();
+    let sealed = seal_secret(
+        home.path().join("vault").as_path(),
+        "API_TOKEN",
+        b"token-header\n",
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = stream.read(&mut buf).unwrap();
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nX-Echo: token-header\r\nContent-Length: 2\r\n\r\nok")
+            .unwrap();
+    });
+    let request = json!({
+        "name": "API_TOKEN",
+        "envelope": sealed,
+        "request": {
+            "method": "GET",
+            "url": format!("http://127.0.0.1:{}/resource", addr.port()),
+            "allowed_hosts": ["127.0.0.1"],
+            "inject": {"type": "bearer"}
+        }
+    });
+
+    let mut fetch = avault()
+        .arg("deliver")
+        .arg("fetch")
+        .env("AVAULT_HOME", home.path().join("vault"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    fetch
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let output = fetch.wait_with_output().unwrap();
+    server.join().unwrap();
+    assert!(output.status.success());
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(response["headers"]
+        .as_object()
+        .unwrap()
+        .values()
+        .any(|value| value == "[avault-redacted]"));
+    assert_eq!(response["body"], "ok");
+}
+
+#[test]
+fn protected_deliver_fetch_redacts_echoed_credential_header() {
+    let home = tempfile::tempdir().unwrap();
+    write_p0_master(&home.path().join("vault"));
+    let dek = [0x7du8; 32];
+    let envelope = envelope_encrypted_with_dek("API_TOKEN", &dek, b"protected-token\n");
+    let pubkey_output = avault()
+        .arg("pubkey")
+        .env("AVAULT_HOME", home.path().join("vault"))
+        .stdout(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(pubkey_output.status.success());
+    let pubkey: serde_json::Value = serde_json::from_slice(&pubkey_output.stdout).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let request_spec = json!({
+        "method": "GET",
+        "url": format!("http://127.0.0.1:{}/resource", addr.port()),
+        "allowed_hosts": ["127.0.0.1"],
+        "inject": {"type": "bearer"}
+    });
+    let approval_nonce = b"fetch-header-red";
+    let approval_expires_at = future_expiry();
+    let dek_blindbox = fixed_blind_box(
+        pubkey["public_key"].as_str().unwrap(),
+        &dek,
+        &aad_deliver(
+            "API_TOKEN",
+            approval_nonce,
+            approval_expires_at,
+            &fetch_operation_hash(&request_spec),
+        ),
+    );
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).unwrap();
+        let request = String::from_utf8_lossy(&buf[..n]);
+        assert!(request.contains("Authorization: Bearer protected-token"));
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nX-Echo: protected-token\r\nContent-Length: 2\r\n\r\nok")
+            .unwrap();
+    });
+    let request = json!({
+        "name": "API_TOKEN",
+        "envelope": envelope,
+        "dek_blindbox": dek_blindbox,
+        "approval": approval_json(approval_nonce, approval_expires_at),
+        "request": request_spec
+    });
+
+    let mut fetch = avault()
+        .arg("deliver")
+        .arg("fetch")
+        .env("AVAULT_HOME", home.path().join("vault"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    fetch
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let output = fetch.wait_with_output().unwrap();
+    server.join().unwrap();
+    assert!(output.status.success());
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(response["headers"]
+        .as_object()
+        .unwrap()
+        .values()
+        .any(|value| value == "[avault-redacted]"));
+    assert_eq!(response["body"], "ok");
+}
+
+#[test]
+fn protected_deliver_inject_uses_operation_bound_dek_blindbox() {
+    let home = tempfile::tempdir().unwrap();
+    write_p0_master(&home.path().join("vault"));
+    let output_path = home.path().join("protected.env");
+    let dek = [0x7eu8; 32];
+    let envelope = envelope_encrypted_with_dek("API_TOKEN", &dek, b"protected-inject");
+    let pubkey_output = avault()
+        .arg("pubkey")
+        .env("AVAULT_HOME", home.path().join("vault"))
+        .stdout(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(pubkey_output.status.success());
+    let pubkey: serde_json::Value = serde_json::from_slice(&pubkey_output.stdout).unwrap();
+    let approval_nonce = b"inject-protected";
+    let approval_expires_at = future_expiry();
+    let dek_blindbox = fixed_blind_box(
+        pubkey["public_key"].as_str().unwrap(),
+        &dek,
+        &aad_deliver(
+            "API_TOKEN",
+            approval_nonce,
+            approval_expires_at,
+            &inject_operation_hash("API_TOKEN", "dotenv", &output_path),
+        ),
+    );
+    let request = json!({
+        "path": output_path,
+        "format": "dotenv",
+        "secrets": [
+            {
+                "name": "API_TOKEN",
+                "key": "API_TOKEN",
+                "envelope": envelope,
+                "dek_blindbox": dek_blindbox,
+                "approval": approval_json(approval_nonce, approval_expires_at)
+            }
+        ]
+    });
+
+    let mut inject = avault()
+        .arg("deliver")
+        .arg("inject")
+        .env("AVAULT_HOME", home.path().join("vault"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    inject
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let output = inject.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(
+        fs::read_to_string(&output_path).unwrap(),
+        "API_TOKEN='protected-inject'\n"
     );
 }
 

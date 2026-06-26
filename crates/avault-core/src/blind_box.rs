@@ -55,6 +55,9 @@ pub struct BlindBoxContext {
     scope_ref: Option<String>,
     sign_scheme: Option<String>,
     digest: Option<[u8; KEY_BYTES]>,
+    approval_nonce: Option<Vec<u8>>,
+    approval_expires_at_unix: Option<u64>,
+    operation_hash: Option<[u8; KEY_BYTES]>,
 }
 
 impl BlindBoxContext {
@@ -99,6 +102,9 @@ impl BlindBoxContext {
             scope_ref: None,
             sign_scheme: None,
             digest: None,
+            approval_nonce: None,
+            approval_expires_at_unix: None,
+            operation_hash: None,
         }
     }
 
@@ -114,12 +120,38 @@ impl BlindBoxContext {
         self
     }
 
+    /// Add a per-approval nonce and expiry to prevent replay of old browser releases.
+    pub fn with_approval(mut self, nonce: &[u8], expires_at_unix: u64) -> Self {
+        self.approval_nonce = Some(nonce.to_vec());
+        self.approval_expires_at_unix = Some(expires_at_unix);
+        self
+    }
+
+    /// Add a SHA-256 commitment to the approved operation details.
+    pub fn with_operation_hash(mut self, operation_hash: [u8; KEY_BYTES]) -> Self {
+        self.operation_hash = Some(operation_hash);
+        self
+    }
+
+    /// Build a stable SHA-256 commitment from length-prefixed operation fields.
+    pub fn operation_hash(fields: &[&[u8]]) -> [u8; KEY_BYTES] {
+        let mut hasher = Sha256::new();
+        for field in fields {
+            let len = u32::try_from(field.len()).expect("operation hash field length fits u32");
+            hasher.update(len.to_be_bytes());
+            hasher.update(field);
+        }
+        hasher.finalize().into()
+    }
+
     /// Return the exact HPKE AAD bytes for this context.
     ///
     /// Encoding:
     /// `BLIND_BOX_AAD_DOMAIN || field(purpose) || field(name) ||
     /// field(WRAP_SCHEME) || field([WRAP_META_VERSION]) || field(scope_type or "")
-    /// || field(scope_ref or "") || field(sign_scheme or "") || field(digest or "")`,
+    /// || field(scope_ref or "") || field(sign_scheme or "") || field(digest or "")
+    /// || field(approval_nonce or "") || field(approval_expires_at_unix_be or "")
+    /// || field(operation_hash or "")`,
     /// where `field(x) = uint32_be(len(x)) || x`.
     pub fn aad_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
@@ -140,6 +172,22 @@ impl BlindBoxContext {
         push_aad_field(
             &mut out,
             self.digest.as_ref().map(|d| d.as_slice()).unwrap_or(&[]),
+        );
+        push_aad_field(&mut out, self.approval_nonce.as_deref().unwrap_or(&[]));
+        push_aad_field(
+            &mut out,
+            self.approval_expires_at_unix
+                .map(|v| v.to_be_bytes())
+                .as_ref()
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]),
+        );
+        push_aad_field(
+            &mut out,
+            self.operation_hash
+                .as_ref()
+                .map(|d| d.as_slice())
+                .unwrap_or(&[]),
         );
         out
     }
@@ -367,7 +415,7 @@ mod tests {
             let scope_ref = case["scope_ref"].as_str().unwrap();
             let sign_scheme = case["sign_scheme"].as_str().unwrap();
             let digest_hex = case["digest_hex"].as_str().unwrap();
-            let context = match purpose {
+            let mut context = match purpose {
                 "seal" => BlindBoxContext::seal(name),
                 "deliver" => BlindBoxContext::deliver(name),
                 "sign" => {
@@ -383,6 +431,22 @@ mod tests {
                 }
                 _ => panic!("unexpected blind-box AAD vector purpose"),
             };
+            if let Some(nonce_hex) = case["approval_nonce_hex"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+            {
+                let nonce = hex::decode(nonce_hex).unwrap();
+                let expires_at = case["approval_expires_at_unix"].as_u64().unwrap();
+                context = context.with_approval(&nonce, expires_at);
+            }
+            if let Some(operation_hash_hex) = case["operation_hash_hex"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+            {
+                let operation_hash: [u8; KEY_BYTES] =
+                    hex::decode(operation_hash_hex).unwrap().try_into().unwrap();
+                context = context.with_operation_hash(operation_hash);
+            }
             assert_eq!(hex::encode(context.aad_bytes()), case["aad_hex"]);
         }
     }

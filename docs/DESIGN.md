@@ -525,18 +525,42 @@ AAD is:
   || field(scope_ref or "")
   || field(sign_scheme or "")
   || field(digest or "")
+  || field(approval_nonce or "")
+  || field(approval_expires_at_unix_be or "")
+  || field(operation_hash or "")
 ```
 
 `field(x)` is `uint32_be(len(x)) || x`. Strings are UTF-8 bytes; `digest` is the
-raw 32-byte signing digest, not hex text. Current `purpose` values:
+raw 32-byte signing digest, not hex text. `approval_expires_at_unix_be` is an
+8-byte unsigned big-endian Unix timestamp. `operation_hash` is the 32-byte
+SHA-256 digest of the approved operation fields encoded the same way:
+`SHA256(field(part0) || field(part1) || ...)`.
 
-| Operation | `purpose` | Required context fields |
-|---|---|---|
-| `seal --blind-box` | `seal` | `name` |
-| one-shot protected `deliver` | `deliver` | `name` |
-| one-shot protected `sign` | `sign` | `name`, `sign_scheme`, `digest` |
-| agent delivery grant | `agent-deliver` | `scope_type`, `scope_ref`, `name` |
-| agent signing grant | `agent-sign` | `scope_type`, `scope_ref`, `name`, `sign_scheme`, `digest` |
+Protected one-shot and agent-grant DEK blind boxes require approval metadata:
+
+```json
+{ "nonce": "<base64 16..128 random bytes>", "expires_at_unix": 4102444800 }
+```
+
+The approval nonce/expiry are authenticated in the HPKE AAD. `avault` rejects
+expired approvals; the resident agent also rejects replayed grant nonces until
+their approval expiry. Current `purpose` and `operation_hash` values:
+
+| Operation | `purpose` | Required AAD context | `operation_hash` fields |
+|---|---|---|---|
+| `seal --blind-box` | `seal` | `name` | empty |
+| one-shot protected `deliver run` | `deliver` | `name`, approval | `"deliver-run"`, env var name, each UTF-8 command argv field |
+| one-shot protected `deliver fetch` | `deliver` | `name`, approval | `"deliver-fetch"`, method, url, canonical allowed hosts, canonical headers, body-or-empty, canonical inject |
+| one-shot protected `deliver inject` | `deliver` | `name`, approval | `"deliver-inject"`, rendered key/env name, lowercase format, UTF-8 path |
+| one-shot protected `sign` | `sign` | `name`, `sign_scheme`, `digest`, approval | `"sign"`, scheme, raw 32-byte digest |
+| agent delivery grant | `agent-deliver` | `scope_type`, `scope_ref`, `name`, approval | `"agent-deliver"`, name |
+| agent signing grant | `agent-sign` | `scope_type`, `scope_ref`, `name`, `sign_scheme`, `digest`, approval | `"agent-sign"`, scheme, raw 32-byte digest |
+
+For fetch operation hashes, canonical allowed hosts are lowercased and joined by
+NUL. Canonical headers are sorted by JSON object key and encoded as
+`name NUL value` pairs joined by NUL. Canonical inject is one of `bearer`,
+`header:<name>`, or `query:<name>`. These values and example AAD bytes are pinned
+in `tests/vectors/p2_core_crypto.json`.
 
 `pubkey` emits:
 
@@ -588,17 +612,18 @@ envelopes authenticate value ciphertext with AAD
   "key_envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." },
   "digest": "<lowercase or uppercase hex 32-byte digest>",
   "scheme": "ecdsa-secp256k1-recoverable",
-  "dek_blindbox": null
+  "dek_blindbox": null,
+  "approval": null
 }
 ```
 
 `name` is required because it is the AAD name for `key_envelope`; omitting it would
 remove the envelope transplant protection. `dek_blindbox` is optional. If omitted,
 standard tier unwraps the key envelope with the machine master key. If present,
-protected tier opens the HPKE blind box above to get the 32-byte DEK and uses that
-DEK to open `key_envelope`. Protected DEK opens require the normal
-`name || "machine-aesgcm-v1" || 0x01` envelope AAD and never take the P0
-empty-AAD read-compatibility fallback.
+protected tier requires `approval`, opens the HPKE blind box above to get the
+32-byte DEK, and uses that DEK to open `key_envelope`. Protected DEK opens require
+the normal `name || "machine-aesgcm-v1" || 0x01` envelope AAD and never take the
+P0 empty-AAD read-compatibility fallback.
 
 Supported `scheme` values:
 
@@ -630,8 +655,9 @@ All P1.1 delivery inputs are JSON on stdin. The `envelope` object is the persist
 AAD. Values never appear in argv. Phase B adds an optional `dek_blindbox` field to
 the one-shot delivery schemas; when present, avault opens that blind box to obtain
 the 32-byte per-record DEK and opens the envelope with `open_with_dek` instead of
-the standard-tier master key. The protected DEK path is AAD-only; the P0
-empty-AAD fallback is only for old standard-tier master-key rows.
+the standard-tier master key. `approval` is required whenever `dek_blindbox` is
+present. The protected DEK path is AAD-only; the P0 empty-AAD fallback is only for
+old standard-tier master-key rows.
 
 `deliver run` accepts a JSON array and spawns exactly one child:
 
@@ -641,7 +667,8 @@ empty-AAD fallback is only for old standard-tier master-key rows.
     "name": "OPENAI_API_KEY",
     "env": "OPENAI_API_KEY",
     "envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." },
-    "dek_blindbox": null
+    "dek_blindbox": null,
+    "approval": null
   }
 ]
 ```
@@ -656,6 +683,7 @@ The legacy single-secret form remains available:
   "name": "GITHUB_TOKEN",
   "envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." },
   "dek_blindbox": null,
+  "approval": null,
   "request": {
     "method": "GET",
     "url": "https://api.github.com/user",
@@ -694,7 +722,8 @@ are intentionally left to the `allowed_hosts` policy boundary.
       "name": "OPENAI_API_KEY",
       "key": "OPENAI_API_KEY",
       "envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." },
-      "dek_blindbox": null
+      "dek_blindbox": null,
+      "approval": null
     }
   ]
 }
@@ -767,6 +796,10 @@ cannot be replayed for a new digest.
         "scheme": "hpke-x25519-hkdfsha256-aes256gcm-v1",
         "enc": "...",
         "ct": "..."
+      },
+      "approval": {
+        "nonce": "<base64 16..128 random bytes>",
+        "expires_at_unix": 4102444800
       }
     },
     {
@@ -778,6 +811,10 @@ cannot be replayed for a new digest.
         "scheme": "hpke-x25519-hkdfsha256-aes256gcm-v1",
         "enc": "...",
         "ct": "..."
+      },
+      "approval": {
+        "nonce": "<base64 16..128 random bytes>",
+        "expires_at_unix": 4102444800
       }
     }
   ]
@@ -790,10 +827,12 @@ Response:
 { "ok": true, "result": { "granted": 2, "ttl_secs": 300 } }
 ```
 
-`purpose` defaults to `deliver` for backward-compatible delivery grants. A
-delivery grant must not include `scheme` or `digest`; a signing grant must include
-both. `digest` is hex on the JSON wire, but the blind-box AAD authenticates the
-decoded 32-byte digest.
+`purpose` defaults to `deliver` for delivery grants. A delivery grant must not
+include `scheme` or `digest`; a signing grant must include both. `digest` is hex
+on the JSON wire, but the blind-box AAD authenticates the decoded 32-byte digest.
+`scope_type` and `scope_ref` must be non-empty. `ttl_secs` defaults to 300, must
+be positive, and is capped at 86400. The effective grant expiry is the earlier of
+`ttl_secs` and the approval expiry; TTLs never slide.
 
 `release` and `revoke` are aliases. They drop and zeroize the grant if present:
 

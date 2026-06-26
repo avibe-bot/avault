@@ -10,6 +10,8 @@ use avault_core::{
     SignerProvider,
 };
 use avault_store::{Backend, FileStore, MasterKey, PassphraseFileStore};
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::collections::HashMap;
@@ -31,9 +33,9 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
 use std::str::FromStr;
-use std::time::Duration;
 #[cfg(unix)]
 use std::time::Instant;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use url::{Host, Url};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -49,9 +51,16 @@ const MAX_FETCH_BODY_BYTES: usize = 8 * 1024 * 1024;
 #[cfg(unix)]
 const DEFAULT_AGENT_GRANT_TTL_SECS: u64 = 300;
 #[cfg(unix)]
+const MAX_AGENT_GRANT_TTL_SECS: u64 = 24 * 60 * 60;
+#[cfg(unix)]
 const DEFAULT_AGENT_IDLE_TIMEOUT_SECS: u64 = 300;
 #[cfg(unix)]
 const AGENT_POLL_INTERVAL: Duration = Duration::from_millis(200);
+#[cfg(unix)]
+const MAX_AGENT_READ_TIMEOUTS: u8 = 30;
+const MIN_APPROVAL_NONCE_BYTES: usize = 16;
+const MAX_APPROVAL_NONCE_BYTES: usize = 128;
+const FETCH_REDACTION: &str = "[avault-redacted]";
 
 const USAGE: &str = "\
 avault — Avibe Vaults custody core
@@ -325,6 +334,8 @@ struct SignInput {
     scheme: String,
     #[serde(default)]
     dek_blindbox: Option<BlindBox>,
+    #[serde(default)]
+    approval: Option<ApprovalContextInput>,
 }
 
 #[derive(Debug, Serialize)]
@@ -345,9 +356,18 @@ fn sign_cmd(args: &[OsString], config: &CliConfig, input: &mut impl Read) -> any
     let scheme = SignatureScheme::from_str(&request.scheme)?;
 
     let key_plaintext = if let Some(dek_blindbox) = &request.dek_blindbox {
+        let approval = request
+            .approval
+            .as_ref()
+            .map(parse_approval_context)
+            .transpose()?
+            .context("protected sign DEK blind-box requires approval")?;
+        validate_approval_not_expired(approval.expires_at_unix)?;
         let master = load_existing_master_from_unlock(&unlock)?;
         let keypair = avault_core::derive_blind_box_keypair_from_master(master.as_bytes());
-        let context = BlindBoxContext::sign(&request.name, scheme.as_str(), &digest);
+        let context = BlindBoxContext::sign(&request.name, scheme.as_str(), &digest)
+            .with_approval(&approval.nonce, approval.expires_at_unix)
+            .with_operation_hash(one_shot_sign_operation_hash(scheme.as_str(), &digest));
         let dek_plaintext = keypair
             .open(dek_blindbox, &context)
             .context("DEK blind-box open failed")?;
@@ -359,6 +379,9 @@ fn sign_cmd(args: &[OsString], config: &CliConfig, input: &mut impl Read) -> any
         drop(dek);
         opened
     } else {
+        if request.approval.is_some() {
+            bail!("approval metadata requires a protected DEK blind-box");
+        }
         let master = load_existing_master_from_unlock(&unlock)?;
         let opened = avault_core::open(master.as_bytes(), &request.name, &request.key_envelope)
             .context("key envelope open failed")?;
@@ -414,6 +437,135 @@ fn zeroizing_vec_to_key32(
     Ok(out)
 }
 
+fn parse_approval_context(input: &ApprovalContextInput) -> anyhow::Result<ApprovalContext> {
+    let nonce = B64
+        .decode(input.nonce.as_bytes())
+        .context("approval nonce is not valid base64")?;
+    if nonce.len() < MIN_APPROVAL_NONCE_BYTES || nonce.len() > MAX_APPROVAL_NONCE_BYTES {
+        bail!("approval nonce has invalid length");
+    }
+    Ok(ApprovalContext {
+        nonce,
+        expires_at_unix: input.expires_at_unix,
+    })
+}
+
+fn validate_approval_not_expired(expires_at_unix: u64) -> anyhow::Result<()> {
+    let now = current_unix_secs()?;
+    if expires_at_unix <= now {
+        bail!("approval is expired");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn approval_expiry_instant(expires_at_unix: u64) -> anyhow::Result<Instant> {
+    let now_unix = current_unix_secs()?;
+    if expires_at_unix <= now_unix {
+        bail!("approval is expired");
+    }
+    Instant::now()
+        .checked_add(Duration::from_secs(expires_at_unix - now_unix))
+        .context("approval expiration is invalid")
+}
+
+fn current_unix_secs() -> anyhow::Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?
+        .as_secs())
+}
+
+fn one_shot_run_operation_hash(
+    env_name: &str,
+    command_fields: &[Vec<u8>],
+) -> anyhow::Result<[u8; 32]> {
+    let mut fields = Vec::with_capacity(2 + command_fields.len());
+    fields.push(b"deliver-run".as_slice());
+    fields.push(env_name.as_bytes());
+    fields.extend(command_fields.iter().map(Vec::as_slice));
+    Ok(BlindBoxContext::operation_hash(&fields))
+}
+
+fn os_command_fields(command: &[OsString]) -> anyhow::Result<Vec<Vec<u8>>> {
+    command
+        .iter()
+        .map(|arg| {
+            arg.to_str()
+                .map(|value| value.as_bytes().to_vec())
+                .context("command arguments must be valid UTF-8 for protected approval binding")
+        })
+        .collect()
+}
+
+fn one_shot_fetch_operation_hash(request: &FetchRequest) -> anyhow::Result<[u8; 32]> {
+    let inject = canonical_fetch_inject(&request.inject);
+    let headers = canonical_fetch_headers(&request.headers);
+    let hosts = canonical_allowed_hosts(&request.allowed_hosts);
+    let body = request.body.as_deref().unwrap_or("");
+    Ok(BlindBoxContext::operation_hash(&[
+        b"deliver-fetch",
+        request.method.as_bytes(),
+        request.url.as_bytes(),
+        hosts.as_bytes(),
+        headers.as_bytes(),
+        body.as_bytes(),
+        inject.as_bytes(),
+    ]))
+}
+
+fn canonical_fetch_inject(inject: &FetchInject) -> String {
+    match inject {
+        FetchInject::Bearer => "bearer".to_string(),
+        FetchInject::Header { name } => format!("header:{name}"),
+        FetchInject::Query { name } => format!("query:{name}"),
+    }
+}
+
+fn canonical_fetch_headers(headers: &BTreeMap<String, String>) -> String {
+    headers
+        .iter()
+        .map(|(name, value)| format!("{name}\0{value}"))
+        .collect::<Vec<_>>()
+        .join("\0")
+}
+
+fn canonical_allowed_hosts(hosts: &[String]) -> String {
+    hosts
+        .iter()
+        .map(|host| host.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join("\0")
+}
+
+fn one_shot_inject_operation_hash(
+    target_name: &str,
+    format: &str,
+    path: &Path,
+) -> anyhow::Result<[u8; 32]> {
+    let path = path
+        .to_str()
+        .context("inject path must be valid UTF-8 for protected approval binding")?;
+    Ok(BlindBoxContext::operation_hash(&[
+        b"deliver-inject",
+        target_name.as_bytes(),
+        format.as_bytes(),
+        path.as_bytes(),
+    ]))
+}
+
+fn one_shot_sign_operation_hash(scheme: &str, digest: &[u8; 32]) -> [u8; 32] {
+    BlindBoxContext::operation_hash(&[b"sign", scheme.as_bytes(), digest.as_slice()])
+}
+
+fn agent_deliver_operation_hash(name: &str) -> [u8; 32] {
+    BlindBoxContext::operation_hash(&[b"agent-deliver", name.as_bytes()])
+}
+
+fn agent_sign_operation_hash(scheme: &str, digest: &[u8; 32]) -> [u8; 32] {
+    BlindBoxContext::operation_hash(&[b"agent-sign", scheme.as_bytes(), digest.as_slice()])
+}
+
 fn deliver_cmd(args: &[OsString], config: &CliConfig, input: &mut impl Read) -> anyhow::Result<u8> {
     let Some(subcmd) = args.first().and_then(|s| s.to_str()) else {
         bail!("missing deliver subcommand");
@@ -446,7 +598,12 @@ fn deliver_run_cmd(
         let input = read_json_input(input, "failed to read deliver run JSON from stdin")?;
         let secrets: Vec<EnvSecretInput> =
             serde_json::from_slice(input.as_slice()).context("deliver run JSON is invalid")?;
-        let opened = open_env_secrets(secrets, &unlock)?;
+        let command_fields = if secrets.iter().any(|secret| secret.dek_blindbox.is_some()) {
+            Some(os_command_fields(command)?)
+        } else {
+            None
+        };
+        let opened = open_env_secrets(secrets, &unlock, command_fields.as_deref())?;
         drop(unlock);
         run_child_with_opened_env(command, opened, true)
     } else {
@@ -460,8 +617,9 @@ fn deliver_run_cmd(
             env: run_options.env_name,
             envelope: sealed,
             dek_blindbox: None,
+            approval: None,
         }];
-        let opened = open_env_secrets(secrets, &unlock)?;
+        let opened = open_env_secrets(secrets, &unlock, None)?;
         drop(unlock);
         run_child_with_opened_env(command, opened, envelope_stdin)
     }
@@ -474,6 +632,8 @@ struct EnvSecretInput {
     envelope: Sealed,
     #[serde(default)]
     dek_blindbox: Option<BlindBox>,
+    #[serde(default)]
+    approval: Option<ApprovalContextInput>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -486,6 +646,8 @@ struct NamedSecretInput {
     envelope: Sealed,
     #[serde(default)]
     dek_blindbox: Option<BlindBox>,
+    #[serde(default)]
+    approval: Option<ApprovalContextInput>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -494,7 +656,20 @@ struct FetchInput {
     envelope: Sealed,
     #[serde(default)]
     dek_blindbox: Option<BlindBox>,
+    #[serde(default)]
+    approval: Option<ApprovalContextInput>,
     request: FetchRequest,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ApprovalContextInput {
+    nonce: String,
+    expires_at_unix: u64,
+}
+
+struct ApprovalContext {
+    nonce: Vec<u8>,
+    expires_at_unix: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -584,6 +759,7 @@ fn run_child_with_opened_env(
 fn open_env_secrets(
     secrets: Vec<EnvSecretInput>,
     unlock: &StoreUnlock,
+    command_fields: Option<&[Vec<u8>]>,
 ) -> anyhow::Result<Vec<OpenedSecret>> {
     let mut opened = Vec::with_capacity(secrets.len());
     let mut seen = BTreeSet::new();
@@ -597,6 +773,15 @@ fn open_env_secrets(
             &secret.name,
             &secret.envelope,
             secret.dek_blindbox.as_ref(),
+            secret.approval.as_ref(),
+            if secret.dek_blindbox.is_some() {
+                Some(one_shot_run_operation_hash(
+                    &secret.env,
+                    command_fields.context("protected delivery requires command binding")?,
+                )?)
+            } else {
+                None
+            },
             unlock,
             Some(&master),
         )
@@ -613,10 +798,19 @@ fn open_one_shot_secret(
     name: &str,
     envelope: &Sealed,
     dek_blindbox: Option<&BlindBox>,
+    approval: Option<&ApprovalContextInput>,
+    operation_hash: Option<[u8; 32]>,
     unlock: &StoreUnlock,
     loaded_master: Option<&MasterKey>,
 ) -> anyhow::Result<Zeroizing<Vec<u8>>> {
     if let Some(dek_blindbox) = dek_blindbox {
+        let approval = approval
+            .map(parse_approval_context)
+            .transpose()?
+            .context("protected DEK blind-box requires approval")?;
+        let operation_hash =
+            operation_hash.context("protected DEK blind-box requires operation")?;
+        validate_approval_not_expired(approval.expires_at_unix)?;
         let master;
         let master = match loaded_master {
             Some(master) => master,
@@ -626,7 +820,9 @@ fn open_one_shot_secret(
             }
         };
         let keypair = avault_core::derive_blind_box_keypair_from_master(master.as_bytes());
-        let context = BlindBoxContext::deliver(name);
+        let context = BlindBoxContext::deliver(name)
+            .with_approval(&approval.nonce, approval.expires_at_unix)
+            .with_operation_hash(operation_hash);
         let dek_plaintext = keypair
             .open(dek_blindbox, &context)
             .context("DEK blind-box open failed")?;
@@ -637,6 +833,9 @@ fn open_one_shot_secret(
         drop(dek);
         Ok(opened)
     } else {
+        if approval.is_some() || operation_hash.is_some() {
+            bail!("approval metadata requires a protected DEK blind-box");
+        }
         let master;
         let master = match loaded_master {
             Some(master) => master,
@@ -676,6 +875,12 @@ fn deliver_fetch_cmd(
         &fetch.name,
         &fetch.envelope,
         fetch.dek_blindbox.as_ref(),
+        fetch.approval.as_ref(),
+        if fetch.dek_blindbox.is_some() {
+            Some(one_shot_fetch_operation_hash(&fetch.request)?)
+        } else {
+            None
+        },
         &unlock,
         None,
     )
@@ -831,7 +1036,7 @@ fn perform_fetch(
     let mut response_headers = BTreeMap::new();
     for name in response.headers_names() {
         if let Some(value) = response.header(&name) {
-            response_headers.insert(name, value.to_string());
+            response_headers.insert(name, redact_fetch_header_value(value, redaction_needle)?);
         }
     }
     let body = read_capped_fetch_body(response, redaction_needle)?;
@@ -875,7 +1080,7 @@ fn redact_fetch_body(body: &mut Vec<u8>, redaction_needle: Option<&[u8]>) -> any
 }
 
 fn redact_verbatim_bytes(body: &mut Vec<u8>, needle: &[u8]) -> anyhow::Result<()> {
-    const REDACTION: &[u8] = b"[avault-redacted]";
+    const REDACTION: &[u8] = FETCH_REDACTION.as_bytes();
     if needle.is_empty() {
         return Ok(());
     }
@@ -906,6 +1111,35 @@ fn redact_verbatim_bytes(body: &mut Vec<u8>, needle: &[u8]) -> anyhow::Result<()
     body.clear();
     body.extend_from_slice(&redacted);
     Ok(())
+}
+
+fn redact_fetch_header_value(
+    value: &str,
+    redaction_needle: Option<&[u8]>,
+) -> anyhow::Result<String> {
+    let Some(needle) = redaction_needle else {
+        return Ok(value.to_string());
+    };
+    if needle.is_empty()
+        || !value
+            .as_bytes()
+            .windows(needle.len())
+            .any(|window| window == needle)
+    {
+        return Ok(value.to_string());
+    }
+    let mut bytes = value.as_bytes().to_vec();
+    redact_verbatim_bytes(&mut bytes, needle)?;
+    match String::from_utf8(bytes) {
+        Ok(value) => Ok(value),
+        Err(err) => {
+            let mut bytes = err.into_bytes();
+            bytes.zeroize();
+            Err(anyhow!(
+                "fetch response header is not valid UTF-8 after redaction"
+            ))
+        }
+    }
 }
 
 fn redacted_body_len(
@@ -953,7 +1187,7 @@ fn deliver_inject_cmd(
         bail!("deliver inject format is not implemented in P1.1");
     }
 
-    let mut opened = open_named_secrets(inject.secrets, &unlock)?;
+    let mut opened = open_named_secrets(inject.secrets, &unlock, &inject.path, &format)?;
     drop(unlock);
     let mut rendered = render_inject_file(&opened, &format)?;
     opened.zeroize();
@@ -969,6 +1203,8 @@ fn deliver_inject_cmd(
 fn open_named_secrets(
     secrets: Vec<NamedSecretInput>,
     unlock: &StoreUnlock,
+    inject_path: &Path,
+    format: &str,
 ) -> anyhow::Result<Vec<OpenedSecret>> {
     let mut opened = Vec::with_capacity(secrets.len());
     let mut seen = BTreeSet::new();
@@ -986,6 +1222,16 @@ fn open_named_secrets(
             &secret.name,
             &secret.envelope,
             secret.dek_blindbox.as_ref(),
+            secret.approval.as_ref(),
+            if secret.dek_blindbox.is_some() {
+                Some(one_shot_inject_operation_hash(
+                    &target_name,
+                    format,
+                    inject_path,
+                )?)
+            } else {
+                None
+            },
             unlock,
             Some(&master),
         )
@@ -1789,6 +2035,7 @@ impl AgentDekPurpose {
 #[cfg(unix)]
 struct AgentState {
     grants: HashMap<GrantKey, GrantEntry>,
+    used_grant_nonces: HashMap<Vec<u8>, Instant>,
     last_activity: Instant,
     idle_timeout: Duration,
     _master: Option<MasterKey>,
@@ -1799,6 +2046,7 @@ impl AgentState {
     fn new(idle_timeout: Duration, master: Option<MasterKey>) -> Self {
         Self {
             grants: HashMap::new(),
+            used_grant_nonces: HashMap::new(),
             last_activity: Instant::now(),
             idle_timeout,
             _master: master,
@@ -1816,6 +2064,8 @@ impl AgentState {
             self.grants.clear();
         }
         self.grants.retain(|_, grant| grant.expires_at > now);
+        self.used_grant_nonces
+            .retain(|_, expires_at| *expires_at > now);
     }
 
     fn get_grant(&mut self, scope: &GrantKey) -> anyhow::Result<&GrantEntry> {
@@ -1823,6 +2073,18 @@ impl AgentState {
         self.grants
             .get(scope)
             .context("grant is missing or expired")
+    }
+
+    fn ensure_grant_nonce_unused(&mut self, nonce: &[u8]) -> anyhow::Result<()> {
+        self.purge();
+        if self.used_grant_nonces.contains_key(nonce) {
+            bail!("grant approval was already used");
+        }
+        Ok(())
+    }
+
+    fn remember_grant_nonce(&mut self, nonce: Vec<u8>, expires_at: Instant) {
+        self.used_grant_nonces.insert(nonce, expires_at);
     }
 }
 
@@ -1859,6 +2121,7 @@ struct AgentGrantRequest {
 struct AgentDekInput {
     name: String,
     dek_blindbox: BlindBox,
+    approval: ApprovalContextInput,
     #[serde(default)]
     purpose: Option<String>,
     #[serde(default)]
@@ -1968,7 +2231,7 @@ fn run_agent(options: AgentOptions, input: &mut impl Read) -> anyhow::Result<u8>
             Err(err) => return Err(err).context("failed to accept agent connection"),
         };
         stream
-            .set_read_timeout(Some(AGENT_POLL_INTERVAL))
+            .set_nonblocking(true)
             .context("failed to configure agent connection")?;
         if let Err(err) = authorize_peer(&stream) {
             let _ = write_agent_error_frame(&mut stream, &err);
@@ -2003,6 +2266,9 @@ fn bind_agent_socket(path: &Path) -> anyhow::Result<UnixListener> {
     ensure_agent_socket_parent(parent)?;
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_socket() => {
+            if UnixStream::connect(path).is_ok() {
+                bail!("agent socket is already in use");
+            }
             fs::remove_file(path).context("failed to remove stale agent socket")?;
         }
         Ok(_) => bail!("agent socket path already exists and is not a socket"),
@@ -2071,14 +2337,33 @@ fn handle_agent_frame_inner(
             if request.deks.is_empty() {
                 bail!("grant requires at least one DEK");
             }
+            let key = grant_key_from_parts(request.scope_type, request.scope_ref)?;
             let ttl_secs = request.ttl_secs.unwrap_or(DEFAULT_AGENT_GRANT_TTL_SECS);
             if ttl_secs == 0 {
                 bail!("grant ttl_secs must be positive");
             }
+            if ttl_secs > MAX_AGENT_GRANT_TTL_SECS {
+                bail!("grant ttl_secs exceeds maximum");
+            }
+            let requested_expires_at = Instant::now()
+                .checked_add(Duration::from_secs(ttl_secs))
+                .context("grant expiration is invalid")?;
             let mut deks = HashMap::with_capacity(request.deks.len());
-            let scope_type = request.scope_type;
-            let scope_ref = request.scope_ref;
+            let scope_type = key.scope_type.clone();
+            let scope_ref = key.scope_ref.clone();
+            let mut used_nonces = Vec::with_capacity(request.deks.len());
+            let mut grant_expires_at = requested_expires_at;
             for dek in request.deks {
+                let approval = parse_approval_context(&dek.approval)?;
+                validate_approval_not_expired(approval.expires_at_unix)?;
+                let approval_expires_at = approval_expiry_instant(approval.expires_at_unix)?;
+                grant_expires_at = grant_expires_at.min(approval_expires_at);
+                state.ensure_grant_nonce_unused(&approval.nonce)?;
+                if used_nonces.iter().any(|(nonce, _): &(Vec<u8>, Instant)| {
+                    nonce.as_slice() == approval.nonce.as_slice()
+                }) {
+                    bail!("duplicate grant approval nonce");
+                }
                 let purpose = AgentDekPurpose::parse(dek.purpose.as_deref())?;
                 let (context, key) = match purpose {
                     AgentDekPurpose::Deliver => {
@@ -2086,7 +2371,9 @@ fn handle_agent_frame_inner(
                             bail!("deliver grant DEK must not include signing fields");
                         }
                         (
-                            BlindBoxContext::agent_deliver(&scope_type, &scope_ref, &dek.name),
+                            BlindBoxContext::agent_deliver(&scope_type, &scope_ref, &dek.name)
+                                .with_approval(&approval.nonce, approval.expires_at_unix)
+                                .with_operation_hash(agent_deliver_operation_hash(&dek.name)),
                             AgentDekKey {
                                 purpose,
                                 name: dek.name.clone(),
@@ -2107,7 +2394,9 @@ fn handle_agent_frame_inner(
                                 &dek.name,
                                 &scheme,
                                 &digest,
-                            ),
+                            )
+                            .with_approval(&approval.nonce, approval.expires_at_unix)
+                            .with_operation_hash(agent_sign_operation_hash(&scheme, &digest)),
                             AgentDekKey {
                                 purpose,
                                 name: dek.name.clone(),
@@ -2128,16 +2417,16 @@ fn handle_agent_frame_inner(
                     MasterKey::from_bytes(&released_dek).context("failed to lock released DEK")?;
                 drop(released_dek);
                 deks.insert(key, locked);
+                used_nonces.push((approval.nonce, approval_expires_at));
             }
             let granted = deks.len();
-            let key = GrantKey {
-                scope_type,
-                scope_ref,
-            };
+            for (nonce, expires_at) in used_nonces {
+                state.remember_grant_nonce(nonce, expires_at);
+            }
             state.grants.insert(
                 key,
                 GrantEntry {
-                    expires_at: Instant::now() + Duration::from_secs(ttl_secs),
+                    expires_at: grant_expires_at,
                     deks,
                 },
             );
@@ -2149,10 +2438,7 @@ fn handle_agent_frame_inner(
             agent_ok(AgentReleaseOutput { released })
         }
         AgentRequest::Deliver(request) => {
-            let scope = GrantKey {
-                scope_type: request.scope_type,
-                scope_ref: request.scope_ref,
-            };
+            let scope = grant_key_from_parts(request.scope_type, request.scope_ref)?;
             let grant = state.get_grant(&scope)?;
             match request.mode {
                 AgentDeliverMode::Run { command, secrets } => {
@@ -2173,6 +2459,7 @@ fn handle_agent_frame_inner(
                         name,
                         envelope,
                         dek_blindbox: None,
+                        approval: None,
                         request,
                     };
                     let (_url, is_loopback) = validate_fetch_input(&fetch)?;
@@ -2190,10 +2477,7 @@ fn handle_agent_frame_inner(
             }
         }
         AgentRequest::Sign(request) => {
-            let scope = GrantKey {
-                scope_type: request.scope_type,
-                scope_ref: request.scope_ref,
-            };
+            let scope = grant_key_from_parts(request.scope_type, request.scope_ref)?;
             let grant = state.get_grant(&scope)?;
             let digest = decode_hex_32(&request.digest, "digest")?;
             let scheme = SignatureScheme::from_str(&request.scheme)?;
@@ -2222,12 +2506,17 @@ fn agent_ok<T: Serialize>(result: T) -> anyhow::Result<serde_json::Value> {
 
 #[cfg(unix)]
 fn grant_key_from_scope(scope: AgentScopeRequest) -> anyhow::Result<GrantKey> {
-    if scope.scope_type.is_empty() || scope.scope_ref.is_empty() {
+    grant_key_from_parts(scope.scope_type, scope.scope_ref)
+}
+
+#[cfg(unix)]
+fn grant_key_from_parts(scope_type: String, scope_ref: String) -> anyhow::Result<GrantKey> {
+    if scope_type.is_empty() || scope_ref.is_empty() {
         bail!("scope_type and scope_ref are required");
     }
     Ok(GrantKey {
-        scope_type: scope.scope_type,
-        scope_ref: scope.scope_ref,
+        scope_type,
+        scope_ref,
     })
 }
 
@@ -2367,6 +2656,10 @@ fn read_exact_agent(
     mut buf: &mut [u8],
     state: &mut AgentState,
 ) -> io::Result<()> {
+    let read_deadline = Instant::now()
+        + Duration::from_millis(
+            AGENT_POLL_INTERVAL.as_millis() as u64 * u64::from(MAX_AGENT_READ_TIMEOUTS),
+        );
     while !buf.is_empty() {
         match stream.read(buf) {
             Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
@@ -2379,6 +2672,10 @@ fn read_exact_agent(
                     || err.kind() == std::io::ErrorKind::TimedOut =>
             {
                 state.purge();
+                if Instant::now() >= read_deadline {
+                    return Err(std::io::ErrorKind::TimedOut.into());
+                }
+                std::thread::sleep(AGENT_POLL_INTERVAL);
             }
             Err(err) => return Err(err),
         }
