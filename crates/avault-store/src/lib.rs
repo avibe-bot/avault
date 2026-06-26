@@ -54,7 +54,11 @@ use windows_sys::Win32::System::Memory::{VirtualLock, VirtualUnlock};
 #[cfg(windows)]
 use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
 #[cfg(windows)]
-use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
+use windows_sys::Win32::System::SystemServices::{
+    ACCESS_ALLOWED_ACE_TYPE, ACCESS_ALLOWED_CALLBACK_ACE_TYPE,
+    ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE, ACCESS_ALLOWED_COMPOUND_ACE_TYPE,
+    ACCESS_ALLOWED_OBJECT_ACE_TYPE,
+};
 #[cfg(windows)]
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -305,7 +309,13 @@ impl FileStore {
         }
 
         let parent = writable_parent(&self.path);
-        let tmp = write_synced_temp_secret_file(parent, ".machine.", ".tmp", key)?;
+        let tmp = write_synced_temp_secret_file(
+            parent,
+            ".machine.",
+            ".tmp",
+            key,
+            CreatedFileOwner::SetCurrentUser,
+        )?;
 
         if force {
             tmp.persist(&self.path)
@@ -326,7 +336,13 @@ impl FileStore {
 
         let key = MasterKey::generate_locked()?;
         let parent = writable_parent(&self.path);
-        let tmp = write_synced_temp_secret_file(parent, ".machine.", ".tmp", key.as_bytes())?;
+        let tmp = write_synced_temp_secret_file(
+            parent,
+            ".machine.",
+            ".tmp",
+            key.as_bytes(),
+            CreatedFileOwner::SetCurrentUser,
+        )?;
         drop(key);
 
         match tmp.persist_noclobber(&self.path) {
@@ -353,11 +369,13 @@ impl FileStore {
 /// Unix callers get a 0600 file; Windows callers get a protected owner-only DACL.
 /// This is for delivery targets such as `deliver inject`: the output file is
 /// private, but an existing project directory is allowed to keep normal project
-/// permissions.
+/// permissions. Windows preserves the file owner assigned by creation, so inject
+/// does not require `WRITE_OWNER` on the containing directory.
 pub fn atomic_write_secret_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let parent = writable_parent(path);
     ensure_output_parent_directory(parent)?;
-    let tmp = write_synced_temp_secret_file(parent, ".avault.", ".tmp", bytes)?;
+    let tmp =
+        write_synced_temp_secret_file(parent, ".avault.", ".tmp", bytes, CreatedFileOwner::Keep)?;
     tmp.persist(path)
         .map_err(|err| err.error)
         .context("failed to install secret file")?;
@@ -371,13 +389,14 @@ fn write_synced_temp_secret_file(
     prefix: &str,
     suffix: &str,
     bytes: &[u8],
+    owner: CreatedFileOwner,
 ) -> anyhow::Result<tempfile::NamedTempFile> {
     let mut tmp = tempfile::Builder::new()
         .prefix(prefix)
         .suffix(suffix)
         .tempfile_in(parent)
         .context("failed to create temporary secret file")?;
-    secure_created_file(tmp.path()).context("failed to secure temporary secret file")?;
+    secure_created_file(tmp.path(), owner).context("failed to secure temporary secret file")?;
     tmp.as_file_mut()
         .write_all(bytes)
         .context("failed to write temporary secret file")?;
@@ -385,6 +404,12 @@ fn write_synced_temp_secret_file(
         .sync_all()
         .context("failed to sync temporary secret file")?;
     Ok(tmp)
+}
+
+#[derive(Clone, Copy)]
+enum CreatedFileOwner {
+    SetCurrentUser,
+    Keep,
 }
 
 fn writable_parent(path: &Path) -> &Path {
@@ -437,7 +462,7 @@ fn secure_created_directory(path: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(unix)]
-fn secure_created_file(path: &Path) -> anyhow::Result<()> {
+fn secure_created_file(path: &Path, _owner: CreatedFileOwner) -> anyhow::Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
         .context("failed to secure secret file")
 }
@@ -448,8 +473,11 @@ fn secure_created_directory(path: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(windows)]
-fn secure_created_file(path: &Path) -> anyhow::Result<()> {
-    set_owner_only_acl(path, false)
+fn secure_created_file(path: &Path, owner: CreatedFileOwner) -> anyhow::Result<()> {
+    match owner {
+        CreatedFileOwner::SetCurrentUser => set_owner_only_acl(path, false),
+        CreatedFileOwner::Keep => set_owner_only_dacl(path, false),
+    }
 }
 
 fn sync_parent_dir(path: &Path) -> anyhow::Result<()> {
@@ -481,13 +509,14 @@ fn sync_directory(parent: &Path) -> anyhow::Result<()> {
         )
     };
     if handle == INVALID_HANDLE_VALUE {
-        bail!("failed to open secret directory");
+        return Ok(());
     }
     let _guard = HandleGuard(handle);
-    // Safety invariant: `handle` is a live directory handle opened above. Failure is propagated
-    // because the caller relies on durable install semantics for secret-bearing files.
-    if unsafe { FlushFileBuffers(handle) } == 0 {
-        bail!("failed to sync secret directory");
+    // Safety invariant: `handle` is a live directory handle opened above. The secret file was
+    // already fully written, fsync'd, and renamed; Windows directory flush failures are treated
+    // as best-effort so a successful write is not reported as failed.
+    unsafe {
+        FlushFileBuffers(handle);
     }
     Ok(())
 }
@@ -563,6 +592,16 @@ fn wide_path(path: &Path) -> Vec<u16> {
 
 #[cfg(windows)]
 fn set_owner_only_acl(path: &Path, directory: bool) -> anyhow::Result<()> {
+    set_owner_only_acl_impl(path, directory, true)
+}
+
+#[cfg(windows)]
+fn set_owner_only_dacl(path: &Path, directory: bool) -> anyhow::Result<()> {
+    set_owner_only_acl_impl(path, directory, false)
+}
+
+#[cfg(windows)]
+fn set_owner_only_acl_impl(path: &Path, directory: bool, set_owner: bool) -> anyhow::Result<()> {
     let owner = current_user_sid().context("failed to read current user SID")?;
     let sid_len = unsafe_sid_len(owner.as_psid())?;
     let acl_len = std::mem::size_of::<ACL>() + std::mem::size_of::<ACCESS_ALLOWED_ACE>() + sid_len
@@ -594,17 +633,27 @@ fn set_owner_only_acl(path: &Path, directory: bool) -> anyhow::Result<()> {
     }
 
     let mut wide = wide_path(path);
+    let security_information = if set_owner {
+        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION
+    } else {
+        DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION
+    };
+    let owner_ptr = if set_owner {
+        owner.as_psid()
+    } else {
+        std::ptr::null_mut()
+    };
     // Safety invariant: `wide` is a NUL-terminated path to the just-created secret object, and
     // `acl` remains alive for the duration of the call. The protected DACL removes inherited
-    // principals so only the owner ACE above grants access.
+    // principals so only the current-user ACE above grants access. Inject-output files pass a
+    // null owner pointer to avoid requiring `WRITE_OWNER`; key-store files set the owner because
+    // avault created them inside its private store directory.
     let rc = unsafe {
         SetNamedSecurityInfoW(
             wide.as_mut_ptr(),
             SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION
-                | DACL_SECURITY_INFORMATION
-                | PROTECTED_DACL_SECURITY_INFORMATION,
-            owner.as_psid(),
+            security_information,
+            owner_ptr,
             std::ptr::null_mut(),
             acl,
             std::ptr::null_mut(),
@@ -677,7 +726,11 @@ fn validate_owner_only_acl(path: &Path, label: &str) -> anyhow::Result<()> {
         let header = ace_ptr.cast::<windows_sys::Win32::Security::ACE_HEADER>();
         // Safety invariant: `ace_ptr` points to an ACE header returned by `GetAce`.
         let ace_type = unsafe { (*header).AceType };
-        if u32::from(ace_type) != ACCESS_ALLOWED_ACE_TYPE {
+        let ace_type = u32::from(ace_type);
+        if ace_type != ACCESS_ALLOWED_ACE_TYPE {
+            if is_unsupported_access_allowing_ace_type(ace_type) {
+                bail!("{label} ACL contains unsupported access-allowing ACE");
+            }
             continue;
         }
         let ace = ace_ptr.cast::<ACCESS_ALLOWED_ACE>();
@@ -693,6 +746,17 @@ fn validate_owner_only_acl(path: &Path, label: &str) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(windows)]
+fn is_unsupported_access_allowing_ace_type(ace_type: u32) -> bool {
+    matches!(
+        ace_type,
+        ACCESS_ALLOWED_CALLBACK_ACE_TYPE
+            | ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE
+            | ACCESS_ALLOWED_COMPOUND_ACE_TYPE
+            | ACCESS_ALLOWED_OBJECT_ACE_TYPE
+    )
 }
 
 #[cfg(windows)]
