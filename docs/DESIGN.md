@@ -491,10 +491,10 @@ These are starting recommendations, not frozen choices — items #2 (envelope) a
 
 | Verb | Input | Output | Purpose |
 |---|---|---|---|
-| `pubkey` | — | X25519 public key + fingerprint | the browser fetches this before sealing a blind box (protected tier must pin / attest it) |
+| `pubkey` | — | X25519 public key + fingerprint | one-shot `pubkey` supports blind-box create; protected DEK release uses the resident agent's ephemeral `pubkey` frame |
 | `seal` | blind box (the value) + name/scheme | envelope `{ciphertext, nonce, wrap_meta}` | standard-tier create: open box → wrap DEK under master → return ciphertext (never plaintext). The CLI plaintext-stdin path remains for local `set` / fd passthrough. |
-| `deliver` | envelope + mode (`run` / `fetch` / `inject`) + *optional* DEK blind box | exit code / response body | decrypt and deliver. No DEK ⇒ standard tier (master key); with DEK ⇒ protected tier (browser-released DEK) |
-| `sign` | key envelope + name + 32-byte digest + scheme + *optional* DEK blind box | signature (public) | standard/protected signing (secp256k1); the private key never leaves `avault` |
+| `deliver` | envelope + mode (`run` / `fetch` / `inject`) | exit code / response body / written file | one-shot standard-tier delivery uses the master key; protected delivery uses resident-agent grants, never inline DEK boxes |
+| `sign` | key envelope + name + 32-byte digest + scheme | signature (public) | one-shot standard-tier signing; protected signing uses resident-agent grants. The private key never leaves `avault` |
 | `key export` / `key import` | passphrase (stdin; if `--store file-passphrase`, first stdin line unlocks the store) | encrypted backup / ok | back up, migrate, restore the master key |
 
 Phase A implements the core blind-box opener and secp256k1 signer plus one-shot CLI
@@ -536,32 +536,27 @@ raw 32-byte signing digest, not hex text. `approval_expires_at_unix_be` is an
 SHA-256 digest of the approved operation fields encoded the same way:
 `SHA256(field(part0) || field(part1) || ...)`.
 
-Protected one-shot and agent-grant DEK blind boxes require approval metadata:
+Protected agent-grant DEK blind boxes require approval metadata:
 
 ```json
 { "nonce": "<base64 16..128 random bytes>", "expires_at_unix": 4102444800 }
 ```
 
-The approval nonce/expiry are authenticated in the HPKE AAD. `avault` rejects
-expired approvals; the resident agent also rejects replayed grant nonces until
-their approval expiry. Current `purpose` and `operation_hash` values:
+The approval nonce/expiry are authenticated in the HPKE AAD. The resident agent
+rejects expired approvals and replayed grant nonces until their approval expiry.
+Protected DEK blind boxes are accepted only by the resident agent, whose receiver
+keypair is fresh in memory for that agent lifetime. The one-shot CLI rejects
+`dek_blindbox` / `approval` fields because its `pubkey` compatibility path is
+master-derived and therefore not ephemeral. Current `purpose` and
+`operation_hash` values:
 
 | Operation | `purpose` | Required AAD context | `operation_hash` fields |
 |---|---|---|---|
 | `seal --blind-box` | `seal` | `name` | empty |
-| one-shot protected `deliver run` | `deliver` | `name`, approval | `"deliver-run"`, env var name, current working directory, `PATH`, each UTF-8 command argv field |
-| one-shot protected `deliver fetch` | `deliver` | `name`, approval | `"deliver-fetch"`, method, url, canonical allowed hosts, canonical headers, body-or-empty, canonical inject |
-| one-shot protected `deliver inject` | `deliver` | `name`, approval | `"deliver-inject"`, rendered key/env name, lowercase format, avault-resolved absolute UTF-8 path |
-| one-shot protected `sign` | `sign` | `name`, `sign_scheme`, `digest`, approval | `"sign"`, scheme, raw 32-byte digest |
 | agent delivery grant | `agent-deliver` | `scope_type`, `scope_ref`, `name`, approval, `ttl_secs` | `"agent-deliver"`, name, `ttl_secs_u64_be` |
 | agent signing grant | `agent-sign` | `scope_type`, `scope_ref`, `name`, `sign_scheme`, `digest`, approval, `ttl_secs` | `"agent-sign"`, scheme, raw 32-byte digest, `ttl_secs_u64_be` |
 
-For fetch operation hashes, canonical allowed hosts are lowercased and joined by
-NUL. Canonical headers are sorted by JSON object key and encoded as repeated
-`field(name) || field(value)` pairs, using the same `field` length prefix as the
-outer operation hash. Header values containing HTTP control bytes are rejected
-before hashing. Canonical inject is one of `bearer`, `header:<name>`, or
-`query:<name>`. These values and example AAD bytes are pinned in
+These values and example AAD bytes are pinned in
 `tests/vectors/p2_core_crypto.json`.
 
 `pubkey` emits:
@@ -575,11 +570,12 @@ before hashing. Canonical inject is one of `bearer`, `header:<name>`, or
 
 The resident agent uses a fresh in-memory X25519 receiver keypair for its process
 lifetime and never writes the private key to disk. The one-shot CLI cannot keep a
-random private key across separate `pubkey` and `seal` processes, so its Phase A
-compatibility path derives the receiver keypair from the local master key with HKDF
-and drops it after each operation. The derived private key is still never written
-or returned; the public key is stable for that master key. The agent path remains
-the final protected-tier shape.
+random private key across separate `pubkey` and `seal` processes, so its
+compatibility path derives the receiver keypair from the local master key with
+HKDF and drops it after each operation. The derived private key is still never
+written or returned; the public key is stable for that master key and is only for
+the blind-box create path. Protected-tier DEK releases must use the resident
+agent's ephemeral `pubkey` frame.
 
 `seal --name NAME --blind-box` reads a blind box from stdin:
 
@@ -613,19 +609,17 @@ envelopes authenticate value ciphertext with AAD
   "name": "ETH_SIGNING_KEY",
   "key_envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." },
   "digest": "<lowercase or uppercase hex 32-byte digest>",
-  "scheme": "ecdsa-secp256k1-recoverable",
-  "dek_blindbox": null,
-  "approval": null
+  "scheme": "ecdsa-secp256k1-recoverable"
 }
 ```
 
 `name` is required because it is the AAD name for `key_envelope`; omitting it would
-remove the envelope transplant protection. `dek_blindbox` is optional. If omitted,
-standard tier unwraps the key envelope with the machine master key. If present,
-protected tier requires `approval`, opens the HPKE blind box above to get the
-32-byte DEK, and uses that DEK to open `key_envelope`. Protected DEK opens require
-the normal `name || "machine-aesgcm-v1" || 0x01` envelope AAD and never take the
-P0 empty-AAD read-compatibility fallback.
+remove the envelope transplant protection. One-shot `sign` is standard-tier only:
+it unwraps the key envelope with the machine master key and rejects
+`dek_blindbox` / `approval` fields. Protected signing uses the resident agent's
+`grant` + `sign` frames; protected DEK opens require the normal
+`name || "machine-aesgcm-v1" || 0x01` envelope AAD and never take the P0
+empty-AAD read-compatibility fallback.
 
 Supported `scheme` values:
 
@@ -654,12 +648,10 @@ test deterministic.
 
 All P1.1 delivery inputs are JSON on stdin. The `envelope` object is the persisted
 `{ciphertext, nonce, wrap_meta}` shape. The `name` field is the secret name used for
-AAD. Values never appear in argv. Phase B adds an optional `dek_blindbox` field to
-the one-shot delivery schemas; when present, avault opens that blind box to obtain
-the 32-byte per-record DEK and opens the envelope with `open_with_dek` instead of
-the standard-tier master key. `approval` is required whenever `dek_blindbox` is
-present. The protected DEK path is AAD-only; the P0 empty-AAD fallback is only for
-old standard-tier master-key rows.
+AAD. Values never appear in argv. One-shot delivery is standard-tier only and
+rejects `dek_blindbox` / `approval` fields. Protected delivery uses the resident
+agent's `grant` + `deliver` frames; the protected DEK path is AAD-only, and the
+P0 empty-AAD fallback is only for old standard-tier master-key rows.
 
 `deliver run` accepts a JSON array and spawns exactly one child:
 
@@ -668,9 +660,7 @@ old standard-tier master-key rows.
   {
     "name": "OPENAI_API_KEY",
     "env": "OPENAI_API_KEY",
-    "envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." },
-    "dek_blindbox": null,
-    "approval": null
+    "envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." }
   }
 ]
 ```
@@ -684,8 +674,6 @@ The legacy single-secret form remains available:
 {
   "name": "GITHUB_TOKEN",
   "envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." },
-  "dek_blindbox": null,
-  "approval": null,
   "request": {
     "method": "GET",
     "url": "https://api.github.com/user",
@@ -723,9 +711,7 @@ are intentionally left to the `allowed_hosts` policy boundary.
     {
       "name": "OPENAI_API_KEY",
       "key": "OPENAI_API_KEY",
-      "envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." },
-      "dek_blindbox": null,
-      "approval": null
+      "envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." }
     }
   ]
 }
@@ -735,9 +721,7 @@ are intentionally left to the `allowed_hosts` policy boundary.
 `dotenv` and `json`; `yaml` and `toml` remain deferred. Files are written
 atomically through an owner-only temporary file, fsync, rename, and
 parent-directory fsync. Unix uses 0600; Windows uses a protected owner-only DACL.
-For protected one-shot inject, relative paths are resolved against avault's
-current working directory before opening the DEK blind box, and the approval
-hash binds the resolved absolute target path rather than the raw JSON string.
+Protected inject uses the agent grant path and rejects inline one-shot DEK boxes.
 
 ### Transport
 

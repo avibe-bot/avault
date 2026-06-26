@@ -352,39 +352,11 @@ fn sign_cmd(args: &[OsString], config: &CliConfig, input: &mut impl Read) -> any
     let digest = decode_hex_32(&request.digest, "digest")?;
     let scheme = SignatureScheme::from_str(&request.scheme)?;
 
-    let key_plaintext = if let Some(dek_blindbox) = &request.dek_blindbox {
-        let approval = request
-            .approval
-            .as_ref()
-            .map(parse_approval_context)
-            .transpose()?
-            .context("protected sign DEK blind-box requires approval")?;
-        validate_approval_not_expired(approval.expires_at_unix)?;
-        let master = load_existing_master_from_unlock(&unlock)?;
-        let keypair = avault_core::derive_blind_box_keypair_from_master(master.as_bytes());
-        let context = BlindBoxContext::sign(&request.name, scheme.as_str(), &digest)
-            .with_approval(&approval.nonce, approval.expires_at_unix)
-            .with_operation_hash(one_shot_sign_operation_hash(scheme.as_str(), &digest));
-        let dek_plaintext = keypair
-            .open(dek_blindbox, &context)
-            .context("DEK blind-box open failed")?;
-        drop(keypair);
-        drop(master);
-        let dek = zeroizing_vec_to_key32(dek_plaintext, "released DEK")?;
-        let opened = avault_core::open_with_dek(&dek, &request.name, &request.key_envelope)
-            .context("key envelope open failed")?;
-        drop(dek);
-        opened
-    } else {
-        if request.approval.is_some() {
-            bail!("approval metadata requires a protected DEK blind-box");
-        }
-        let master = load_existing_master_from_unlock(&unlock)?;
-        let opened = avault_core::open(master.as_bytes(), &request.name, &request.key_envelope)
-            .context("key envelope open failed")?;
-        drop(master);
-        opened
-    };
+    reject_one_shot_protected_fields(request.dek_blindbox.as_ref(), request.approval.as_ref())?;
+    let master = load_existing_master_from_unlock(&unlock)?;
+    let key_plaintext = avault_core::open(master.as_bytes(), &request.name, &request.key_envelope)
+        .context("key envelope open failed")?;
+    drop(master);
     drop(unlock);
     let output = sign_digest_with_key(scheme, &digest, key_plaintext)?;
     serde_json::to_writer(io::stdout(), &output).context("failed to write signature JSON")?;
@@ -473,138 +445,6 @@ fn current_unix_secs() -> anyhow::Result<u64> {
         .as_secs())
 }
 
-fn one_shot_run_operation_hash(
-    env_name: &str,
-    command_fields: &[Vec<u8>],
-) -> anyhow::Result<[u8; 32]> {
-    let cwd = std::env::current_dir()
-        .context("failed to read current directory for protected approval binding")?;
-    let cwd = cwd
-        .to_str()
-        .context("current directory must be valid UTF-8 for protected approval binding")?;
-    let path = std::env::var_os("PATH")
-        .map(|value| {
-            value
-                .into_string()
-                .map_err(|_| anyhow!("PATH must be valid UTF-8 for protected approval binding"))
-        })
-        .transpose()?
-        .unwrap_or_default();
-    let mut fields = Vec::with_capacity(4 + command_fields.len());
-    fields.push(b"deliver-run".as_slice());
-    fields.push(env_name.as_bytes());
-    fields.push(cwd.as_bytes());
-    fields.push(path.as_bytes());
-    fields.extend(command_fields.iter().map(Vec::as_slice));
-    Ok(BlindBoxContext::operation_hash(&fields))
-}
-
-fn os_command_fields(command: &[OsString]) -> anyhow::Result<Vec<Vec<u8>>> {
-    command
-        .iter()
-        .map(|arg| {
-            arg.to_str()
-                .map(|value| value.as_bytes().to_vec())
-                .context("command arguments must be valid UTF-8 for protected approval binding")
-        })
-        .collect()
-}
-
-fn one_shot_fetch_operation_hash(request: &FetchRequest) -> anyhow::Result<[u8; 32]> {
-    let inject = canonical_fetch_inject(&request.inject);
-    let headers = canonical_fetch_headers(&request.headers);
-    let hosts = canonical_allowed_hosts(&request.allowed_hosts);
-    let body = request.body.as_deref().unwrap_or("");
-    Ok(BlindBoxContext::operation_hash(&[
-        b"deliver-fetch",
-        request.method.as_bytes(),
-        request.url.as_bytes(),
-        hosts.as_bytes(),
-        headers.as_slice(),
-        body.as_bytes(),
-        inject.as_bytes(),
-    ]))
-}
-
-fn canonical_fetch_inject(inject: &FetchInject) -> String {
-    match inject {
-        FetchInject::Bearer => "bearer".to_string(),
-        FetchInject::Header { name } => format!("header:{name}"),
-        FetchInject::Query { name } => format!("query:{name}"),
-    }
-}
-
-fn canonical_fetch_headers(headers: &BTreeMap<String, String>) -> Vec<u8> {
-    let mut out = Vec::new();
-    for (name, value) in headers {
-        push_operation_field(&mut out, name.as_bytes());
-        push_operation_field(&mut out, value.as_bytes());
-    }
-    out
-}
-
-fn canonical_allowed_hosts(hosts: &[String]) -> String {
-    hosts
-        .iter()
-        .map(|host| host.to_ascii_lowercase())
-        .collect::<Vec<_>>()
-        .join("\0")
-}
-
-fn push_operation_field(out: &mut Vec<u8>, value: &[u8]) {
-    let len = u32::try_from(value.len()).expect("operation field length fits u32");
-    out.extend_from_slice(&len.to_be_bytes());
-    out.extend_from_slice(value);
-}
-
-fn one_shot_inject_operation_hash(
-    target_name: &str,
-    format: &str,
-    path: &Path,
-) -> anyhow::Result<[u8; 32]> {
-    let resolved_path = resolve_inject_approval_path(path)?;
-    let path = resolved_path
-        .to_str()
-        .context("inject path must be valid UTF-8 for protected approval binding")?;
-    Ok(BlindBoxContext::operation_hash(&[
-        b"deliver-inject",
-        target_name.as_bytes(),
-        format.as_bytes(),
-        path.as_bytes(),
-    ]))
-}
-
-fn resolve_inject_approval_path(path: &Path) -> anyhow::Result<PathBuf> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .context("failed to read current directory for protected approval binding")?
-            .join(path)
-    };
-    if let Ok(canonical) = absolute.canonicalize() {
-        return Ok(canonical);
-    }
-    let parent = absolute
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty());
-    let parent = match parent {
-        Some(parent) => parent
-            .canonicalize()
-            .with_context(|| "inject path parent must exist for protected approval binding")?,
-        None => std::env::current_dir()
-            .context("failed to read current directory for protected approval binding")?,
-    };
-    let file_name = absolute
-        .file_name()
-        .context("inject path must include a file name for protected approval binding")?;
-    Ok(parent.join(file_name))
-}
-
-fn one_shot_sign_operation_hash(scheme: &str, digest: &[u8; 32]) -> [u8; 32] {
-    BlindBoxContext::operation_hash(&[b"sign", scheme.as_bytes(), digest.as_slice()])
-}
-
 #[cfg(unix)]
 fn agent_deliver_operation_hash(name: &str, ttl_secs: u64) -> [u8; 32] {
     let ttl_secs = ttl_secs.to_be_bytes();
@@ -657,12 +497,7 @@ fn deliver_run_cmd(
         if secrets.is_empty() {
             bail!("deliver run requires at least one secret");
         }
-        let command_fields = if secrets.iter().any(|secret| secret.dek_blindbox.is_some()) {
-            Some(os_command_fields(command)?)
-        } else {
-            None
-        };
-        let opened = open_env_secrets(secrets, &unlock, command_fields.as_deref())?;
+        let opened = open_env_secrets(secrets, &unlock)?;
         drop(unlock);
         run_child_with_opened_env(command, opened, true)
     } else {
@@ -678,7 +513,7 @@ fn deliver_run_cmd(
             dek_blindbox: None,
             approval: None,
         }];
-        let opened = open_env_secrets(secrets, &unlock, None)?;
+        let opened = open_env_secrets(secrets, &unlock)?;
         drop(unlock);
         run_child_with_opened_env(command, opened, envelope_stdin)
     }
@@ -761,6 +596,7 @@ struct FetchOutput {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct InjectInput {
     path: PathBuf,
     #[serde(default = "default_inject_format")]
@@ -786,7 +622,7 @@ fn run_child_with_opened_env(
     opened: Vec<OpenedSecret>,
     envelope_stdin: bool,
 ) -> anyhow::Result<u8> {
-    let mut child = spawn_child_with_opened_env(command, opened, envelope_stdin)?;
+    let mut child = spawn_child_with_opened_env(command, opened, envelope_stdin, true)?;
     let status = child.wait().context("failed to wait for child command")?;
     Ok(status_to_exit_code(status))
 }
@@ -795,10 +631,14 @@ fn spawn_child_with_opened_env(
     command: &[OsString],
     mut opened: Vec<OpenedSecret>,
     envelope_stdin: bool,
+    inherit_env: bool,
 ) -> anyhow::Result<std::process::Child> {
     let child = {
         let mut child = Command::new(&command[0]);
         child.args(&command[1..]);
+        if !inherit_env {
+            child.env_clear();
+        }
         for secret in &opened {
             let env_value = std::str::from_utf8(secret.plaintext.as_slice())
                 .context("secret value is not valid UTF-8 for env delivery")?;
@@ -830,7 +670,7 @@ fn run_agent_child_with_opened_env(
     envelope_stdin: bool,
     state: &mut AgentState,
 ) -> anyhow::Result<u8> {
-    let mut child = spawn_child_with_opened_env(command, opened, envelope_stdin)?;
+    let mut child = spawn_child_with_opened_env(command, opened, envelope_stdin, false)?;
     loop {
         state.purge();
         if let Some(status) = child
@@ -846,7 +686,6 @@ fn run_agent_child_with_opened_env(
 fn open_env_secrets(
     secrets: Vec<EnvSecretInput>,
     unlock: &StoreUnlock,
-    command_fields: Option<&[Vec<u8>]>,
 ) -> anyhow::Result<Vec<OpenedSecret>> {
     let mut opened = Vec::with_capacity(secrets.len());
     let mut seen = BTreeSet::new();
@@ -861,14 +700,6 @@ fn open_env_secrets(
             &secret.envelope,
             secret.dek_blindbox.as_ref(),
             secret.approval.as_ref(),
-            if secret.dek_blindbox.is_some() {
-                Some(one_shot_run_operation_hash(
-                    &secret.env,
-                    command_fields.context("protected delivery requires command binding")?,
-                )?)
-            } else {
-                None
-            },
             unlock,
             Some(&master),
         )
@@ -886,55 +717,31 @@ fn open_one_shot_secret(
     envelope: &Sealed,
     dek_blindbox: Option<&BlindBox>,
     approval: Option<&ApprovalContextInput>,
-    operation_hash: Option<[u8; 32]>,
     unlock: &StoreUnlock,
     loaded_master: Option<&MasterKey>,
 ) -> anyhow::Result<Zeroizing<Vec<u8>>> {
-    if let Some(dek_blindbox) = dek_blindbox {
-        let approval = approval
-            .map(parse_approval_context)
-            .transpose()?
-            .context("protected DEK blind-box requires approval")?;
-        let operation_hash =
-            operation_hash.context("protected DEK blind-box requires operation")?;
-        validate_approval_not_expired(approval.expires_at_unix)?;
-        let master;
-        let master = match loaded_master {
-            Some(master) => master,
-            None => {
-                master = load_existing_master_from_unlock(unlock)?;
-                &master
-            }
-        };
-        let keypair = avault_core::derive_blind_box_keypair_from_master(master.as_bytes());
-        let context = BlindBoxContext::deliver(name)
-            .with_approval(&approval.nonce, approval.expires_at_unix)
-            .with_operation_hash(operation_hash);
-        let dek_plaintext = keypair
-            .open(dek_blindbox, &context)
-            .context("DEK blind-box open failed")?;
-        drop(keypair);
-        let dek = zeroizing_vec_to_key32(dek_plaintext, "released DEK")?;
-        let opened =
-            avault_core::open_with_dek(&dek, name, envelope).context("envelope open failed")?;
-        drop(dek);
-        Ok(opened)
-    } else {
-        if approval.is_some() || operation_hash.is_some() {
-            bail!("approval metadata requires a protected DEK blind-box");
+    reject_one_shot_protected_fields(dek_blindbox, approval)?;
+    let master;
+    let master = match loaded_master {
+        Some(master) => master,
+        None => {
+            master = load_existing_master_from_unlock(unlock)?;
+            &master
         }
-        let master;
-        let master = match loaded_master {
-            Some(master) => master,
-            None => {
-                master = load_existing_master_from_unlock(unlock)?;
-                &master
-            }
-        };
-        let opened =
-            avault_core::open(master.as_bytes(), name, envelope).context("envelope open failed")?;
-        Ok(opened)
+    };
+    let opened =
+        avault_core::open(master.as_bytes(), name, envelope).context("envelope open failed")?;
+    Ok(opened)
+}
+
+fn reject_one_shot_protected_fields(
+    dek_blindbox: Option<&BlindBox>,
+    approval: Option<&ApprovalContextInput>,
+) -> anyhow::Result<()> {
+    if dek_blindbox.is_some() || approval.is_some() {
+        bail!("protected DEK blind boxes require the resident agent");
     }
+    Ok(())
 }
 
 impl Zeroize for OpenedSecret {
@@ -963,11 +770,6 @@ fn deliver_fetch_cmd(
         &fetch.envelope,
         fetch.dek_blindbox.as_ref(),
         fetch.approval.as_ref(),
-        if fetch.dek_blindbox.is_some() {
-            Some(one_shot_fetch_operation_hash(&fetch.request)?)
-        } else {
-            None
-        },
         &unlock,
         None,
     )
@@ -1014,13 +816,13 @@ fn execute_fetch_request(
 ) -> anyhow::Result<FetchOutput> {
     let mut secret_header: Option<(String, Zeroizing<String>)> = None;
     let mut target_url = Zeroizing::new(request.url.clone());
-    let mut redaction_needle: Option<Zeroizing<Vec<u8>>> = None;
+    let mut redaction_needles: Vec<Zeroizing<Vec<u8>>> = Vec::new();
     match &request.inject {
         FetchInject::Bearer => {
             let credential =
                 fetch_header_credential_bytes(secret.as_slice(), "fetch bearer credential")?;
             if !credential.is_empty() {
-                redaction_needle = Some(Zeroizing::new(credential.to_vec()));
+                redaction_needles.push(Zeroizing::new(credential.to_vec()));
             }
             let secret_text = std::str::from_utf8(credential)
                 .context("fetch bearer credential is not valid UTF-8")?;
@@ -1034,7 +836,7 @@ fn execute_fetch_request(
             let credential =
                 fetch_header_credential_bytes(secret.as_slice(), "fetch header credential")?;
             if !credential.is_empty() {
-                redaction_needle = Some(Zeroizing::new(credential.to_vec()));
+                redaction_needles.push(Zeroizing::new(credential.to_vec()));
             }
             let secret_text = std::str::from_utf8(credential)
                 .context("fetch header credential is not valid UTF-8")?;
@@ -1043,7 +845,11 @@ fn execute_fetch_request(
         FetchInject::Query { name } => {
             let secret_text = secret_utf8(secret.as_slice(), "fetch query credential")?;
             if !secret.is_empty() {
-                redaction_needle = Some(Zeroizing::new(secret.as_slice().to_vec()));
+                redaction_needles.push(Zeroizing::new(secret.as_slice().to_vec()));
+                let mut encoded =
+                    Zeroizing::new(String::with_capacity(encoded_query_len(secret_text)));
+                push_query_encoded(&mut encoded, secret_text);
+                redaction_needles.push(Zeroizing::new(encoded.as_bytes().to_vec()));
             }
             target_url = build_secret_query_url(&request.url, name, secret_text)?;
         }
@@ -1057,10 +863,10 @@ fn execute_fetch_request(
         secret_header,
         request.body,
         is_loopback,
-        redaction_needle.as_deref().map(Vec::as_slice),
+        redaction_needles.as_slice(),
     )
     .context("fetch request failed")?;
-    drop(redaction_needle);
+    drop(redaction_needles);
     Ok(output)
 }
 
@@ -1079,7 +885,7 @@ fn perform_fetch(
     mut secret_header: Option<(String, Zeroizing<String>)>,
     body: Option<String>,
     is_loopback: bool,
-    redaction_needle: Option<&[u8]>,
+    redaction_needles: &[Zeroizing<Vec<u8>>],
 ) -> anyhow::Result<FetchOutput> {
     let method = method.to_ascii_uppercase();
     let connect_timeout = Duration::from_secs(FETCH_CONNECT_TIMEOUT_SECS);
@@ -1123,10 +929,12 @@ fn perform_fetch(
     let mut response_headers = BTreeMap::new();
     for name in response.headers_names() {
         if let Some(value) = response.header(&name) {
-            response_headers.insert(name, redact_fetch_header_value(value, redaction_needle)?);
+            let name = redact_fetch_header_text(&name, redaction_needles)?;
+            let value = redact_fetch_header_text(value, redaction_needles)?;
+            response_headers.insert(name, value);
         }
     }
-    let body = read_capped_fetch_body(response, redaction_needle)?;
+    let body = read_capped_fetch_body(response, redaction_needles)?;
     Ok(FetchOutput {
         status,
         headers: response_headers,
@@ -1136,7 +944,7 @@ fn perform_fetch(
 
 fn read_capped_fetch_body(
     response: ureq::Response,
-    redaction_needle: Option<&[u8]>,
+    redaction_needles: &[Zeroizing<Vec<u8>>],
 ) -> anyhow::Result<String> {
     let mut reader = response
         .into_reader()
@@ -1148,7 +956,7 @@ fn read_capped_fetch_body(
     if body.len() > MAX_FETCH_BODY_BYTES {
         bail!("fetch response body exceeds size limit");
     }
-    redact_fetch_body(&mut body, redaction_needle)?;
+    redact_fetch_body(&mut body, redaction_needles)?;
     match String::from_utf8(std::mem::take(&mut *body)) {
         Ok(body) => Ok(body),
         Err(err) => {
@@ -1159,9 +967,12 @@ fn read_capped_fetch_body(
     }
 }
 
-fn redact_fetch_body(body: &mut Vec<u8>, redaction_needle: Option<&[u8]>) -> anyhow::Result<()> {
-    if let Some(needle) = redaction_needle {
-        redact_verbatim_bytes(body, needle)?;
+fn redact_fetch_body(
+    body: &mut Vec<u8>,
+    redaction_needles: &[Zeroizing<Vec<u8>>],
+) -> anyhow::Result<()> {
+    for needle in redaction_needles {
+        redact_verbatim_bytes(body, needle.as_slice())?;
     }
     Ok(())
 }
@@ -1200,23 +1011,23 @@ fn redact_verbatim_bytes(body: &mut Vec<u8>, needle: &[u8]) -> anyhow::Result<()
     Ok(())
 }
 
-fn redact_fetch_header_value(
+fn redact_fetch_header_text(
     value: &str,
-    redaction_needle: Option<&[u8]>,
+    redaction_needles: &[Zeroizing<Vec<u8>>],
 ) -> anyhow::Result<String> {
-    let Some(needle) = redaction_needle else {
-        return Ok(value.to_string());
-    };
-    if needle.is_empty()
-        || !value
-            .as_bytes()
-            .windows(needle.len())
-            .any(|window| window == needle)
-    {
+    if redaction_needles.iter().all(|needle| {
+        needle.is_empty()
+            || !value
+                .as_bytes()
+                .windows(needle.len())
+                .any(|window| window == needle.as_slice())
+    }) {
         return Ok(value.to_string());
     }
     let mut bytes = value.as_bytes().to_vec();
-    redact_verbatim_bytes(&mut bytes, needle)?;
+    for needle in redaction_needles {
+        redact_verbatim_bytes(&mut bytes, needle.as_slice())?;
+    }
     match String::from_utf8(bytes) {
         Ok(value) => Ok(value),
         Err(err) => {
@@ -1274,7 +1085,7 @@ fn deliver_inject_cmd(
         bail!("deliver inject format is not implemented in P1.1");
     }
 
-    let mut opened = open_named_secrets(inject.secrets, &unlock, &inject.path, &format)?;
+    let mut opened = open_named_secrets(inject.secrets, &unlock)?;
     drop(unlock);
     let mut rendered = render_inject_file(&opened, &format)?;
     opened.zeroize();
@@ -1290,8 +1101,6 @@ fn deliver_inject_cmd(
 fn open_named_secrets(
     secrets: Vec<NamedSecretInput>,
     unlock: &StoreUnlock,
-    inject_path: &Path,
-    format: &str,
 ) -> anyhow::Result<Vec<OpenedSecret>> {
     let mut opened = Vec::with_capacity(secrets.len());
     let mut seen = BTreeSet::new();
@@ -1310,15 +1119,6 @@ fn open_named_secrets(
             &secret.envelope,
             secret.dek_blindbox.as_ref(),
             secret.approval.as_ref(),
-            if secret.dek_blindbox.is_some() {
-                Some(one_shot_inject_operation_hash(
-                    &target_name,
-                    format,
-                    inject_path,
-                )?)
-            } else {
-                None
-            },
             unlock,
             Some(&master),
         )
@@ -2155,6 +1955,21 @@ impl AgentState {
             .retain(|_, expires_at| *expires_at > now);
     }
 
+    fn purge_before_blocking(&mut self, max_block: Duration) {
+        self.purge();
+        let now = Instant::now();
+        let idle_age = now.duration_since(self.last_activity);
+        if idle_age
+            .checked_add(max_block)
+            .map_or(true, |age| age >= self.idle_timeout)
+        {
+            self.grants.clear();
+        }
+        let expiry_cutoff = now.checked_add(max_block).unwrap_or(now);
+        self.grants
+            .retain(|_, grant| grant.expires_at > expiry_cutoff);
+    }
+
     fn get_grant(&mut self, scope: &GrantKey) -> anyhow::Result<&GrantEntry> {
         self.purge();
         self.grants
@@ -2189,6 +2004,7 @@ enum AgentRequest {
 
 #[cfg(unix)]
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AgentScopeRequest {
     scope_type: String,
     scope_ref: String,
@@ -2196,6 +2012,7 @@ struct AgentScopeRequest {
 
 #[cfg(unix)]
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AgentGrantRequest {
     scope_type: String,
     scope_ref: String,
@@ -2205,6 +2022,7 @@ struct AgentGrantRequest {
 
 #[cfg(unix)]
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AgentDekInput {
     name: String,
     dek_blindbox: BlindBox,
@@ -2222,6 +2040,10 @@ struct AgentDekInput {
 struct AgentDeliverRequest {
     scope_type: String,
     scope_ref: String,
+    #[serde(default)]
+    dek_blindbox: Option<serde_json::Value>,
+    #[serde(default)]
+    approval: Option<serde_json::Value>,
     #[serde(flatten)]
     mode: AgentDeliverMode,
 }
@@ -2230,20 +2052,31 @@ struct AgentDeliverRequest {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 enum AgentDeliverMode {
-    Run {
-        command: Vec<String>,
-        secrets: Vec<EnvSecretInput>,
-    },
-    Fetch {
-        name: String,
-        envelope: Sealed,
-        request: FetchRequest,
-    },
+    Run(AgentRunDeliverInput),
+    Fetch(AgentFetchDeliverInput),
     Inject(InjectInput),
 }
 
 #[cfg(unix)]
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentRunDeliverInput {
+    command: Vec<String>,
+    secrets: Vec<EnvSecretInput>,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentFetchDeliverInput {
+    name: String,
+    envelope: Sealed,
+    request: FetchRequest,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AgentSignRequest {
     scope_type: String,
     scope_ref: String,
@@ -2375,12 +2208,39 @@ fn bind_agent_socket(path: &Path) -> anyhow::Result<UnixListener> {
 #[cfg(unix)]
 fn ensure_agent_socket_parent(parent: &Path) -> anyhow::Result<()> {
     if !parent.exists() {
-        fs::create_dir_all(parent).context("failed to create agent runtime directory")?;
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-            .context("failed to secure agent runtime directory")?;
-        return Ok(());
+        let mut missing = Vec::new();
+        let mut current = parent;
+        while !current.exists() {
+            missing.push(current.to_path_buf());
+            current = match current.parent() {
+                Some(next) if !next.as_os_str().is_empty() => next,
+                _ => Path::new("."),
+            };
+        }
+        for dir in missing.iter().rev() {
+            match fs::create_dir(dir) {
+                Ok(()) => secure_agent_runtime_directory(dir)?,
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    validate_agent_runtime_directory(dir)?
+                }
+                Err(err) => return Err(err).context("failed to create agent runtime directory"),
+            }
+        }
     }
-    let metadata = fs::metadata(parent).context("failed to stat agent runtime directory")?;
+    validate_agent_runtime_directory(parent)?;
+    validate_agent_home_ancestors(parent)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn secure_agent_runtime_directory(path: &Path) -> anyhow::Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .context("failed to secure agent runtime directory")
+}
+
+#[cfg(unix)]
+fn validate_agent_runtime_directory(path: &Path) -> anyhow::Result<()> {
+    let metadata = fs::metadata(path).context("failed to stat agent runtime directory")?;
     if !metadata.is_dir() {
         bail!("agent runtime path parent is not a directory");
     }
@@ -2389,6 +2249,25 @@ fn ensure_agent_socket_parent(parent: &Path) -> anyhow::Result<()> {
     }
     if metadata.permissions().mode() & 0o077 != 0 {
         bail!("agent runtime directory mode is too open");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_agent_home_ancestors(parent: &Path) -> anyhow::Result<()> {
+    let Ok(home) = user_home_dir() else {
+        return Ok(());
+    };
+    let mut current = parent.parent();
+    while let Some(path) = current {
+        if path == home {
+            break;
+        }
+        if !path.starts_with(&home) {
+            break;
+        }
+        validate_agent_runtime_directory(path)?;
+        current = path.parent();
     }
     Ok(())
 }
@@ -2535,13 +2414,17 @@ fn handle_agent_frame_inner(
         AgentRequest::Release(request) | AgentRequest::Revoke(request) => {
             let key = grant_key_from_scope(request)?;
             let released = state.grants.remove(&key).is_some();
-            Ok((agent_ok(AgentReleaseOutput { released })?, true))
+            Ok((agent_ok(AgentReleaseOutput { released })?, released))
         }
         AgentRequest::Deliver(request) => {
+            reject_agent_one_shot_request_fields(
+                request.dek_blindbox.as_ref(),
+                request.approval.as_ref(),
+            )?;
             let scope = grant_key_from_parts(request.scope_type, request.scope_ref)?;
             let grant = state.get_grant(&scope)?;
             match request.mode {
-                AgentDeliverMode::Run { command, secrets } => {
+                AgentDeliverMode::Run(AgentRunDeliverInput { command, secrets }) => {
                     if command.is_empty() {
                         bail!("deliver run requires a command");
                     }
@@ -2553,11 +2436,11 @@ fn handle_agent_frame_inner(
                     let exit_code = run_agent_child_with_opened_env(&command, opened, true, state)?;
                     Ok((agent_ok(AgentRunOutput { exit_code })?, true))
                 }
-                AgentDeliverMode::Fetch {
+                AgentDeliverMode::Fetch(AgentFetchDeliverInput {
                     name,
                     envelope,
                     request,
-                } => {
+                }) => {
                     let fetch = FetchInput {
                         name,
                         envelope,
@@ -2568,6 +2451,7 @@ fn handle_agent_frame_inner(
                     let (_url, is_loopback) = validate_fetch_input(&fetch)?;
                     let mut secret = open_secret_with_grant(&fetch.name, &fetch.envelope, grant)
                         .context("open failed")?;
+                    state.purge_before_blocking(Duration::from_secs(FETCH_TOTAL_TIMEOUT_SECS));
                     let output = execute_fetch_request(fetch.request, &mut secret, is_loopback)
                         .context("fetch request failed")?;
                     secret.zeroize();
@@ -2683,6 +2567,17 @@ fn open_named_secrets_with_grant(
 fn reject_agent_one_shot_secret_fields(
     dek_blindbox: Option<&BlindBox>,
     approval: Option<&ApprovalContextInput>,
+) -> anyhow::Result<()> {
+    if dek_blindbox.is_some() || approval.is_some() {
+        bail!("agent delivery uses cached grants and rejects one-shot DEK fields");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn reject_agent_one_shot_request_fields(
+    dek_blindbox: Option<&serde_json::Value>,
+    approval: Option<&serde_json::Value>,
 ) -> anyhow::Result<()> {
     if dek_blindbox.is_some() || approval.is_some() {
         bail!("agent delivery uses cached grants and rejects one-shot DEK fields");
@@ -2996,7 +2891,8 @@ mod tests {
     fn redacted_fetch_body_enforces_size_cap_after_growth() {
         let mut body = vec![b'b'; MAX_FETCH_BODY_BYTES];
         body[0] = b'a';
+        let needles = [Zeroizing::new(b"a".to_vec())];
 
-        assert!(redact_fetch_body(&mut body, Some(b"a")).is_err());
+        assert!(redact_fetch_body(&mut body, &needles).is_err());
     }
 }

@@ -24,9 +24,7 @@ pub const BLIND_BOX_AAD_DOMAIN: &[u8] = b"avault:blind-box:aad:v1";
 const CLI_DERIVED_RECEIVER_SALT: &[u8] = b"avault:blind-box:receiver-salt:v1";
 const CLI_DERIVED_RECEIVER_INFO: &[u8] = b"avault:blind-box:receiver-x25519:v1";
 const BLIND_BOX_PURPOSE_SEAL: &str = "seal";
-const BLIND_BOX_PURPOSE_DELIVER: &str = "deliver";
 const BLIND_BOX_PURPOSE_AGENT_DELIVER: &str = "agent-deliver";
-const BLIND_BOX_PURPOSE_SIGN: &str = "sign";
 const BLIND_BOX_PURPOSE_AGENT_SIGN: &str = "agent-sign";
 
 /// Browser-to-avault blind box.
@@ -66,19 +64,9 @@ impl BlindBoxContext {
         Self::new(BLIND_BOX_PURPOSE_SEAL, name)
     }
 
-    /// Context for one-shot protected delivery with a DEK blind box.
-    pub fn deliver(name: &str) -> Self {
-        Self::new(BLIND_BOX_PURPOSE_DELIVER, name)
-    }
-
     /// Context for an agent grant that caches a delivery DEK under a scope.
     pub fn agent_deliver(scope_type: &str, scope_ref: &str, name: &str) -> Self {
         Self::new(BLIND_BOX_PURPOSE_AGENT_DELIVER, name).with_scope(scope_type, scope_ref)
-    }
-
-    /// Context for one-shot protected signing with a DEK blind box.
-    pub fn sign(name: &str, sign_scheme: &str, digest: &[u8; KEY_BYTES]) -> Self {
-        Self::new(BLIND_BOX_PURPOSE_SIGN, name).with_signing(sign_scheme, digest)
     }
 
     /// Context for an agent grant that caches a signing DEK for one approved digest.
@@ -417,12 +405,6 @@ mod tests {
             let digest_hex = case["digest_hex"].as_str().unwrap();
             let mut context = match purpose {
                 "seal" => BlindBoxContext::seal(name),
-                "deliver" => BlindBoxContext::deliver(name),
-                "sign" => {
-                    let digest: [u8; KEY_BYTES] =
-                        hex::decode(digest_hex).unwrap().try_into().unwrap();
-                    BlindBoxContext::sign(name, sign_scheme, &digest)
-                }
                 "agent-deliver" => BlindBoxContext::agent_deliver(scope_type, scope_ref, name),
                 "agent-sign" => {
                     let digest: [u8; KEY_BYTES] =
@@ -480,11 +462,14 @@ mod tests {
     #[test]
     fn rejects_wrong_blind_box_context() {
         let keypair = derive_blind_box_keypair_from_master(&MASTER_KEY);
-        let context = BlindBoxContext::sign(
+        let context = BlindBoxContext::agent_sign(
+            "session",
+            "scope-a",
             "SIGNING_KEY",
             "ecdsa-secp256k1-recoverable",
             &[0x11u8; KEY_BYTES],
-        );
+        )
+        .with_approval(b"0123456789abcdef", 4_102_444_800);
         let blind_box = seal_blind_box_for_tests(
             &keypair.public_key_b64(),
             b"blind secret",
@@ -492,14 +477,21 @@ mod tests {
             &context,
         )
         .unwrap();
-        let wrong_digest = BlindBoxContext::sign(
+        let wrong_digest = BlindBoxContext::agent_sign(
+            "session",
+            "scope-a",
             "SIGNING_KEY",
             "ecdsa-secp256k1-recoverable",
             &[0x22u8; KEY_BYTES],
-        );
+        )
+        .with_approval(b"0123456789abcdef", 4_102_444_800);
         assert!(keypair.open(&blind_box, &wrong_digest).is_err());
         assert!(keypair
-            .open(&blind_box, &BlindBoxContext::deliver("SIGNING_KEY"))
+            .open(
+                &blind_box,
+                &BlindBoxContext::agent_deliver("session", "scope-a", "SIGNING_KEY")
+                    .with_approval(b"0123456789abcdef", 4_102_444_800),
+            )
             .is_err());
     }
 

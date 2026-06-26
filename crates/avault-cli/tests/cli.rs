@@ -764,7 +764,7 @@ fn sign_matches_shared_vectors_for_all_schemes() {
 }
 
 #[test]
-fn protected_sign_uses_dek_blindbox() {
+fn one_shot_sign_rejects_protected_dek_blindbox() {
     let home = tempfile::tempdir().unwrap();
     write_p0_master(&home.path().join("vault"));
     let vector = p2_vectors();
@@ -794,12 +794,6 @@ fn protected_sign_uses_dek_blindbox() {
             approval_expires_at,
         ),
     );
-    let expected = signing["schemes"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|scheme| scheme["scheme"] == "ecdsa-secp256k1-der")
-        .unwrap();
     let request = json!({
         "name": "PROTECTED_KEY",
         "key_envelope": key_envelope,
@@ -812,7 +806,7 @@ fn protected_sign_uses_dek_blindbox() {
         .arg("sign")
         .env("AVAULT_HOME", home.path().join("vault"))
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     sign.stdin
@@ -821,14 +815,12 @@ fn protected_sign_uses_dek_blindbox() {
         .write_all(request.to_string().as_bytes())
         .unwrap();
     let output = sign.wait_with_output().unwrap();
-    assert!(output.status.success());
-    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(response["signature"], expected["signature_hex"]);
-    assert_eq!(response["recovery_id"], serde_json::Value::Null);
+    assert_eq!(output.status.code(), Some(70));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("resident agent"));
 }
 
 #[test]
-fn protected_deliver_run_uses_dek_blindbox() {
+fn one_shot_deliver_run_rejects_protected_dek_blindbox() {
     let home = tempfile::tempdir().unwrap();
     write_p0_master(&home.path().join("vault"));
     let dek = [0x7bu8; 32];
@@ -875,132 +867,6 @@ fn protected_deliver_run_uses_dek_blindbox() {
         .args(command)
         .env("AVAULT_HOME", home.path().join("vault"))
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    deliver
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(request.to_string().as_bytes())
-        .unwrap();
-    let output = deliver.wait_with_output().unwrap();
-    assert!(output.status.success());
-    assert_eq!(output.stdout, b"ok");
-}
-
-#[test]
-fn protected_deliver_rejects_replayed_blindbox_for_different_command() {
-    let home = tempfile::tempdir().unwrap();
-    write_p0_master(&home.path().join("vault"));
-    let dek = [0x7cu8; 32];
-    let envelope = envelope_encrypted_with_dek("PROTECTED_VALUE", &dek, b"protected-run");
-    let pubkey_output = avault()
-        .arg("pubkey")
-        .env("AVAULT_HOME", home.path().join("vault"))
-        .stdout(Stdio::piped())
-        .output()
-        .unwrap();
-    assert!(pubkey_output.status.success());
-    let pubkey: serde_json::Value = serde_json::from_slice(&pubkey_output.stdout).unwrap();
-    let approval_nonce = b"replayed-run-001";
-    let approval_expires_at = future_expiry();
-    let approved_command = ["/bin/sh", "-c", "printf approved"];
-    let replayed_command = ["/bin/sh", "-c", "printf replayed"];
-    let dek_blindbox = fixed_blind_box(
-        pubkey["public_key"].as_str().unwrap(),
-        &dek,
-        &aad_deliver(
-            "PROTECTED_VALUE",
-            approval_nonce,
-            approval_expires_at,
-            &run_operation_hash("SECRET_VALUE", &approved_command),
-        ),
-    );
-    let request = json!([
-        {
-            "name": "PROTECTED_VALUE",
-            "env": "SECRET_VALUE",
-            "envelope": envelope,
-            "dek_blindbox": dek_blindbox,
-            "approval": approval_json(approval_nonce, approval_expires_at)
-        }
-    ]);
-
-    let mut deliver = avault()
-        .arg("deliver")
-        .arg("run")
-        .arg("--")
-        .args(replayed_command)
-        .env("AVAULT_HOME", home.path().join("vault"))
-        .stdin(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    deliver
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(request.to_string().as_bytes())
-        .unwrap();
-    let output = deliver.wait_with_output().unwrap();
-    assert!(!output.status.success());
-    assert_eq!(output.status.code(), Some(70));
-}
-
-#[test]
-fn protected_deliver_rejects_replayed_blindbox_for_different_cwd() {
-    let home = tempfile::tempdir().unwrap();
-    let approved_cwd = tempfile::tempdir().unwrap();
-    let replay_cwd = tempfile::tempdir().unwrap();
-    write_p0_master(&home.path().join("vault"));
-    let dek = [0x7eu8; 32];
-    let envelope = envelope_encrypted_with_dek("PROTECTED_VALUE", &dek, b"protected-run");
-    let pubkey_output = avault()
-        .arg("pubkey")
-        .env("AVAULT_HOME", home.path().join("vault"))
-        .stdout(Stdio::piped())
-        .output()
-        .unwrap();
-    assert!(pubkey_output.status.success());
-    let pubkey: serde_json::Value = serde_json::from_slice(&pubkey_output.stdout).unwrap();
-    let approval_nonce = b"replayed-cwd-0001";
-    let approval_expires_at = future_expiry();
-    let command = ["/bin/sh", "-c", "printf replayed"];
-    let path = std::env::var("PATH").unwrap_or_default();
-    let dek_blindbox = fixed_blind_box(
-        pubkey["public_key"].as_str().unwrap(),
-        &dek,
-        &aad_deliver(
-            "PROTECTED_VALUE",
-            approval_nonce,
-            approval_expires_at,
-            &run_operation_hash_with_context(
-                "SECRET_VALUE",
-                &command,
-                approved_cwd.path().to_str().unwrap(),
-                &path,
-            ),
-        ),
-    );
-    let request = json!([
-        {
-            "name": "PROTECTED_VALUE",
-            "env": "SECRET_VALUE",
-            "envelope": envelope,
-            "dek_blindbox": dek_blindbox,
-            "approval": approval_json(approval_nonce, approval_expires_at)
-        }
-    ]);
-
-    let mut deliver = avault()
-        .arg("deliver")
-        .arg("run")
-        .arg("--")
-        .args(command)
-        .current_dir(replay_cwd.path())
-        .env("AVAULT_HOME", home.path().join("vault"))
-        .stdin(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
@@ -1012,6 +878,7 @@ fn protected_deliver_rejects_replayed_blindbox_for_different_cwd() {
         .unwrap();
     let output = deliver.wait_with_output().unwrap();
     assert_eq!(output.status.code(), Some(70));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("resident agent"));
 }
 
 #[test]
@@ -1508,6 +1375,84 @@ fn agent_deliver_rejects_one_shot_dek_fields() {
 }
 
 #[test]
+fn agent_deliver_fetch_rejects_one_shot_dek_fields() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("run").join("avault.sock");
+    let mut agent = spawn_agent(&socket, 60);
+    let mut stream = connect_agent(&socket);
+    let pubkey = agent_request(&mut stream, json!({"type": "pubkey"}));
+    let public_key = pubkey["result"]["public_key"].as_str().unwrap();
+    let dek = [0x5au8; 32];
+    let approval_nonce = b"agent-fetch-grnt";
+    let approval_expires_at = future_expiry();
+    let grant = agent_request(
+        &mut stream,
+        json!({
+            "type": "grant",
+            "scope_type": "session",
+            "scope_ref": "mixed-fetch",
+            "ttl_secs": 60,
+            "deks": [
+                {
+                    "name": "API_TOKEN",
+                    "dek_blindbox": fixed_blind_box(
+                        public_key,
+                        &dek,
+                        &aad_agent_deliver(
+                            "session",
+                            "mixed-fetch",
+                            "API_TOKEN",
+                            approval_nonce,
+                            approval_expires_at,
+                            60
+                        )
+                    ),
+                    "approval": approval_json(approval_nonce, approval_expires_at)
+                }
+            ]
+        }),
+    );
+    assert_eq!(grant["ok"], true);
+
+    let envelope = envelope_encrypted_with_dek("API_TOKEN", &dek, b"agent-secret");
+    let request_spec = json!({
+        "method": "GET",
+        "url": "http://127.0.0.1:9/resource",
+        "allowed_hosts": ["127.0.0.1"],
+        "inject": {"type": "bearer"}
+    });
+    let one_shot_nonce = b"agent-fetch-one";
+    let rejected = agent_request(
+        &mut stream,
+        json!({
+            "type": "deliver",
+            "scope_type": "session",
+            "scope_ref": "mixed-fetch",
+            "mode": "fetch",
+            "name": "API_TOKEN",
+            "envelope": envelope,
+            "request": request_spec,
+            "dek_blindbox": fixed_blind_box(
+                public_key,
+                &dek,
+                &aad_deliver(
+                    "API_TOKEN",
+                    one_shot_nonce,
+                    approval_expires_at,
+                    &fetch_operation_hash(&request_spec)
+                )
+            ),
+            "approval": approval_json(one_shot_nonce, approval_expires_at)
+        }),
+    );
+    assert_eq!(rejected["ok"], false);
+    assert!(!rejected["error"].as_str().unwrap().is_empty());
+
+    let _ = agent.kill();
+    let _ = agent.wait();
+}
+
+#[test]
 fn agent_signs_with_cached_dek_grant() {
     let tmp = tempfile::tempdir().unwrap();
     let socket = tmp.path().join("run").join("avault.sock");
@@ -1708,6 +1653,76 @@ fn agent_pubkey_does_not_refresh_grant_idle_timeout() {
             "scope_ref": "idle-pubkey",
             "mode": "inject",
             "path": tmp.path().join("idle-pubkey.env"),
+            "format": "dotenv",
+            "secrets": [
+                {"name": "API_TOKEN", "key": "API_TOKEN", "envelope": envelope}
+            ]
+        }),
+    );
+    assert_eq!(denied["ok"], false);
+    assert!(denied["error"].as_str().unwrap().contains("grant"));
+
+    let _ = agent.kill();
+    let _ = agent.wait();
+}
+
+#[test]
+fn agent_missing_release_does_not_refresh_grant_idle_timeout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("run").join("avault.sock");
+    let mut agent = spawn_agent(&socket, 1);
+    let mut stream = connect_agent(&socket);
+    let pubkey = agent_request(&mut stream, json!({"type": "pubkey"}));
+    let public_key = pubkey["result"]["public_key"].as_str().unwrap();
+    let dek = [0x5bu8; 32];
+    let approval_nonce = b"agent-idle-rmss1";
+    let approval_expires_at = future_expiry();
+    let grant = agent_request(
+        &mut stream,
+        json!({
+            "type": "grant",
+            "scope_type": "session",
+            "scope_ref": "idle-release",
+            "ttl_secs": 60,
+            "deks": [
+                {
+                    "name": "API_TOKEN",
+                    "dek_blindbox": fixed_blind_box(
+                        public_key,
+                        &dek,
+                        &aad_agent_deliver(
+                            "session",
+                            "idle-release",
+                            "API_TOKEN",
+                            approval_nonce,
+                            approval_expires_at,
+                            60
+                        )
+                    ),
+                    "approval": approval_json(approval_nonce, approval_expires_at)
+                }
+            ]
+        }),
+    );
+    assert_eq!(grant["ok"], true);
+    thread::sleep(Duration::from_millis(600));
+    let missing_release = agent_request(
+        &mut stream,
+        json!({"type": "release", "scope_type": "session", "scope_ref": "missing-release"}),
+    );
+    assert_eq!(missing_release["ok"], true);
+    assert_eq!(missing_release["result"]["released"], false);
+    thread::sleep(Duration::from_millis(700));
+
+    let envelope = envelope_encrypted_with_dek("API_TOKEN", &dek, b"idle-cleared");
+    let denied = agent_request(
+        &mut stream,
+        json!({
+            "type": "deliver",
+            "scope_type": "session",
+            "scope_ref": "idle-release",
+            "mode": "inject",
+            "path": tmp.path().join("idle-release.env"),
             "format": "dotenv",
             "secrets": [
                 {"name": "API_TOKEN", "key": "API_TOKEN", "envelope": envelope}
@@ -2207,55 +2222,32 @@ fn deliver_fetch_redacts_verbatim_echoed_credential_header() {
 }
 
 #[test]
-fn protected_deliver_fetch_redacts_echoed_credential_header() {
+fn deliver_fetch_redacts_credential_echoed_in_header_name() {
     let home = tempfile::tempdir().unwrap();
-    write_p0_master(&home.path().join("vault"));
-    let dek = [0x7du8; 32];
-    let envelope = envelope_encrypted_with_dek("API_TOKEN", &dek, b"protected-token\n");
-    let pubkey_output = avault()
-        .arg("pubkey")
-        .env("AVAULT_HOME", home.path().join("vault"))
-        .stdout(Stdio::piped())
-        .output()
-        .unwrap();
-    assert!(pubkey_output.status.success());
-    let pubkey: serde_json::Value = serde_json::from_slice(&pubkey_output.stdout).unwrap();
+    let sealed = seal_secret(
+        home.path().join("vault").as_path(),
+        "API_TOKEN",
+        b"tokenname\n",
+    );
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
-    let request_spec = json!({
-        "method": "GET",
-        "url": format!("http://127.0.0.1:{}/resource", addr.port()),
-        "allowed_hosts": ["127.0.0.1"],
-        "inject": {"type": "bearer"}
-    });
-    let approval_nonce = b"fetch-header-red";
-    let approval_expires_at = future_expiry();
-    let dek_blindbox = fixed_blind_box(
-        pubkey["public_key"].as_str().unwrap(),
-        &dek,
-        &aad_deliver(
-            "API_TOKEN",
-            approval_nonce,
-            approval_expires_at,
-            &fetch_operation_hash(&request_spec),
-        ),
-    );
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         let mut buf = [0u8; 4096];
-        let n = stream.read(&mut buf).unwrap();
-        let request = String::from_utf8_lossy(&buf[..n]);
-        assert!(request.contains("Authorization: Bearer protected-token"));
+        let _ = stream.read(&mut buf).unwrap();
         stream
-            .write_all(b"HTTP/1.1 200 OK\r\nX-Echo: protected-token\r\nContent-Length: 2\r\n\r\nok")
+            .write_all(b"HTTP/1.1 200 OK\r\ntokenname: yes\r\nContent-Length: 2\r\n\r\nok")
             .unwrap();
     });
     let request = json!({
         "name": "API_TOKEN",
-        "envelope": envelope,
-        "dek_blindbox": dek_blindbox,
-        "approval": approval_json(approval_nonce, approval_expires_at),
-        "request": request_spec
+        "envelope": sealed,
+        "request": {
+            "method": "GET",
+            "url": format!("http://127.0.0.1:{}/resource", addr.port()),
+            "allowed_hosts": ["127.0.0.1"],
+            "inject": {"type": "bearer"}
+        }
     });
 
     let mut fetch = avault()
@@ -2276,16 +2268,136 @@ fn protected_deliver_fetch_redacts_echoed_credential_header() {
     server.join().unwrap();
     assert!(output.status.success());
     let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert!(response["headers"]
-        .as_object()
-        .unwrap()
-        .values()
-        .any(|value| value == "[avault-redacted]"));
+    let headers = response["headers"].as_object().unwrap();
+    assert!(headers.keys().all(|name| !name.contains("tokenname")));
+    assert!(headers.contains_key("[avault-redacted]"));
     assert_eq!(response["body"], "ok");
 }
 
 #[test]
-fn protected_deliver_inject_uses_operation_bound_dek_blindbox() {
+fn deliver_fetch_redacts_url_encoded_query_credential() {
+    let home = tempfile::tempdir().unwrap();
+    let sealed = seal_secret(
+        home.path().join("vault").as_path(),
+        "API_TOKEN",
+        b"a/b token",
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).unwrap();
+        let request = String::from_utf8_lossy(&buf[..n]);
+        assert!(request.starts_with("GET /resource?api_key=a%2Fb+token HTTP/1.1"));
+        let body = b"uri=/resource?api_key=a%2Fb+token";
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nLocation: /resource?api_key=a%2Fb+token\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        stream.write_all(body).unwrap();
+    });
+    let request = json!({
+        "name": "API_TOKEN",
+        "envelope": sealed,
+        "request": {
+            "method": "GET",
+            "url": format!("http://127.0.0.1:{}/resource", addr.port()),
+            "allowed_hosts": ["127.0.0.1"],
+            "inject": {"type": "query", "name": "api_key"}
+        }
+    });
+
+    let mut fetch = avault()
+        .arg("deliver")
+        .arg("fetch")
+        .env("AVAULT_HOME", home.path().join("vault"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    fetch
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let output = fetch.wait_with_output().unwrap();
+    server.join().unwrap();
+    assert!(output.status.success());
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let body = response["body"].as_str().unwrap();
+    assert!(body.contains("[avault-redacted]"));
+    assert!(!body.contains("a%2Fb+token"));
+    let headers = response["headers"].as_object().unwrap();
+    assert!(headers
+        .values()
+        .all(|value| !value.as_str().unwrap().contains("a%2Fb+token")));
+}
+
+#[test]
+fn one_shot_deliver_fetch_rejects_protected_dek_blindbox() {
+    let home = tempfile::tempdir().unwrap();
+    write_p0_master(&home.path().join("vault"));
+    let dek = [0x7du8; 32];
+    let envelope = envelope_encrypted_with_dek("API_TOKEN", &dek, b"protected-token\n");
+    let pubkey_output = avault()
+        .arg("pubkey")
+        .env("AVAULT_HOME", home.path().join("vault"))
+        .stdout(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(pubkey_output.status.success());
+    let pubkey: serde_json::Value = serde_json::from_slice(&pubkey_output.stdout).unwrap();
+    let request_spec = json!({
+        "method": "GET",
+        "url": "http://127.0.0.1:9/resource",
+        "allowed_hosts": ["127.0.0.1"],
+        "inject": {"type": "bearer"}
+    });
+    let approval_nonce = b"fetch-reject-001";
+    let approval_expires_at = future_expiry();
+    let dek_blindbox = fixed_blind_box(
+        pubkey["public_key"].as_str().unwrap(),
+        &dek,
+        &aad_deliver(
+            "API_TOKEN",
+            approval_nonce,
+            approval_expires_at,
+            &fetch_operation_hash(&request_spec),
+        ),
+    );
+    let request = json!({
+        "name": "API_TOKEN",
+        "envelope": envelope,
+        "dek_blindbox": dek_blindbox,
+        "approval": approval_json(approval_nonce, approval_expires_at),
+        "request": request_spec
+    });
+
+    let mut fetch = avault()
+        .arg("deliver")
+        .arg("fetch")
+        .env("AVAULT_HOME", home.path().join("vault"))
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    fetch
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let output = fetch.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(70));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("resident agent"));
+}
+
+#[test]
+fn one_shot_deliver_inject_rejects_protected_dek_blindbox() {
     let home = tempfile::tempdir().unwrap();
     write_p0_master(&home.path().join("vault"));
     let output_path = home.path().join("protected.env");
@@ -2330,72 +2442,6 @@ fn protected_deliver_inject_uses_operation_bound_dek_blindbox() {
         .arg("inject")
         .env("AVAULT_HOME", home.path().join("vault"))
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    inject
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(request.to_string().as_bytes())
-        .unwrap();
-    let output = inject.wait_with_output().unwrap();
-    assert!(output.status.success());
-    assert_eq!(
-        fs::read_to_string(&output_path).unwrap(),
-        "API_TOKEN='protected-inject'\n"
-    );
-}
-
-#[test]
-fn protected_deliver_inject_rejects_replayed_blindbox_for_different_cwd() {
-    let home = tempfile::tempdir().unwrap();
-    let approved_cwd = tempfile::tempdir().unwrap();
-    let replay_cwd = tempfile::tempdir().unwrap();
-    write_p0_master(&home.path().join("vault"));
-    let dek = [0x7eu8; 32];
-    let envelope = envelope_encrypted_with_dek("API_TOKEN", &dek, b"protected-inject-cwd");
-    let pubkey_output = avault()
-        .arg("pubkey")
-        .env("AVAULT_HOME", home.path().join("vault"))
-        .stdout(Stdio::piped())
-        .output()
-        .unwrap();
-    assert!(pubkey_output.status.success());
-    let pubkey: serde_json::Value = serde_json::from_slice(&pubkey_output.stdout).unwrap();
-    let approval_nonce = b"inject-cwd-00001";
-    let approval_expires_at = future_expiry();
-    let approved_path = approved_cwd.path().join("secrets.env");
-    let dek_blindbox = fixed_blind_box(
-        pubkey["public_key"].as_str().unwrap(),
-        &dek,
-        &aad_deliver(
-            "API_TOKEN",
-            approval_nonce,
-            approval_expires_at,
-            &inject_operation_hash("API_TOKEN", "dotenv", &approved_path),
-        ),
-    );
-    let request = json!({
-        "path": "secrets.env",
-        "format": "dotenv",
-        "secrets": [
-            {
-                "name": "API_TOKEN",
-                "key": "API_TOKEN",
-                "envelope": envelope,
-                "dek_blindbox": dek_blindbox,
-                "approval": approval_json(approval_nonce, approval_expires_at)
-            }
-        ]
-    });
-
-    let mut inject = avault()
-        .arg("deliver")
-        .arg("inject")
-        .current_dir(replay_cwd.path())
-        .env("AVAULT_HOME", home.path().join("vault"))
-        .stdin(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
@@ -2407,7 +2453,8 @@ fn protected_deliver_inject_rejects_replayed_blindbox_for_different_cwd() {
         .unwrap();
     let output = inject.wait_with_output().unwrap();
     assert_eq!(output.status.code(), Some(70));
-    assert!(!replay_cwd.path().join("secrets.env").exists());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("resident agent"));
+    assert!(!output_path.exists());
 }
 
 #[test]

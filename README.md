@@ -153,14 +153,14 @@ reads `{"scheme":"hpke-x25519-hkdfsha256-aes256gcm-v1","enc":"...","ct":"..."}`
 from stdin and returns the normal `{ciphertext, nonce, wrap_meta}` envelope.
 Blind boxes are authenticated with operation-bound HPKE AAD (`purpose`, `name`,
 scheme/version, optional scope, approval nonce/expiry, and a hash of the approved
-operation such as command/fetch target/inject path/signing digest), as pinned in
-`docs/DESIGN.md` and `tests/vectors/p2_core_crypto.json`. Protected one-shot
-`dek_blindbox` inputs and resident-agent grant DEKs must include an `approval`
-object `{nonce, expires_at_unix}`; grant approval nonces are single-use until
-their approval expiry.
+operation), as pinned in `docs/DESIGN.md` and `tests/vectors/p2_core_crypto.json`.
+Protected DEK blind boxes are accepted only by the resident agent, whose receiver
+keypair is fresh in memory for that agent lifetime. Agent grant DEKs must include
+an `approval` object `{nonce, expires_at_unix}`; grant approval nonces are
+single-use until their approval expiry.
 The one-shot CLI derives the receiver keypair from the local master key so `pubkey`
-and `seal --blind-box` work across processes without persisting a new private key.
-The resident agent uses a fresh in-memory keypair for its process lifetime.
+and `seal --blind-box` work across processes without persisting a new private key;
+that master-derived key is for blind-box create only, not protected DEK release.
 
 `sign` reads:
 
@@ -169,17 +169,17 @@ The resident agent uses a fresh in-memory keypair for its process lifetime.
   "name": "ETH_SIGNING_KEY",
   "key_envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." },
   "digest": "<hex 32-byte digest>",
-  "scheme": "ecdsa-secp256k1-recoverable",
-  "dek_blindbox": null,
-  "approval": null
+  "scheme": "ecdsa-secp256k1-recoverable"
 }
 ```
 
 Supported schemes are `ecdsa-secp256k1-recoverable`, `ecdsa-secp256k1-der`, and
 `schnorr-secp256k1-bip340`. Output is `{"signature":"<hex>","recovery_id":0|null}`.
 avault signs exactly the caller-provided digest; chain-specific sighash construction
-stays outside avault. Protected `dek_blindbox` opens are AAD-only; the P0 empty-AAD
-read fallback applies only to legacy standard-tier rows.
+stays outside avault. One-shot `sign` is standard-tier only and rejects
+`dek_blindbox` / `approval`; protected signing goes through the resident agent.
+Protected DEK opens are AAD-only; the P0 empty-AAD read fallback applies only to
+legacy standard-tier rows.
 
 ## How Avibe talks to it
 
