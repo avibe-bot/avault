@@ -10,7 +10,9 @@ use avault_core::{
     SignerProvider,
 };
 use avault_store::{Backend, FileStore, MasterKey, PassphraseFileStore};
+#[cfg(unix)]
 use base64::engine::general_purpose::STANDARD as B64;
+#[cfg(unix)]
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
@@ -56,7 +58,9 @@ const DEFAULT_AGENT_IDLE_TIMEOUT_SECS: u64 = 300;
 const AGENT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 #[cfg(unix)]
 const MAX_AGENT_READ_TIMEOUTS: u8 = 30;
+#[cfg(unix)]
 const MIN_APPROVAL_NONCE_BYTES: usize = 16;
+#[cfg(unix)]
 const MAX_APPROVAL_NONCE_BYTES: usize = 128;
 const FETCH_REDACTION: &str = "[avault-redacted]";
 
