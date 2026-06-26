@@ -1,8 +1,9 @@
 //! avault-store — where avault's own key material lives.
 //!
-//! P1 implements the standard-tier `file + mlock` floor: a 32-byte master key in a
-//! 0600 file, read into a zeroizing buffer, with best-effort no-core/no-swap hardening.
-//! Stronger stores (Keychain / Secure Enclave / TPM / KMS) are P2+.
+//! P1 implements the standard-tier file-store floor: a 32-byte master key in an
+//! owner-only file (0600 on Unix, protected DACL on Windows), read into a zeroizing
+//! buffer, with best-effort no-core/no-swap hardening. Stronger stores (Keychain /
+//! Secure Enclave / TPM / KMS) are P2+.
 
 use anyhow::{bail, Context};
 use rand::rngs::OsRng;
@@ -11,10 +12,49 @@ use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::env;
 use std::fs::{self, File};
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use zeroize::Zeroize;
+
+#[cfg(windows)]
+use std::ffi::OsStr;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetLastError, LocalFree, ERROR_INSUFFICIENT_BUFFER, HANDLE, HLOCAL,
+    INVALID_HANDLE_VALUE,
+};
+#[cfg(windows)]
+use windows_sys::Win32::Security::Authorization::{
+    GetNamedSecurityInfoW, SetNamedSecurityInfoW, SE_FILE_OBJECT,
+};
+#[cfg(windows)]
+use windows_sys::Win32::Security::{
+    AddAccessAllowedAceEx, CreateWellKnownSid, EqualSid, GetAce, GetLengthSid, GetTokenInformation,
+    InitializeAcl, TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid, ACCESS_ALLOWED_ACE,
+    ACL, ACL_REVISION, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE,
+    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY, TOKEN_USER,
+};
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    CreateFileW, FlushFileBuffers, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ,
+    FILE_SHARE_WRITE, OPEN_EXISTING,
+};
+#[cfg(windows)]
+use windows_sys::Win32::System::Diagnostics::Debug::{SetErrorMode, SEM_NOGPFAULTERRORBOX};
+#[cfg(windows)]
+use windows_sys::Win32::System::Memory::{VirtualLock, VirtualUnlock};
+#[cfg(windows)]
+use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+#[cfg(windows)]
+use windows_sys::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
+#[cfg(windows)]
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 /// Master key size for the standard-tier store.
 pub const MASTER_KEY_BYTES: usize = 32;
@@ -143,7 +183,17 @@ pub fn harden_process_memory() {
 }
 
 /// Apply best-effort process-wide memory hardening before secret material is read.
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
+pub fn harden_process_memory() {
+    // Safety invariant: `SetErrorMode` is process-wide WER/crash UI hardening and does not
+    // dereference secret buffers. It reduces accidental crash-dump exposure on Windows.
+    unsafe {
+        SetErrorMode(SEM_NOGPFAULTERRORBOX);
+    }
+}
+
+/// Apply best-effort process-wide memory hardening before secret material is read.
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub fn harden_process_memory() {}
 
 /// Return the default P1 master-key path: `$AVAULT_HOME/machine.key` or
@@ -152,12 +202,33 @@ pub fn default_master_key_path() -> anyhow::Result<PathBuf> {
     if let Some(home) = env::var_os("AVAULT_HOME") {
         return Ok(PathBuf::from(home).join("machine.key"));
     }
-    let home = env::var_os("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home)
+    Ok(user_home_dir()?
         .join(".avibe")
         .join("state")
         .join("vault")
         .join("machine.key"))
+}
+
+#[cfg(not(windows))]
+fn user_home_dir() -> anyhow::Result<PathBuf> {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("HOME is not set")
+}
+
+#[cfg(windows)]
+fn user_home_dir() -> anyhow::Result<PathBuf> {
+    if let Some(home) = env::var_os("HOME").or_else(|| env::var_os("USERPROFILE")) {
+        return Ok(PathBuf::from(home));
+    }
+    match (env::var_os("HOMEDRIVE"), env::var_os("HOMEPATH")) {
+        (Some(drive), Some(path)) => {
+            let mut home = PathBuf::from(drive);
+            home.push(path);
+            Ok(home)
+        }
+        _ => bail!("Windows user profile directory is not set"),
+    }
 }
 
 /// Load the 32-byte master key, or create it on first use.
@@ -235,7 +306,7 @@ impl FileStore {
             .path
             .parent()
             .context("master key path has no parent")?;
-        let tmp = write_synced_temp_key(parent, key)?;
+        let tmp = write_synced_temp_secret_file(parent, ".machine.", ".tmp", key)?;
 
         if force {
             tmp.persist(&self.path)
@@ -259,7 +330,7 @@ impl FileStore {
             .path
             .parent()
             .context("master key path has no parent")?;
-        let tmp = write_synced_temp_key(parent, key.as_bytes())?;
+        let tmp = write_synced_temp_secret_file(parent, ".machine.", ".tmp", key.as_bytes())?;
         drop(key);
 
         match tmp.persist_noclobber(&self.path) {
@@ -278,43 +349,150 @@ impl FileStore {
             .path
             .parent()
             .context("master key path has no parent")?;
-        fs::create_dir_all(parent).context("failed to create master key directory")?;
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-            .context("failed to secure master key directory")?;
+        ensure_secret_parent_directory(parent)?;
         validate_directory_mode(parent)?;
         Ok(())
     }
 }
 
-fn write_synced_temp_key(
+/// Atomically write a secret-bearing file using owner-only permissions / ACLs.
+///
+/// Unix callers get a 0600 file; Windows callers get a protected owner-only DACL.
+/// The parent directory is created only when missing and is never weakened or
+/// silently mutated if it already exists with unsafe permissions.
+pub fn atomic_write_secret_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let parent = writable_parent(path);
+    ensure_secret_parent_directory(parent)?;
+    validate_directory_mode(parent)?;
+    let tmp = write_synced_temp_secret_file(parent, ".avault.", ".tmp", bytes)?;
+    tmp.persist(path)
+        .map_err(|err| err.error)
+        .context("failed to install secret file")?;
+    validate_file_mode(path)?;
+    sync_parent_dir(path)?;
+    Ok(())
+}
+
+fn write_synced_temp_secret_file(
     parent: &Path,
-    key: &[u8; MASTER_KEY_BYTES],
+    prefix: &str,
+    suffix: &str,
+    bytes: &[u8],
 ) -> anyhow::Result<tempfile::NamedTempFile> {
     let mut tmp = tempfile::Builder::new()
-        .prefix(".machine.")
-        .suffix(".tmp")
+        .prefix(prefix)
+        .suffix(suffix)
         .tempfile_in(parent)
-        .context("failed to create temporary master key file")?;
+        .context("failed to create temporary secret file")?;
+    secure_created_file(tmp.path()).context("failed to secure temporary secret file")?;
     tmp.as_file_mut()
-        .set_permissions(fs::Permissions::from_mode(0o600))
-        .context("failed to set temporary master key mode")?;
-    tmp.as_file_mut()
-        .write_all(key)
-        .context("failed to write temporary master key file")?;
+        .write_all(bytes)
+        .context("failed to write temporary secret file")?;
     tmp.as_file_mut()
         .sync_all()
-        .context("failed to sync temporary master key file")?;
+        .context("failed to sync temporary secret file")?;
     Ok(tmp)
+}
+
+fn writable_parent(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
+}
+
+fn ensure_secret_parent_directory(parent: &Path) -> anyhow::Result<()> {
+    if parent.exists() {
+        validate_directory_mode(parent)?;
+        return Ok(());
+    }
+
+    let mut missing = Vec::new();
+    let mut current = parent;
+    while !current.exists() {
+        missing.push(current.to_path_buf());
+        current = current
+            .parent()
+            .context("secret directory path has no existing ancestor")?;
+    }
+
+    for dir in missing.iter().rev() {
+        match fs::create_dir(dir) {
+            Ok(()) => secure_created_directory(dir).context("failed to secure secret directory")?,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                validate_directory_mode(dir)?
+            }
+            Err(err) => return Err(err).context("failed to create secret directory"),
+        }
+    }
+    validate_directory_mode(parent)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn secure_created_directory(path: &Path) -> anyhow::Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .context("failed to secure secret directory")
+}
+
+#[cfg(unix)]
+fn secure_created_file(path: &Path) -> anyhow::Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .context("failed to secure secret file")
+}
+
+#[cfg(windows)]
+fn secure_created_directory(path: &Path) -> anyhow::Result<()> {
+    set_owner_only_acl(path, true)
+}
+
+#[cfg(windows)]
+fn secure_created_file(path: &Path) -> anyhow::Result<()> {
+    set_owner_only_acl(path, false)
 }
 
 fn sync_parent_dir(path: &Path) -> anyhow::Result<()> {
     let parent = path.parent().context("master key path has no parent")?;
+    sync_directory(parent)
+}
+
+#[cfg(unix)]
+fn sync_directory(parent: &Path) -> anyhow::Result<()> {
     File::open(parent)
         .context("failed to open master key directory")?
         .sync_all()
         .context("failed to sync master key directory")
 }
 
+#[cfg(windows)]
+fn sync_directory(parent: &Path) -> anyhow::Result<()> {
+    let wide = wide_path(parent);
+    // Safety invariant: the path is NUL-terminated UTF-16 and points to a directory whose
+    // metadata update installs a secret file. Opening/flushing it never exposes key bytes.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        bail!("failed to open secret directory");
+    }
+    let _guard = HandleGuard(handle);
+    // Safety invariant: `handle` is a live directory handle opened above. Failure is propagated
+    // because the caller relies on durable install semantics for secret-bearing files.
+    if unsafe { FlushFileBuffers(handle) } == 0 {
+        bail!("failed to sync secret directory");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn validate_file_mode(path: &Path) -> anyhow::Result<()> {
     let metadata = fs::metadata(path).context("failed to stat master key")?;
     let mode = metadata.permissions().mode() & 0o777;
@@ -324,6 +502,12 @@ fn validate_file_mode(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn validate_file_mode(path: &Path) -> anyhow::Result<()> {
+    validate_owner_only_acl(path, "master key")
+}
+
+#[cfg(unix)]
 fn validate_directory_mode(path: &Path) -> anyhow::Result<()> {
     let metadata = fs::metadata(path).context("failed to stat master key directory")?;
     let mode = metadata.permissions().mode() & 0o777;
@@ -333,9 +517,286 @@ fn validate_directory_mode(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn validate_directory_mode(path: &Path) -> anyhow::Result<()> {
+    validate_owner_only_acl(path, "master key directory")
+}
+
 fn validate_parent_directory_mode(path: &Path) -> anyhow::Result<()> {
     let parent = path.parent().context("master key path has no parent")?;
     validate_directory_mode(parent)
+}
+
+#[cfg(windows)]
+struct HandleGuard(HANDLE);
+
+#[cfg(windows)]
+impl Drop for HandleGuard {
+    fn drop(&mut self) {
+        // Safety invariant: the handle was returned by a Windows open call in this module and is
+        // no longer used after this guard drops. Closing it does not touch secret memory.
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+struct LocalSecurityDescriptor(PSECURITY_DESCRIPTOR);
+
+#[cfg(windows)]
+impl Drop for LocalSecurityDescriptor {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // Safety invariant: `GetNamedSecurityInfoW` allocated this security descriptor with
+            // the Windows local allocator; freeing it releases ACL metadata only, not secrets.
+            unsafe {
+                LocalFree(self.0 as HLOCAL);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn wide_path(path: &Path) -> Vec<u16> {
+    OsStr::new(path).encode_wide().chain(Some(0)).collect()
+}
+
+#[cfg(windows)]
+fn set_owner_only_acl(path: &Path, directory: bool) -> anyhow::Result<()> {
+    let owner = current_user_sid().context("failed to read current user SID")?;
+    let sid_len = unsafe_sid_len(owner.as_psid())?;
+    let acl_len = std::mem::size_of::<ACL>() + std::mem::size_of::<ACCESS_ALLOWED_ACE>() + sid_len
+        - std::mem::size_of::<u32>();
+    let mut acl_buf = vec![0u8; acl_len];
+    let acl = acl_buf.as_mut_ptr().cast::<ACL>();
+    // Safety invariant: `acl_buf` is a writable buffer sized for one owner ACE. The ACL grants
+    // only the current user access to the secret directory/file and blocks inherited ACEs when
+    // installed with `PROTECTED_DACL_SECURITY_INFORMATION`.
+    unsafe {
+        if InitializeAcl(acl, acl_len as u32, ACL_REVISION) == 0 {
+            bail!("failed to initialize secret file ACL");
+        }
+        let inheritance = if directory {
+            OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+        } else {
+            0
+        };
+        if AddAccessAllowedAceEx(
+            acl,
+            ACL_REVISION,
+            inheritance,
+            FILE_ALL_ACCESS,
+            owner.as_psid(),
+        ) == 0
+        {
+            bail!("failed to build secret file ACL");
+        }
+    }
+
+    let mut wide = wide_path(path);
+    // Safety invariant: `wide` is a NUL-terminated path to the just-created secret object, and
+    // `acl` remains alive for the duration of the call. The protected DACL removes inherited
+    // principals so only the owner ACE above grants access.
+    let rc = unsafe {
+        SetNamedSecurityInfoW(
+            wide.as_mut_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            acl,
+            std::ptr::null_mut(),
+        )
+    };
+    if rc != 0 {
+        bail!("failed to install owner-only ACL");
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn validate_owner_only_acl(path: &Path, label: &str) -> anyhow::Result<()> {
+    let owner = current_user_sid().context("failed to read current user SID")?;
+    let system = well_known_sid(WinLocalSystemSid).context("failed to build SYSTEM SID")?;
+    let administrators = well_known_sid(WinBuiltinAdministratorsSid)
+        .context("failed to build Administrators SID")?;
+    let allowed = [owner.as_psid(), system.as_psid(), administrators.as_psid()];
+
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let mut wide = wide_path(path);
+    // Safety invariant: `wide` is a NUL-terminated object path. Windows returns a security
+    // descriptor that this function only inspects to reject unsafe ACLs before reading secrets.
+    let rc = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_mut_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    if rc != 0 {
+        bail!("failed to read {label} ACL");
+    }
+    let _sd = LocalSecurityDescriptor(sd);
+    if dacl.is_null() {
+        bail!("{label} ACL is missing");
+    }
+
+    // Safety invariant: `dacl` is owned by the Windows security descriptor above and remains
+    // valid while `_sd` is alive. The loop only reads ACE metadata to enforce owner-only access.
+    let ace_count = unsafe { (*dacl).AceCount };
+    for index in 0..ace_count {
+        let mut ace_ptr = std::ptr::null_mut();
+        // Safety invariant: `index < AceCount` and `ace_ptr` is an out-parameter. Windows fills
+        // it with a pointer into `dacl`, which remains valid for this scope.
+        if unsafe { GetAce(dacl, u32::from(index), &mut ace_ptr) } == 0 {
+            bail!("failed to inspect {label} ACL");
+        }
+        let header = ace_ptr.cast::<windows_sys::Win32::Security::ACE_HEADER>();
+        // Safety invariant: `ace_ptr` points to an ACE header returned by `GetAce`.
+        let ace_type = unsafe { (*header).AceType };
+        if u32::from(ace_type) != ACCESS_ALLOWED_ACE_TYPE {
+            continue;
+        }
+        let ace = ace_ptr.cast::<ACCESS_ALLOWED_ACE>();
+        // Safety invariant: this is an access-allowed ACE; `SidStart` is the first u32 of the SID
+        // embedded in the ACE, per the Windows ACL layout.
+        let sid = unsafe { (&(*ace).SidStart as *const u32).cast::<core::ffi::c_void>() as PSID };
+        if !allowed
+            .iter()
+            .any(|allowed_sid| equal_sid(sid, *allowed_sid))
+        {
+            bail!("{label} ACL grants access to another principal");
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(windows)]
+struct Sid {
+    bytes: Vec<u8>,
+}
+
+#[cfg(windows)]
+impl Sid {
+    fn as_psid(&self) -> PSID {
+        self.bytes.as_ptr().cast::<core::ffi::c_void>() as PSID
+    }
+}
+
+#[cfg(windows)]
+fn current_user_sid() -> anyhow::Result<Sid> {
+    let mut token: HANDLE = std::ptr::null_mut();
+    // Safety invariant: this opens a query-only handle to the current process token so we can
+    // derive the owner SID for the protected DACL. It does not access secret memory.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        bail!("failed to open process token");
+    }
+    let _token = HandleGuard(token);
+
+    let mut needed = 0u32;
+    // Safety invariant: this first call intentionally passes a null buffer to learn the size.
+    unsafe {
+        GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed);
+    }
+    if needed == 0 && unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER {
+        bail!("failed to size process token user");
+    }
+    let mut buf = vec![0u8; needed as usize];
+    // Safety invariant: `buf` is writable for `needed` bytes and receives TOKEN_USER metadata,
+    // which contains only the current user's SID, not key material.
+    if unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            buf.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    } == 0
+    {
+        bail!("failed to read process token user");
+    }
+    let token_user = buf.as_ptr().cast::<TOKEN_USER>();
+    // Safety invariant: `buf` was filled as TOKEN_USER above; the SID length is obtained from
+    // Windows before copying it into owned Rust memory for later ACL calls.
+    let user_sid = unsafe { (*token_user).User.Sid };
+    copy_sid(user_sid)
+}
+
+#[cfg(windows)]
+fn well_known_sid(kind: windows_sys::Win32::Security::WELL_KNOWN_SID_TYPE) -> anyhow::Result<Sid> {
+    let mut needed = 0u32;
+    // Safety invariant: this size-probe uses a null destination as documented by Windows and
+    // does not access secret memory.
+    unsafe {
+        CreateWellKnownSid(
+            kind,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut needed,
+        );
+    }
+    if needed == 0 {
+        bail!("failed to size well-known SID");
+    }
+    let mut bytes = vec![0u8; needed as usize];
+    // Safety invariant: `bytes` is a writable SID buffer of the size requested by Windows.
+    if unsafe {
+        CreateWellKnownSid(
+            kind,
+            std::ptr::null_mut(),
+            bytes.as_mut_ptr().cast(),
+            &mut needed,
+        )
+    } == 0
+    {
+        bail!("failed to create well-known SID");
+    }
+    bytes.truncate(needed as usize);
+    Ok(Sid { bytes })
+}
+
+#[cfg(windows)]
+fn copy_sid(sid: PSID) -> anyhow::Result<Sid> {
+    let len = unsafe_sid_len(sid)?;
+    let mut bytes = vec![0u8; len];
+    // Safety invariant: `sid` is a valid SID pointer returned by Windows and `bytes` is sized
+    // from `GetLengthSid`; copying preserves only ACL identity metadata.
+    unsafe {
+        std::ptr::copy_nonoverlapping(sid.cast::<u8>(), bytes.as_mut_ptr(), len);
+    }
+    Ok(Sid { bytes })
+}
+
+#[cfg(windows)]
+fn unsafe_sid_len(sid: PSID) -> anyhow::Result<usize> {
+    if sid.is_null() {
+        bail!("missing SID");
+    }
+    // Safety invariant: callers pass SIDs returned by Windows token/security APIs or owned SID
+    // buffers previously created here. `GetLengthSid` reads SID metadata only.
+    let len = unsafe { GetLengthSid(sid) };
+    usize::try_from(len)
+        .ok()
+        .filter(|value| *value > 0)
+        .context("invalid SID length")
+}
+
+#[cfg(windows)]
+fn equal_sid(left: PSID, right: PSID) -> bool {
+    if left.is_null() || right.is_null() {
+        return false;
+    }
+    // Safety invariant: both pointers are valid SIDs for the current ACL validation scope.
+    unsafe { EqualSid(left, right) != 0 }
 }
 
 #[cfg(target_os = "linux")]
@@ -361,7 +822,17 @@ fn lock_memory(ptr: *const u8, len: usize) {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
+fn lock_memory(ptr: *const u8, len: usize) {
+    // Safety invariant: the pointer/length describe the live dedicated master-key page.
+    // `VirtualLock` pins those pages for this process when the OS permits it and does not
+    // mutate Rust-visible contents. Failure is best-effort like Unix `mlock`.
+    unsafe {
+        VirtualLock(ptr.cast(), len);
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn lock_memory(_ptr: *const u8, _len: usize) {}
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -374,7 +845,16 @@ fn unlock_memory(ptr: *const u8, len: usize) {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(windows)]
+fn unlock_memory(ptr: *const u8, len: usize) {
+    // Safety invariant: the pointer/length still refer to the dedicated key page during
+    // `Drop`; `VirtualUnlock` releases the page lock after explicit zeroization.
+    unsafe {
+        VirtualUnlock(ptr.cast(), len);
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn unlock_memory(_ptr: *const u8, _len: usize) {}
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -396,7 +876,21 @@ fn system_page_size() -> usize {
             .filter(|p| *p > 0)
             .unwrap_or(4096)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    {
+        let mut info = std::mem::MaybeUninit::<SYSTEM_INFO>::zeroed();
+        // Safety invariant: `GetSystemInfo` initializes the provided stack buffer and does not
+        // touch Rust-owned secret memory. A bad value falls back to the common 4096-byte page.
+        unsafe {
+            GetSystemInfo(info.as_mut_ptr());
+            let info = info.assume_init();
+            usize::try_from(info.dwPageSize)
+                .ok()
+                .filter(|p| *p > 0)
+                .unwrap_or(4096)
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         4096
     }
@@ -406,14 +900,21 @@ fn system_page_size() -> usize {
 mod tests {
     use super::*;
 
+    fn nested_store(tmp: &tempfile::TempDir) -> FileStore {
+        FileStore::new(tmp.path().join("vault").join("machine.key"))
+    }
+
     #[test]
     fn creates_and_reads_key_with_0600_mode() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = FileStore::new(tmp.path().join("machine.key"));
+        let store = nested_store(&tmp);
         let first = store.get_or_create().unwrap();
         assert_eq!(first.as_bytes().len(), MASTER_KEY_BYTES);
-        let mode = fs::metadata(store.path()).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
+        #[cfg(unix)]
+        {
+            let mode = fs::metadata(store.path()).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
 
         let second = store.get().unwrap();
         assert_eq!(first.as_bytes(), second.as_bytes());
@@ -422,19 +923,21 @@ mod tests {
     #[test]
     fn get_errors_if_missing() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = FileStore::new(tmp.path().join("machine.key"));
+        let store = nested_store(&tmp);
         assert!(store.get().is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn refuses_loose_mode_on_read() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = FileStore::new(tmp.path().join("machine.key"));
+        let store = nested_store(&tmp);
         store.get_or_create().unwrap();
         fs::set_permissions(store.path(), fs::Permissions::from_mode(0o644)).unwrap();
         assert!(store.get().is_err());
     }
 
+    #[cfg(unix)]
     #[test]
     fn refuses_loose_parent_directory_on_read() {
         let tmp = tempfile::tempdir().unwrap();
@@ -444,6 +947,32 @@ mod tests {
         fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o777)).unwrap();
 
         assert!(store.get().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn get_or_create_rejects_existing_loose_parent_without_chmod() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        let store = FileStore::new(tmp.path().join("machine.key"));
+
+        assert!(store.get_or_create().is_err());
+        let mode = fs::metadata(tmp.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o777);
+        assert!(!store.path().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_secret_file_rejects_existing_loose_parent_without_chmod() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        let out = tmp.path().join("inject.env");
+
+        assert!(atomic_write_secret_file(&out, b"SECRET='value'\n").is_err());
+        let mode = fs::metadata(tmp.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o777);
+        assert!(!out.exists());
     }
 
     #[test]
@@ -460,7 +989,7 @@ mod tests {
     #[test]
     fn import_refuses_overwrite_without_force() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = FileStore::new(tmp.path().join("machine.key"));
+        let store = nested_store(&tmp);
         store.get_or_create().unwrap();
         let key = [9u8; MASTER_KEY_BYTES];
         assert!(store.import(&key, false).is_err());
@@ -471,31 +1000,41 @@ mod tests {
     #[test]
     fn import_does_not_reuse_stale_temp_file() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = FileStore::new(tmp.path().join("machine.key"));
-        let stale_tmp = tmp.path().join("machine.tmp");
+        let store = nested_store(&tmp);
+        store.ensure_parent().unwrap();
+        let stale_tmp = store.path().parent().unwrap().join("machine.tmp");
         fs::write(&stale_tmp, [3u8; MASTER_KEY_BYTES]).unwrap();
+        #[cfg(unix)]
         fs::set_permissions(&stale_tmp, fs::Permissions::from_mode(0o644)).unwrap();
 
         let key = [9u8; MASTER_KEY_BYTES];
         store.import(&key, false).unwrap();
         assert_eq!(store.get().unwrap().as_bytes(), &key);
-        let mode = fs::metadata(store.path()).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
+        #[cfg(unix)]
+        {
+            let mode = fs::metadata(store.path()).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
         assert!(stale_tmp.exists());
     }
 
     #[test]
     fn create_does_not_reuse_stale_temp_file() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = FileStore::new(tmp.path().join("machine.key"));
-        let stale_tmp = tmp.path().join(".machine.stale.tmp");
+        let store = nested_store(&tmp);
+        store.ensure_parent().unwrap();
+        let stale_tmp = store.path().parent().unwrap().join(".machine.stale.tmp");
         fs::write(&stale_tmp, [3u8; MASTER_KEY_BYTES]).unwrap();
+        #[cfg(unix)]
         fs::set_permissions(&stale_tmp, fs::Permissions::from_mode(0o644)).unwrap();
 
         let key = store.get_or_create().unwrap();
         assert_ne!(key.as_bytes(), &[3u8; MASTER_KEY_BYTES]);
-        let mode = fs::metadata(store.path()).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
+        #[cfg(unix)]
+        {
+            let mode = fs::metadata(store.path()).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
         assert!(stale_tmp.exists());
     }
 
