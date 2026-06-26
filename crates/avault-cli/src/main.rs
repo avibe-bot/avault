@@ -27,7 +27,7 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(unix)]
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 #[cfg(unix)]
 use std::path::Path;
 use std::path::PathBuf;
@@ -45,6 +45,12 @@ const MAX_STDIN_PASSPHRASE_BYTES: usize = 64 * 1024;
 const STDIN_READ_CHUNK_BYTES: usize = 8192;
 #[cfg(unix)]
 const MAX_AGENT_FRAME_BYTES: usize = 2 * 1024 * 1024;
+#[cfg(unix)]
+const MAX_AGENT_RUN_SECRETS: usize = 1024;
+#[cfg(unix)]
+const MAX_AGENT_RUN_ENV_NAME_BYTES: usize = 4096;
+#[cfg(unix)]
+const AGENT_RUN_HELPER_MAGIC: &[u8] = b"avault-agent-run-env-v1\0";
 const FETCH_CONNECT_TIMEOUT_SECS: u64 = 10;
 const FETCH_TOTAL_TIMEOUT_SECS: u64 = 30;
 const MAX_FETCH_BODY_BYTES: usize = 8 * 1024 * 1024;
@@ -122,6 +128,8 @@ fn run(args: Vec<OsString>) -> anyhow::Result<u8> {
         "pubkey" => pubkey_cmd(&args[1..], &config, &mut stdin),
         "sign" => sign_cmd(&args[1..], &config, &mut stdin),
         "agent" => agent_cmd(&args[1..], &config, &mut stdin),
+        #[cfg(unix)]
+        "__agent-run-helper" => agent_run_helper_cmd(&args[1..], &mut stdin),
         other => {
             eprintln!("avault: unknown command '{other}'\n");
             print!("{USAGE}");
@@ -650,9 +658,10 @@ fn spawn_child_with_opened_env(
             child.env_clear();
         }
         for secret in &opened {
+            validate_env_value(secret.plaintext.as_slice())?;
             let env_value = std::str::from_utf8(secret.plaintext.as_slice())
                 .context("secret value is not valid UTF-8 for env delivery")?;
-            // Accepted standard-tier residual: `Command::env` copies this value into std's
+            // Accepted one-shot standard-tier residual: `Command::env` copies this value into std's
             // process builder and then into the child's environment. Rust does not expose that
             // buffer for zeroizing; avault wipes its owned buffers immediately after spawn.
             child.env(&secret.name, env_value);
@@ -680,7 +689,7 @@ fn run_agent_child_with_opened_env(
     envelope_stdin: bool,
     state: &mut AgentState,
 ) -> anyhow::Result<u8> {
-    let mut child = spawn_child_with_opened_env(command, opened, envelope_stdin, false)?;
+    let mut child = spawn_agent_run_helper(command, opened, envelope_stdin)?;
     loop {
         state.purge();
         if let Some(status) = child
@@ -691,6 +700,176 @@ fn run_agent_child_with_opened_env(
         }
         std::thread::sleep(AGENT_POLL_INTERVAL);
     }
+}
+
+#[cfg(unix)]
+fn agent_run_helper_cmd(args: &[OsString], input: &mut impl Read) -> anyhow::Result<u8> {
+    let mut index = 0;
+    let mut stdin_null = false;
+    if args.get(index).and_then(|arg| arg.to_str()) == Some("--stdin-null") {
+        stdin_null = true;
+        index += 1;
+    }
+    if args.get(index).and_then(|arg| arg.to_str()) != Some("--") {
+        bail!("agent run helper requires -- before command");
+    }
+    let command = &args[index + 1..];
+    if command.is_empty() {
+        bail!("agent run helper requires a command");
+    }
+
+    let mut opened = read_agent_run_helper_frame(input)?;
+    let mut child = Command::new(&command[0]);
+    child.args(&command[1..]);
+    child.env_clear();
+    for secret in &opened {
+        let env_value = std::str::from_utf8(secret.plaintext.as_slice())
+            .context("secret value is not valid UTF-8 for env delivery")?;
+        child.env(&secret.name, env_value);
+    }
+    if stdin_null {
+        child.stdin(Stdio::null());
+    } else {
+        child.stdin(Stdio::inherit());
+    }
+    child.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    let err = child.exec();
+    opened.zeroize();
+    drop(opened);
+    Err(err).context("failed to exec child command")
+}
+
+#[cfg(unix)]
+fn spawn_agent_run_helper(
+    command: &[OsString],
+    mut opened: Vec<OpenedSecret>,
+    envelope_stdin: bool,
+) -> anyhow::Result<std::process::Child> {
+    if !envelope_stdin {
+        bail!("agent deliver run requires closed child stdin");
+    }
+    let exe = env::current_exe().context("failed to locate avault helper")?;
+    let mut helper = Command::new(exe);
+    helper
+        .arg("__agent-run-helper")
+        .arg("--stdin-null")
+        .arg("--")
+        .args(command)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    let mut child = helper.spawn().context("failed to spawn agent run helper")?;
+    let write_result = match child.stdin.as_mut() {
+        Some(stdin) => write_agent_run_helper_frame(stdin, &opened),
+        None => Err(anyhow!("failed to open agent run helper stdin")),
+    };
+    opened.zeroize();
+    drop(opened);
+    drop(child.stdin.take());
+    if let Err(err) = write_result {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(err).context("failed to send secrets to agent run helper");
+    }
+    Ok(child)
+}
+
+#[cfg(unix)]
+fn write_agent_run_helper_frame(
+    writer: &mut impl Write,
+    opened: &[OpenedSecret],
+) -> anyhow::Result<()> {
+    if opened.is_empty() {
+        bail!("agent run helper requires at least one secret");
+    }
+    let count: u32 = opened
+        .len()
+        .try_into()
+        .context("too many secrets for agent run helper")?;
+    writer
+        .write_all(AGENT_RUN_HELPER_MAGIC)
+        .context("failed to write agent run helper frame")?;
+    writer
+        .write_all(&count.to_be_bytes())
+        .context("failed to write agent run helper frame")?;
+    for secret in opened {
+        validate_shell_name(&secret.name, "env var name")?;
+        validate_env_value(secret.plaintext.as_slice())?;
+        write_agent_run_helper_bytes(writer, secret.name.as_bytes())?;
+        write_agent_run_helper_bytes(writer, secret.plaintext.as_slice())?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_agent_run_helper_bytes(writer: &mut impl Write, bytes: &[u8]) -> anyhow::Result<()> {
+    let len: u32 = bytes
+        .len()
+        .try_into()
+        .context("agent run helper field is too large")?;
+    writer
+        .write_all(&len.to_be_bytes())
+        .context("failed to write agent run helper frame")?;
+    writer
+        .write_all(bytes)
+        .context("failed to write agent run helper frame")
+}
+
+#[cfg(unix)]
+fn read_agent_run_helper_frame(input: &mut impl Read) -> anyhow::Result<Vec<OpenedSecret>> {
+    let mut magic = vec![0u8; AGENT_RUN_HELPER_MAGIC.len()];
+    input
+        .read_exact(&mut magic)
+        .context("failed to read agent run helper frame")?;
+    if magic != AGENT_RUN_HELPER_MAGIC {
+        bail!("agent run helper frame is invalid");
+    }
+    let count = read_agent_run_helper_u32(input)? as usize;
+    if count == 0 || count > MAX_AGENT_RUN_SECRETS {
+        bail!("agent run helper secret count is invalid");
+    }
+    let mut opened = Vec::with_capacity(count);
+    for _ in 0..count {
+        let name_len = read_agent_run_helper_u32(input)? as usize;
+        if name_len == 0 || name_len > MAX_AGENT_RUN_ENV_NAME_BYTES {
+            bail!("agent run helper env name is invalid");
+        }
+        let mut name = vec![0u8; name_len];
+        input
+            .read_exact(&mut name)
+            .context("failed to read agent run helper frame")?;
+        let name = String::from_utf8(name).context("agent run helper env name is invalid")?;
+        validate_shell_name(&name, "env var name")?;
+
+        let value_len = read_agent_run_helper_u32(input)? as usize;
+        if value_len > MAX_STDIN_SECRET_BYTES {
+            bail!("agent run helper secret value is too large");
+        }
+        let mut plaintext = Zeroizing::new(vec![0u8; value_len]);
+        input
+            .read_exact(plaintext.as_mut_slice())
+            .context("failed to read agent run helper frame")?;
+        validate_env_value(plaintext.as_slice())?;
+        opened.push(OpenedSecret { name, plaintext });
+    }
+    Ok(opened)
+}
+
+#[cfg(unix)]
+fn read_agent_run_helper_u32(input: &mut impl Read) -> anyhow::Result<u32> {
+    let mut buf = [0u8; 4];
+    input
+        .read_exact(&mut buf)
+        .context("failed to read agent run helper frame")?;
+    Ok(u32::from_be_bytes(buf))
+}
+
+fn validate_env_value(value: &[u8]) -> anyhow::Result<()> {
+    std::str::from_utf8(value).context("secret value is not valid UTF-8 for env delivery")?;
+    if value.contains(&0) {
+        bail!("secret value contains a NUL byte and cannot be delivered as an env var");
+    }
+    Ok(())
 }
 
 fn open_env_secrets(

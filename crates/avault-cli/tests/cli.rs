@@ -435,17 +435,23 @@ fn agent_request(stream: &mut UnixStream, request: serde_json::Value) -> serde_j
 }
 
 fn spawn_agent(socket: &std::path::Path, idle_timeout_secs: u64) -> std::process::Child {
-    avault()
-        .arg("agent")
-        .arg("--socket")
-        .arg(socket)
-        .arg("--idle-timeout-secs")
-        .arg(idle_timeout_secs.to_string())
+    spawn_agent_command(socket, idle_timeout_secs)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap()
+}
+
+fn spawn_agent_command(socket: &std::path::Path, idle_timeout_secs: u64) -> Command {
+    let mut command = avault();
+    command
+        .arg("agent")
+        .arg("--socket")
+        .arg(socket)
+        .arg("--idle-timeout-secs")
+        .arg(idle_timeout_secs.to_string());
+    command
 }
 
 fn spawn_passphrase_agent(
@@ -1245,6 +1251,70 @@ fn agent_purges_grants_while_deliver_run_child_is_running() {
     );
     assert_eq!(denied["ok"], false);
     assert!(denied["error"].as_str().unwrap().contains("grant"));
+
+    let _ = agent.kill();
+    let _ = agent.wait();
+}
+
+#[test]
+fn agent_deliver_run_clears_inherited_env_and_delivers_secret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("run").join("avault.sock");
+    let mut agent = spawn_agent_command(&socket, 60)
+        .env("AVAULT_PARENT_ONLY", "must-not-leak")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stream = connect_agent(&socket);
+    let pubkey = agent_request(&mut stream, json!({"type": "pubkey"}));
+    let public_key = pubkey["result"]["public_key"].as_str().unwrap();
+    let dek = [0x5au8; 32];
+    let approval_nonce = b"agent-run-env-01";
+    let approval_expires_at = future_expiry();
+    let grant = agent_request(
+        &mut stream,
+        json!({
+            "type": "grant",
+            "scope_type": "session",
+            "scope_ref": "run-env",
+            "ttl_secs": 60,
+            "deks": [
+                {
+                    "name": "API_TOKEN",
+                    "dek_blindbox": fixed_blind_box(
+                        public_key,
+                        &dek,
+                        &aad_agent_deliver("session", "run-env", "API_TOKEN", approval_nonce, approval_expires_at, 60)
+                    ),
+                    "approval": approval_json(approval_nonce, approval_expires_at)
+                }
+            ]
+        }),
+    );
+    assert_eq!(grant["ok"], true);
+
+    let envelope = envelope_encrypted_with_dek("API_TOKEN", &dek, b"agent-secret");
+    let delivered = agent_request(
+        &mut stream,
+        json!({
+            "type": "deliver",
+            "scope_type": "session",
+            "scope_ref": "run-env",
+            "mode": "run",
+            "command": [
+                "/bin/sh",
+                "-c",
+                r#"test "$API_TOKEN" = "agent-secret" && test -z "${AVAULT_PARENT_ONLY+x}""#
+            ],
+            "secrets": [
+                {"name": "API_TOKEN", "env": "API_TOKEN", "envelope": envelope}
+            ]
+        }),
+    );
+    assert_eq!(delivered["ok"], true);
+    assert_eq!(delivered["result"]["exit_code"], 0);
 
     let _ = agent.kill();
     let _ = agent.wait();
