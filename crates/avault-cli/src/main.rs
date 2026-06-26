@@ -556,13 +556,20 @@ fn one_shot_sign_operation_hash(scheme: &str, digest: &[u8; 32]) -> [u8; 32] {
 }
 
 #[cfg(unix)]
-fn agent_deliver_operation_hash(name: &str) -> [u8; 32] {
-    BlindBoxContext::operation_hash(&[b"agent-deliver", name.as_bytes()])
+fn agent_deliver_operation_hash(name: &str, ttl_secs: u64) -> [u8; 32] {
+    let ttl_secs = ttl_secs.to_be_bytes();
+    BlindBoxContext::operation_hash(&[b"agent-deliver", name.as_bytes(), ttl_secs.as_slice()])
 }
 
 #[cfg(unix)]
-fn agent_sign_operation_hash(scheme: &str, digest: &[u8; 32]) -> [u8; 32] {
-    BlindBoxContext::operation_hash(&[b"agent-sign", scheme.as_bytes(), digest.as_slice()])
+fn agent_sign_operation_hash(scheme: &str, digest: &[u8; 32], ttl_secs: u64) -> [u8; 32] {
+    let ttl_secs = ttl_secs.to_be_bytes();
+    BlindBoxContext::operation_hash(&[
+        b"agent-sign",
+        scheme.as_bytes(),
+        digest.as_slice(),
+        ttl_secs.as_slice(),
+    ])
 }
 
 fn deliver_cmd(args: &[OsString], config: &CliConfig, input: &mut impl Read) -> anyhow::Result<u8> {
@@ -2403,7 +2410,9 @@ fn handle_agent_frame_inner(
                         (
                             BlindBoxContext::agent_deliver(&scope_type, &scope_ref, &dek.name)
                                 .with_approval(&approval.nonce, approval.expires_at_unix)
-                                .with_operation_hash(agent_deliver_operation_hash(&dek.name)),
+                                .with_operation_hash(agent_deliver_operation_hash(
+                                    &dek.name, ttl_secs,
+                                )),
                             AgentDekKey {
                                 purpose,
                                 name: dek.name.clone(),
@@ -2426,7 +2435,9 @@ fn handle_agent_frame_inner(
                                 &digest,
                             )
                             .with_approval(&approval.nonce, approval.expires_at_unix)
-                            .with_operation_hash(agent_sign_operation_hash(&scheme, &digest)),
+                            .with_operation_hash(
+                                agent_sign_operation_hash(&scheme, &digest, ttl_secs),
+                            ),
                             AgentDekKey {
                                 purpose,
                                 name: dek.name.clone(),

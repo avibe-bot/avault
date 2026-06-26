@@ -141,8 +141,10 @@ fn aad_agent_deliver(
     name: &str,
     approval_nonce: &[u8],
     expires_at: u64,
+    ttl_secs: u64,
 ) -> Vec<u8> {
-    let operation_hash = operation_hash(&[b"agent-deliver", name.as_bytes()]);
+    let ttl_secs = ttl_secs.to_be_bytes();
+    let operation_hash = operation_hash(&[b"agent-deliver", name.as_bytes(), ttl_secs.as_slice()]);
     blind_box_aad(TestBlindBoxAad {
         purpose: "agent-deliver",
         name,
@@ -178,26 +180,36 @@ fn aad_sign(
     })
 }
 
+struct TestGrantApproval<'a> {
+    nonce: &'a [u8],
+    expires_at: u64,
+    ttl_secs: u64,
+}
+
 fn aad_agent_sign(
     scope_type: &str,
     scope_ref: &str,
     name: &str,
     scheme: &str,
-    digest_hex: &str,
-    approval_nonce: &[u8],
-    expires_at: u64,
+    digest: &[u8],
+    approval: TestGrantApproval<'_>,
 ) -> Vec<u8> {
-    let digest = hex::decode(digest_hex).unwrap();
-    let operation_hash = operation_hash(&[b"agent-sign", scheme.as_bytes(), digest.as_slice()]);
+    let ttl_secs = approval.ttl_secs.to_be_bytes();
+    let operation_hash = operation_hash(&[
+        b"agent-sign",
+        scheme.as_bytes(),
+        digest,
+        ttl_secs.as_slice(),
+    ]);
     blind_box_aad(TestBlindBoxAad {
         purpose: "agent-sign",
         name,
         scope_type,
         scope_ref,
         scheme,
-        digest: &digest,
-        approval_nonce,
-        approval_expires_at_unix: Some(expires_at),
+        digest,
+        approval_nonce: approval.nonce,
+        approval_expires_at_unix: Some(approval.expires_at),
         operation_hash: &operation_hash,
     })
 }
@@ -944,7 +956,7 @@ fn agent_grant_deliver_inject_release_roundtrip() {
                     "dek_blindbox": fixed_blind_box(
                         public_key,
                         &dek,
-                        &aad_agent_deliver("session", "agent-test", "API_TOKEN", approval_nonce, approval_expires_at)
+                        &aad_agent_deliver("session", "agent-test", "API_TOKEN", approval_nonce, approval_expires_at, 60)
                     ),
                     "approval": approval_json(approval_nonce, approval_expires_at)
                 }
@@ -1000,7 +1012,8 @@ fn agent_grant_deliver_inject_release_roundtrip() {
                             "agent-test",
                             "API_TOKEN",
                             approval_nonce,
-                            approval_expires_at
+                            approval_expires_at,
+                            60
                         )
                     ),
                     "approval": approval_json(approval_nonce, approval_expires_at)
@@ -1051,7 +1064,7 @@ fn agent_rejects_empty_scope_and_excessive_ttl() {
         "dek_blindbox": fixed_blind_box(
             public_key,
             &dek,
-            &aad_agent_deliver("session", "bad-test", "API_TOKEN", approval_nonce, approval_expires_at)
+            &aad_agent_deliver("session", "bad-test", "API_TOKEN", approval_nonce, approval_expires_at, 60)
         ),
         "approval": approval_json(approval_nonce, approval_expires_at)
     });
@@ -1182,7 +1195,7 @@ fn agent_expires_grants_by_ttl() {
                     "dek_blindbox": fixed_blind_box(
                         public_key,
                         &dek,
-                        &aad_agent_deliver("session", "ttl-test", "API_TOKEN", approval_nonce, approval_expires_at)
+                        &aad_agent_deliver("session", "ttl-test", "API_TOKEN", approval_nonce, approval_expires_at, 1)
                     ),
                     "approval": approval_json(approval_nonce, approval_expires_at)
                 }
@@ -1238,7 +1251,7 @@ fn agent_purges_grants_while_deliver_run_child_is_running() {
                     "dek_blindbox": fixed_blind_box(
                         public_key,
                         &dek,
-                        &aad_agent_deliver("session", "run-purge", "API_TOKEN", approval_nonce, approval_expires_at)
+                        &aad_agent_deliver("session", "run-purge", "API_TOKEN", approval_nonce, approval_expires_at, 1)
                     ),
                     "approval": approval_json(approval_nonce, approval_expires_at)
                 }
@@ -1286,6 +1299,53 @@ fn agent_purges_grants_while_deliver_run_child_is_running() {
 }
 
 #[test]
+fn agent_rejects_grant_ttl_escalation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("run").join("avault.sock");
+    let mut agent = spawn_agent(&socket, 60);
+    let mut stream = connect_agent(&socket);
+    let pubkey = agent_request(&mut stream, json!({"type": "pubkey"}));
+    let public_key = pubkey["result"]["public_key"].as_str().unwrap();
+    let dek = [0x57u8; 32];
+    let approval_nonce = b"agent-ttl-bind1";
+    let approval_expires_at = future_expiry();
+    let approved_ttl_secs = 1;
+
+    let escalated = agent_request(
+        &mut stream,
+        json!({
+            "type": "grant",
+            "scope_type": "session",
+            "scope_ref": "ttl-bind",
+            "ttl_secs": 60,
+            "deks": [
+                {
+                    "name": "API_TOKEN",
+                    "dek_blindbox": fixed_blind_box(
+                        public_key,
+                        &dek,
+                        &aad_agent_deliver(
+                            "session",
+                            "ttl-bind",
+                            "API_TOKEN",
+                            approval_nonce,
+                            approval_expires_at,
+                            approved_ttl_secs
+                        )
+                    ),
+                    "approval": approval_json(approval_nonce, approval_expires_at)
+                }
+            ]
+        }),
+    );
+    assert_eq!(escalated["ok"], false);
+    assert!(!escalated["error"].as_str().unwrap().is_empty());
+
+    let _ = agent.kill();
+    let _ = agent.wait();
+}
+
+#[test]
 fn agent_signs_with_cached_dek_grant() {
     let tmp = tempfile::tempdir().unwrap();
     let socket = tmp.path().join("run").join("avault.sock");
@@ -1320,9 +1380,12 @@ fn agent_signs_with_cached_dek_grant() {
                             "sign-test",
                             "AGENT_SIGNING_KEY",
                             "ecdsa-secp256k1-der",
-                            signing["digest_hex"].as_str().unwrap(),
-                            approval_nonce,
-                            approval_expires_at
+                            &hex::decode(signing["digest_hex"].as_str().unwrap()).unwrap(),
+                            TestGrantApproval {
+                                nonce: approval_nonce,
+                                expires_at: approval_expires_at,
+                                ttl_secs: 60
+                            }
                         )
                     ),
                     "approval": approval_json(approval_nonce, approval_expires_at)
@@ -1398,7 +1461,7 @@ fn agent_idle_timeout_clears_grants() {
                     "dek_blindbox": fixed_blind_box(
                         public_key,
                         &dek,
-                        &aad_agent_deliver("session", "idle-test", "API_TOKEN", approval_nonce, approval_expires_at)
+                        &aad_agent_deliver("session", "idle-test", "API_TOKEN", approval_nonce, approval_expires_at, 60)
                     ),
                     "approval": approval_json(approval_nonce, approval_expires_at)
                 }

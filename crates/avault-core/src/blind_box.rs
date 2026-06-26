@@ -445,6 +445,24 @@ mod tests {
             {
                 let operation_hash: [u8; KEY_BYTES] =
                     hex::decode(operation_hash_hex).unwrap().try_into().unwrap();
+                if let Some(ttl_secs) = case["ttl_secs"].as_u64() {
+                    let ttl_secs = ttl_secs.to_be_bytes();
+                    let expected = match purpose {
+                        "agent-deliver" => BlindBoxContext::operation_hash(&[
+                            b"agent-deliver",
+                            name.as_bytes(),
+                            ttl_secs.as_slice(),
+                        ]),
+                        "agent-sign" => BlindBoxContext::operation_hash(&[
+                            b"agent-sign",
+                            sign_scheme.as_bytes(),
+                            context.digest.as_ref().unwrap().as_slice(),
+                            ttl_secs.as_slice(),
+                        ]),
+                        _ => panic!("ttl_secs is only valid for agent grant vectors"),
+                    };
+                    assert_eq!(operation_hash, expected);
+                }
                 context = context.with_operation_hash(operation_hash);
             }
             assert_eq!(hex::encode(context.aad_bytes()), case["aad_hex"]);

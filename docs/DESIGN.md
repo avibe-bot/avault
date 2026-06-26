@@ -553,8 +553,8 @@ their approval expiry. Current `purpose` and `operation_hash` values:
 | one-shot protected `deliver fetch` | `deliver` | `name`, approval | `"deliver-fetch"`, method, url, canonical allowed hosts, canonical headers, body-or-empty, canonical inject |
 | one-shot protected `deliver inject` | `deliver` | `name`, approval | `"deliver-inject"`, rendered key/env name, lowercase format, UTF-8 path |
 | one-shot protected `sign` | `sign` | `name`, `sign_scheme`, `digest`, approval | `"sign"`, scheme, raw 32-byte digest |
-| agent delivery grant | `agent-deliver` | `scope_type`, `scope_ref`, `name`, approval | `"agent-deliver"`, name |
-| agent signing grant | `agent-sign` | `scope_type`, `scope_ref`, `name`, `sign_scheme`, `digest`, approval | `"agent-sign"`, scheme, raw 32-byte digest |
+| agent delivery grant | `agent-deliver` | `scope_type`, `scope_ref`, `name`, approval, `ttl_secs` | `"agent-deliver"`, name, `ttl_secs_u64_be` |
+| agent signing grant | `agent-sign` | `scope_type`, `scope_ref`, `name`, `sign_scheme`, `digest`, approval, `ttl_secs` | `"agent-sign"`, scheme, raw 32-byte digest, `ttl_secs_u64_be` |
 
 For fetch operation hashes, canonical allowed hosts are lowercased and joined by
 NUL. Canonical headers are sorted by JSON object key and encoded as
@@ -831,7 +831,10 @@ Response:
 include `scheme` or `digest`; a signing grant must include both. `digest` is hex
 on the JSON wire, but the blind-box AAD authenticates the decoded 32-byte digest.
 `scope_type` and `scope_ref` must be non-empty. `ttl_secs` defaults to 300, must
-be positive, and is capped at 86400. The effective grant expiry is the earlier of
+be positive, and is capped at 86400. The same normalized `ttl_secs` value is
+authenticated in each grant DEK blind box as an 8-byte unsigned big-endian field
+inside `operation_hash`, so a daemon cannot replay a shorter approved release
+into a longer agent grant. The effective grant expiry is the earlier of
 `ttl_secs` and the approval expiry; TTLs never slide.
 
 `release` and `revoke` are aliases. They drop and zeroize the grant if present:
