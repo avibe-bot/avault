@@ -86,6 +86,16 @@ impl MasterKey {
         Ok(Self { page })
     }
 
+    /// Copy a 32-byte secret into a dedicated locked, zeroizing page.
+    ///
+    /// The resident agent uses this for cached protected-tier DEKs. The type name remains
+    /// `MasterKey` because it is the existing locked 32-byte secret primitive in this crate.
+    pub fn from_bytes(bytes: &[u8; MASTER_KEY_BYTES]) -> anyhow::Result<Self> {
+        let mut key = Self::zeroed_locked()?;
+        key.as_mut_bytes().copy_from_slice(bytes);
+        Ok(key)
+    }
+
     fn generate_locked() -> anyhow::Result<Self> {
         let mut key = Self::zeroed_locked()?;
         OsRng.fill_bytes(key.as_mut_bytes());
