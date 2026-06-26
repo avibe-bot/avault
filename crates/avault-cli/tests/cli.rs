@@ -1215,6 +1215,77 @@ fn agent_expires_grants_by_ttl() {
 }
 
 #[test]
+fn agent_purges_grants_while_deliver_run_child_is_running() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("run").join("avault.sock");
+    let mut agent = spawn_agent(&socket, 60);
+    let mut stream = connect_agent(&socket);
+    let pubkey = agent_request(&mut stream, json!({"type": "pubkey"}));
+    let public_key = pubkey["result"]["public_key"].as_str().unwrap();
+    let dek = [0x56u8; 32];
+    let approval_nonce = b"agent-run-purge1";
+    let approval_expires_at = future_expiry();
+    let grant = agent_request(
+        &mut stream,
+        json!({
+            "type": "grant",
+            "scope_type": "session",
+            "scope_ref": "run-purge",
+            "ttl_secs": 1,
+            "deks": [
+                {
+                    "name": "API_TOKEN",
+                    "dek_blindbox": fixed_blind_box(
+                        public_key,
+                        &dek,
+                        &aad_agent_deliver("session", "run-purge", "API_TOKEN", approval_nonce, approval_expires_at)
+                    ),
+                    "approval": approval_json(approval_nonce, approval_expires_at)
+                }
+            ]
+        }),
+    );
+    assert_eq!(grant["ok"], true);
+
+    let envelope = envelope_encrypted_with_dek("API_TOKEN", &dek, b"running");
+    let delivered = agent_request(
+        &mut stream,
+        json!({
+            "type": "deliver",
+            "scope_type": "session",
+            "scope_ref": "run-purge",
+            "mode": "run",
+            "command": ["/bin/sh", "-c", "sleep 2"],
+            "secrets": [
+                {"name": "API_TOKEN", "env": "API_TOKEN", "envelope": envelope.clone()}
+            ]
+        }),
+    );
+    assert_eq!(delivered["ok"], true);
+    assert_eq!(delivered["result"]["exit_code"], 0);
+
+    let denied = agent_request(
+        &mut stream,
+        json!({
+            "type": "deliver",
+            "scope_type": "session",
+            "scope_ref": "run-purge",
+            "mode": "inject",
+            "path": tmp.path().join("purged.env"),
+            "format": "dotenv",
+            "secrets": [
+                {"name": "API_TOKEN", "key": "API_TOKEN", "envelope": envelope}
+            ]
+        }),
+    );
+    assert_eq!(denied["ok"], false);
+    assert!(denied["error"].as_str().unwrap().contains("grant"));
+
+    let _ = agent.kill();
+    let _ = agent.wait();
+}
+
+#[test]
 fn agent_signs_with_cached_dek_grant() {
     let tmp = tempfile::tempdir().unwrap();
     let socket = tmp.path().join("run").join("avault.sock");
@@ -1461,6 +1532,29 @@ fn deliver_run_accepts_multiple_secrets_for_one_child() {
     let output = deliver.wait_with_output().unwrap();
     assert!(output.status.success());
     assert_eq!(output.stdout, b"ok");
+}
+
+#[test]
+fn deliver_run_rejects_empty_secret_list() {
+    let home = tempfile::tempdir().unwrap();
+    let mut deliver = avault()
+        .arg("deliver")
+        .arg("run")
+        .arg("--")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg("printf should-not-run")
+        .env("AVAULT_HOME", home.path().join("vault"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    deliver.stdin.as_mut().unwrap().write_all(b"[]").unwrap();
+    let output = deliver.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(70));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("at least one secret"));
 }
 
 #[cfg(unix)]

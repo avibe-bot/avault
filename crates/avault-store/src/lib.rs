@@ -18,6 +18,8 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 #[cfg(unix)]
+use std::os::fd::{AsFd, AsRawFd};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
@@ -222,6 +224,92 @@ pub fn harden_process_memory() {
 /// Apply best-effort process-wide memory hardening before secret material is read.
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 pub fn harden_process_memory() {}
+
+/// Authorize a connected Unix-domain socket peer by kernel credentials.
+///
+/// The resident agent calls this before processing any frame. It accepts only a
+/// same-uid peer and deliberately does not use a shared token that could become
+/// another secret in the Python daemon.
+#[cfg(unix)]
+pub fn authorize_same_uid_peer(stream: &impl AsFd) -> anyhow::Result<()> {
+    let peer_uid = peer_uid(stream)?;
+    let current_uid = current_euid();
+    if peer_uid != current_uid {
+        bail!("agent peer uid is not authorized");
+    }
+    Ok(())
+}
+
+/// Return this process's effective Unix uid.
+#[cfg(unix)]
+pub fn effective_uid() -> u32 {
+    current_euid()
+}
+
+#[cfg(target_os = "linux")]
+fn peer_uid(stream: &impl AsFd) -> anyhow::Result<u32> {
+    let fd = stream.as_fd().as_raw_fd();
+    let mut cred = std::mem::MaybeUninit::<libc::ucred>::zeroed();
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // Safety invariant: `fd` is a live Unix stream socket. `getsockopt(SO_PEERCRED)` writes only
+    // kernel peer-credential metadata into the stack buffer so the agent can reject other users
+    // before any secret-bearing frame is honored.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            cred.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        bail!("failed to read peer credentials");
+    }
+    // Safety invariant: `getsockopt` succeeded and initialized `cred`.
+    let cred = unsafe { cred.assume_init() };
+    Ok(cred.uid)
+}
+
+#[cfg(target_os = "macos")]
+fn peer_uid(stream: &impl AsFd) -> anyhow::Result<u32> {
+    let fd = stream.as_fd().as_raw_fd();
+    let mut cred = std::mem::MaybeUninit::<libc::xucred>::zeroed();
+    let mut len = std::mem::size_of::<libc::xucred>() as libc::socklen_t;
+    // Safety invariant: `fd` is a live Unix stream socket. `getsockopt(LOCAL_PEERCRED)` writes
+    // only kernel peer-credential metadata into the stack buffer so same-uid authorization does
+    // not depend on a shared secret in Python.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERCRED,
+            cred.as_mut_ptr().cast(),
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        bail!("failed to read peer credentials");
+    }
+    // Safety invariant: `getsockopt` succeeded and initialized `cred`.
+    let cred = unsafe { cred.assume_init() };
+    if cred.cr_version != libc::XUCRED_VERSION {
+        bail!("peer credentials have unsupported version");
+    }
+    Ok(cred.cr_uid)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn peer_uid(_stream: &impl AsFd) -> anyhow::Result<u32> {
+    bail!("agent peer credentials are unsupported on this Unix platform")
+}
+
+#[cfg(unix)]
+fn current_euid() -> u32 {
+    // Safety invariant: `geteuid` reads process identity metadata only. The agent uses this to
+    // compare the kernel-reported peer uid against its own uid before processing frames.
+    unsafe { libc::geteuid() }
+}
 
 /// Return the default P1 master-key path: `$AVAULT_HOME/machine.key` or
 /// `$HOME/.avibe/state/vault/machine.key`.

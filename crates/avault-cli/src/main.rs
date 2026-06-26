@@ -21,8 +21,6 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read, Write};
 #[cfg(unix)]
-use std::os::fd::AsRawFd;
-#[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -599,6 +597,9 @@ fn deliver_run_cmd(
         let input = read_json_input(input, "failed to read deliver run JSON from stdin")?;
         let secrets: Vec<EnvSecretInput> =
             serde_json::from_slice(input.as_slice()).context("deliver run JSON is invalid")?;
+        if secrets.is_empty() {
+            bail!("deliver run requires at least one secret");
+        }
         let command_fields = if secrets.iter().any(|secret| secret.dek_blindbox.is_some()) {
             Some(os_command_fields(command)?)
         } else {
@@ -725,10 +726,20 @@ fn default_inject_format() -> String {
 
 fn run_child_with_opened_env(
     command: &[OsString],
-    mut opened: Vec<OpenedSecret>,
+    opened: Vec<OpenedSecret>,
     envelope_stdin: bool,
 ) -> anyhow::Result<u8> {
-    let mut child = {
+    let mut child = spawn_child_with_opened_env(command, opened, envelope_stdin)?;
+    let status = child.wait().context("failed to wait for child command")?;
+    Ok(status_to_exit_code(status))
+}
+
+fn spawn_child_with_opened_env(
+    command: &[OsString],
+    mut opened: Vec<OpenedSecret>,
+    envelope_stdin: bool,
+) -> anyhow::Result<std::process::Child> {
+    let child = {
         let mut child = Command::new(&command[0]);
         child.args(&command[1..]);
         for secret in &opened {
@@ -752,9 +763,27 @@ fn run_child_with_opened_env(
     };
     opened.zeroize();
     drop(opened);
+    Ok(child)
+}
 
-    let status = child.wait().context("failed to wait for child command")?;
-    Ok(status_to_exit_code(status))
+#[cfg(unix)]
+fn run_agent_child_with_opened_env(
+    command: &[OsString],
+    opened: Vec<OpenedSecret>,
+    envelope_stdin: bool,
+    state: &mut AgentState,
+) -> anyhow::Result<u8> {
+    let mut child = spawn_child_with_opened_env(command, opened, envelope_stdin)?;
+    loop {
+        state.purge();
+        if let Some(status) = child
+            .try_wait()
+            .context("failed to wait for child command")?
+        {
+            return Ok(status_to_exit_code(status));
+        }
+        std::thread::sleep(AGENT_POLL_INTERVAL);
+    }
 }
 
 fn open_env_secrets(
@@ -2295,7 +2324,7 @@ fn ensure_agent_socket_parent(parent: &Path) -> anyhow::Result<()> {
     if !metadata.is_dir() {
         bail!("agent runtime path parent is not a directory");
     }
-    if metadata.uid() != unsafe_geteuid() {
+    if metadata.uid() != avault_store::effective_uid() {
         bail!("agent runtime directory is not owned by the current user");
     }
     if metadata.permissions().mode() & 0o077 != 0 {
@@ -2446,9 +2475,12 @@ fn handle_agent_frame_inner(
                     if command.is_empty() {
                         bail!("deliver run requires a command");
                     }
+                    if secrets.is_empty() {
+                        bail!("deliver run requires at least one secret");
+                    }
                     let command: Vec<OsString> = command.into_iter().map(OsString::from).collect();
                     let opened = open_env_secrets_with_grant(secrets, grant)?;
-                    let exit_code = run_child_with_opened_env(&command, opened, true)?;
+                    let exit_code = run_agent_child_with_opened_env(&command, opened, true, state)?;
                     agent_ok(AgentRunOutput { exit_code })
                 }
                 AgentDeliverMode::Fetch {
@@ -2708,88 +2740,39 @@ fn write_agent_frame(stream: &mut UnixStream, bytes: &[u8]) -> anyhow::Result<()
         .len()
         .try_into()
         .context("agent frame exceeds supported size")?;
-    stream
-        .write_all(&len.to_be_bytes())
-        .context("failed to write agent frame length")?;
-    stream
-        .write_all(bytes)
-        .context("failed to write agent frame")?;
+    write_all_agent(stream, &len.to_be_bytes()).context("failed to write agent frame length")?;
+    write_all_agent(stream, bytes).context("failed to write agent frame")?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn write_all_agent(stream: &mut UnixStream, mut bytes: &[u8]) -> io::Result<()> {
+    let write_deadline = Instant::now()
+        + Duration::from_millis(
+            AGENT_POLL_INTERVAL.as_millis() as u64 * u64::from(MAX_AGENT_READ_TIMEOUTS),
+        );
+    while !bytes.is_empty() {
+        match stream.write(bytes) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) => bytes = &bytes[n..],
+            Err(err)
+                if err.kind() == std::io::ErrorKind::WouldBlock
+                    || err.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                if Instant::now() >= write_deadline {
+                    return Err(std::io::ErrorKind::TimedOut.into());
+                }
+                std::thread::sleep(AGENT_POLL_INTERVAL);
+            }
+            Err(err) => return Err(err),
+        }
+    }
     Ok(())
 }
 
 #[cfg(unix)]
 fn authorize_peer(stream: &UnixStream) -> anyhow::Result<()> {
-    let peer_uid = peer_uid(stream)?;
-    let current_uid = unsafe_geteuid();
-    if peer_uid != current_uid {
-        bail!("agent peer uid is not authorized");
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn peer_uid(stream: &UnixStream) -> anyhow::Result<u32> {
-    let fd = stream.as_raw_fd();
-    let mut cred = std::mem::MaybeUninit::<libc::ucred>::zeroed();
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    // Safety invariant: `fd` is a live Unix stream socket. `getsockopt(SO_PEERCRED)` writes only
-    // kernel peer-credential metadata into the stack buffer so the agent can reject other users
-    // before any secret-bearing frame is honored.
-    let rc = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            cred.as_mut_ptr().cast(),
-            &mut len,
-        )
-    };
-    if rc != 0 {
-        bail!("failed to read peer credentials");
-    }
-    // Safety invariant: `getsockopt` succeeded and initialized `cred`.
-    let cred = unsafe { cred.assume_init() };
-    Ok(cred.uid)
-}
-
-#[cfg(target_os = "macos")]
-fn peer_uid(stream: &UnixStream) -> anyhow::Result<u32> {
-    let fd = stream.as_raw_fd();
-    let mut cred = std::mem::MaybeUninit::<libc::xucred>::zeroed();
-    let mut len = std::mem::size_of::<libc::xucred>() as libc::socklen_t;
-    // Safety invariant: `fd` is a live Unix stream socket. `getsockopt(LOCAL_PEERCRED)` writes
-    // only kernel peer-credential metadata into the stack buffer so same-uid authorization does
-    // not depend on a shared secret in Python.
-    let rc = unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_LOCAL,
-            libc::LOCAL_PEERCRED,
-            cred.as_mut_ptr().cast(),
-            &mut len,
-        )
-    };
-    if rc != 0 {
-        bail!("failed to read peer credentials");
-    }
-    // Safety invariant: `getsockopt` succeeded and initialized `cred`.
-    let cred = unsafe { cred.assume_init() };
-    if cred.cr_version != libc::XUCRED_VERSION {
-        bail!("peer credentials have unsupported version");
-    }
-    Ok(cred.cr_uid)
-}
-
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-fn peer_uid(_stream: &UnixStream) -> anyhow::Result<u32> {
-    bail!("agent peer credentials are unsupported on this Unix platform")
-}
-
-#[cfg(unix)]
-fn unsafe_geteuid() -> u32 {
-    // Safety invariant: `geteuid` reads process identity metadata only. The agent uses this to
-    // compare the kernel-reported peer uid against its own uid before processing frames.
-    unsafe { libc::geteuid() }
+    avault_store::authorize_same_uid_peer(stream)
 }
 
 fn read_stdin_zeroizing_from(reader: &mut impl Read) -> anyhow::Result<Zeroizing<Vec<u8>>> {
