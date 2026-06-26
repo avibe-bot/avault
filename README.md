@@ -3,7 +3,7 @@
 A small, hardened **Rust key-custody core** for [Avibe](https://github.com/avibe-bot/avibe) Vaults — the one component that ever holds a key or performs cryptography, so the agent (and Python) never do.
 
 > **Status: P1.1 standard-tier core.** The standard-tier Rust crypto core,
-> `file+mlock` master-key store, and one-shot CLI delivery surface are implemented.
+> cross-platform file master-key store, and one-shot CLI delivery surface are implemented.
 > The resident agent, pubkey/blind-box receiver, signer, protected tier, and
 > hardware stores remain P2+.
 
@@ -20,9 +20,9 @@ avault makes the split real:
 - **Python never holds keys, never decrypts, never keeps reusable secret state.** It relays only ciphertext or **blind boxes** (sealed to avault). avault is the sole opener, and **plaintext only flows in — never back out**.
 - **No `decrypt → plaintext` verb.** A value can only be *delivered* (into a child env / file / HTTP egress) or *signed*; it is never returned to the caller.
 - **Two trust roots, chosen per secret:**
-  - **Standard (machine-rooted):** master key in a hardware keystore (Keychain / Secure Enclave / TPM) or `file+mlock`. Headless use OK. For API keys.
+  - **Standard (machine-rooted):** master key in a hardware keystore (Keychain / Secure Enclave / TPM) or the cross-platform file store. Headless use OK. For API keys.
   - **Protected (human-rooted):** the root (VMK) is wrapped by a passkey/password and only the browser can unlock it; the machine alone cannot decrypt. No headless use. For signing keys & crown jewels.
-- **Rust memory hygiene** Python structurally can't do: `zeroize` on `Drop`, constant-time compare (`subtle`), `mlock` / no-coredump on key pages.
+- **Rust memory hygiene** Python structurally can't do: `zeroize` on `Drop`, constant-time compare (`subtle`), `mlock` / `VirtualLock` / no-coredump on key pages.
 
 ## Interface (deliberately narrow)
 
@@ -49,6 +49,9 @@ read-compatible only.
 
 The P1 file store uses `$AVAULT_HOME/machine.key` when `AVAULT_HOME` is set, or
 `$HOME/.avibe/state/vault/machine.key` by default, matching the P0 Python basename.
+On Unix it requires a 0700 parent directory and a 0600 key file. On Windows it
+sets and validates a protected owner-only DACL for the key directory and key file
+(existing broad ACLs are rejected rather than silently rewritten).
 
 `deliver run` reads envelope JSON from stdin by default, opens it with the local
 master key, injects the value into the requested env var for the child command,
@@ -93,7 +96,9 @@ envelope; loopback hosts are not implicit. Output is response JSON
 `{status, headers, body}`. `https` is required except for loopback `http`,
 unsafe echo methods are rejected before decrypting, conflicting injected
 header/query fields are rejected, transport errors are sanitized, and the
-response body is capped.
+response body is capped. avault also best-effort redacts verbatim appearances of
+the credential from the returned response body; encoded or transformed echoes are
+outside that substring scrub, so `allowed_hosts` remains the authority boundary.
 
 `deliver inject` accepts:
 
@@ -111,8 +116,8 @@ response body is capped.
 }
 ```
 
-P1.1 implements `dotenv` and `json` files with atomic 0600 writes; `yaml` and
-`toml` remain deferred.
+P1.1 implements `dotenv` and `json` files with atomic owner-only writes: 0600 on
+Unix and a protected owner-only DACL on Windows. `yaml` and `toml` remain deferred.
 
 `key export` reads a passphrase from stdin and emits the P0-compatible
 `machine-key-export-v1` JSON blob. `key import` reads JSON from stdin:
@@ -138,7 +143,7 @@ Like the `askill` dependency: ensured by `vibe runtime prepare`, resolved on `PA
 ```
 crates/
   avault-core/    pure crypto: AEAD+AAD, DEK wrap, blind-box open, sign — no I/O, zeroized
-  avault-store/   cross-platform master/VMK store: file+mlock → keychain/SE/TPM/KMS
+  avault-store/   cross-platform master/VMK store: file+mlock / Windows DACL → keychain/SE/TPM/KMS
   avault-cli/     the `avault` binary: one-shot CLI + resident agent
 docs/
   DESIGN.md       the full custody-core design (authoritative)
@@ -154,7 +159,7 @@ cargo clippy --all-targets
 
 ## Roadmap
 
-- **P1** — `avault-core` + CLI + `file+mlock` store; Rust takes the standard-tier seal/open. Closes the Python memory-hygiene gap.
+- **P1** — `avault-core` + CLI + cross-platform file store; Rust takes the standard-tier seal/open. Closes the Python memory-hygiene gap.
 - **P1.1** — complete standard-tier delivery: multi-secret run, brokered fetch, and atomic dotenv/json inject.
 - **P2** — resident agent + `SO_PEERCRED` + scope-grant DEK cache + secp256k1 signer; hardware-store backends.
 - **P3** — multi-factor (passkey-PRF, TPM, KMS); external signer (hardware wallet / WalletConnect).
