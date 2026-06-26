@@ -110,6 +110,27 @@ fn seal_and_deliver_run_roundtrip() {
 }
 
 #[test]
+fn seal_creates_missing_relative_avault_home() {
+    let workdir = tempfile::tempdir().unwrap();
+
+    let mut seal = avault()
+        .arg("seal")
+        .arg("--name")
+        .arg("RELATIVE_HOME_SECRET")
+        .env("AVAULT_HOME", "vault")
+        .current_dir(workdir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    seal.stdin.as_mut().unwrap().write_all(b"value").unwrap();
+    let output = seal.wait_with_output().unwrap();
+
+    assert!(output.status.success());
+    assert!(workdir.path().join("vault").join("machine.key").exists());
+}
+
+#[test]
 fn deliver_run_returns_child_exit_code() {
     let home = tempfile::tempdir().unwrap();
 
@@ -443,7 +464,7 @@ fn deliver_fetch_redacts_verbatim_echoed_credential() {
     let sealed = seal_secret(
         home.path().join("vault").as_path(),
         "API_TOKEN",
-        b"token-echo",
+        b"token-echo\n",
     );
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -661,6 +682,45 @@ fn deliver_fetch_rejects_invalid_injected_header_name_before_opening() {
             "url": "https://api.example.com/resource",
             "allowed_hosts": ["api.example.com"],
             "inject": {"type": "header", "name": "X Api Key"}
+        }
+    });
+
+    let mut fetch = avault()
+        .arg("deliver")
+        .arg("fetch")
+        .env("AVAULT_HOME", home.path().join("vault"))
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    fetch
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let output = fetch.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(70));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("invalid fetch header name"));
+    assert!(!stderr.contains("open failed"));
+}
+
+#[test]
+fn deliver_fetch_rejects_empty_injected_header_name_before_opening() {
+    let home = tempfile::tempdir().unwrap();
+    let request = json!({
+        "name": "API_TOKEN",
+        "envelope": {
+            "ciphertext": "not-base64",
+            "nonce": "not-base64",
+            "wrap_meta": "{}"
+        },
+        "request": {
+            "method": "GET",
+            "url": "https://api.example.com/resource",
+            "allowed_hosts": ["api.example.com"],
+            "inject": {"type": "header", "name": ""}
         }
     });
 
@@ -980,6 +1040,91 @@ fn deliver_inject_writes_dotenv_and_json_as_0600() {
     let parsed: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&json_path).unwrap()).unwrap();
     assert_eq!(parsed, json!({"A_KEY": "alpha-1", "B_KEY": "beta-2"}));
+}
+
+#[test]
+fn deliver_inject_writes_into_existing_project_directory() {
+    let home = tempfile::tempdir().unwrap();
+    let sealed = seal_secret(home.path().join("vault").as_path(), "A_KEY", b"alpha-1");
+    let project_dir = home.path().join("project");
+    fs::create_dir(&project_dir).unwrap();
+    fs::set_permissions(&project_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    let inject_path = project_dir.join("secrets.env");
+    let request = json!({
+        "path": inject_path,
+        "format": "dotenv",
+        "secrets": [
+            {"name": "A_KEY", "key": "A_KEY", "envelope": sealed}
+        ]
+    });
+
+    let mut inject = avault()
+        .arg("deliver")
+        .arg("inject")
+        .env("AVAULT_HOME", home.path().join("vault"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    inject
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let output = inject.wait_with_output().unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        fs::metadata(&project_dir).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    assert_eq!(
+        fs::metadata(&inject_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn deliver_inject_preserves_relative_output_path() {
+    let home = tempfile::tempdir().unwrap();
+    let workdir = tempfile::tempdir().unwrap();
+    let sealed = seal_secret(home.path().join("vault").as_path(), "A_KEY", b"alpha-1");
+    let request = json!({
+        "path": "secrets.env",
+        "format": "dotenv",
+        "secrets": [
+            {"name": "A_KEY", "key": "A_KEY", "envelope": sealed}
+        ]
+    });
+
+    let mut inject = avault()
+        .arg("deliver")
+        .arg("inject")
+        .env("AVAULT_HOME", home.path().join("vault"))
+        .current_dir(workdir.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    inject
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let output = inject.wait_with_output().unwrap();
+    let inject_path = workdir.path().join("secrets.env");
+
+    assert!(output.status.success());
+    assert_eq!(
+        fs::metadata(&inject_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::read_to_string(inject_path).unwrap(),
+        "A_KEY='alpha-1'\n"
+    );
 }
 
 #[test]

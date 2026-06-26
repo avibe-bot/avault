@@ -34,10 +34,12 @@ use windows_sys::Win32::Security::Authorization::{
 };
 #[cfg(windows)]
 use windows_sys::Win32::Security::{
-    AddAccessAllowedAceEx, CreateWellKnownSid, EqualSid, GetAce, GetLengthSid, GetTokenInformation,
-    InitializeAcl, TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid, ACCESS_ALLOWED_ACE,
-    ACL, ACL_REVISION, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE,
-    PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY, TOKEN_USER,
+    AddAccessAllowedAceEx, CreateWellKnownSid, EqualSid, GetAce, GetLengthSid,
+    GetSecurityDescriptorControl, GetTokenInformation, InitializeAcl, TokenUser,
+    WinBuiltinAdministratorsSid, WinLocalSystemSid, ACCESS_ALLOWED_ACE, ACL, ACL_REVISION,
+    CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE,
+    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
 };
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
@@ -302,10 +304,7 @@ impl FileStore {
             bail!("master key already exists");
         }
 
-        let parent = self
-            .path
-            .parent()
-            .context("master key path has no parent")?;
+        let parent = writable_parent(&self.path);
         let tmp = write_synced_temp_secret_file(parent, ".machine.", ".tmp", key)?;
 
         if force {
@@ -326,10 +325,7 @@ impl FileStore {
         self.ensure_parent()?;
 
         let key = MasterKey::generate_locked()?;
-        let parent = self
-            .path
-            .parent()
-            .context("master key path has no parent")?;
+        let parent = writable_parent(&self.path);
         let tmp = write_synced_temp_secret_file(parent, ".machine.", ".tmp", key.as_bytes())?;
         drop(key);
 
@@ -345,10 +341,7 @@ impl FileStore {
     }
 
     fn ensure_parent(&self) -> anyhow::Result<()> {
-        let parent = self
-            .path
-            .parent()
-            .context("master key path has no parent")?;
+        let parent = writable_parent(&self.path);
         ensure_secret_parent_directory(parent)?;
         validate_directory_mode(parent)?;
         Ok(())
@@ -358,12 +351,12 @@ impl FileStore {
 /// Atomically write a secret-bearing file using owner-only permissions / ACLs.
 ///
 /// Unix callers get a 0600 file; Windows callers get a protected owner-only DACL.
-/// The parent directory is created only when missing and is never weakened or
-/// silently mutated if it already exists with unsafe permissions.
+/// This is for delivery targets such as `deliver inject`: the output file is
+/// private, but an existing project directory is allowed to keep normal project
+/// permissions.
 pub fn atomic_write_secret_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let parent = writable_parent(path);
-    ensure_secret_parent_directory(parent)?;
-    validate_directory_mode(parent)?;
+    ensure_output_parent_directory(parent)?;
     let tmp = write_synced_temp_secret_file(parent, ".avault.", ".tmp", bytes)?;
     tmp.persist(path)
         .map_err(|err| err.error)
@@ -401,6 +394,13 @@ fn writable_parent(path: &Path) -> &Path {
     }
 }
 
+fn ensure_output_parent_directory(parent: &Path) -> anyhow::Result<()> {
+    if parent.exists() {
+        return Ok(());
+    }
+    fs::create_dir_all(parent).context("failed to create secret output directory")
+}
+
 fn ensure_secret_parent_directory(parent: &Path) -> anyhow::Result<()> {
     if parent.exists() {
         validate_directory_mode(parent)?;
@@ -411,9 +411,10 @@ fn ensure_secret_parent_directory(parent: &Path) -> anyhow::Result<()> {
     let mut current = parent;
     while !current.exists() {
         missing.push(current.to_path_buf());
-        current = current
-            .parent()
-            .context("secret directory path has no existing ancestor")?;
+        current = match current.parent() {
+            Some(next) if !next.as_os_str().is_empty() => next,
+            _ => Path::new("."),
+        };
     }
 
     for dir in missing.iter().rev() {
@@ -452,8 +453,7 @@ fn secure_created_file(path: &Path) -> anyhow::Result<()> {
 }
 
 fn sync_parent_dir(path: &Path) -> anyhow::Result<()> {
-    let parent = path.parent().context("master key path has no parent")?;
-    sync_directory(parent)
+    sync_directory(writable_parent(path))
 }
 
 #[cfg(unix)]
@@ -523,8 +523,7 @@ fn validate_directory_mode(path: &Path) -> anyhow::Result<()> {
 }
 
 fn validate_parent_directory_mode(path: &Path) -> anyhow::Result<()> {
-    let parent = path.parent().context("master key path has no parent")?;
-    validate_directory_mode(parent)
+    validate_directory_mode(writable_parent(path))
 }
 
 #[cfg(windows)]
@@ -602,8 +601,10 @@ fn set_owner_only_acl(path: &Path, directory: bool) -> anyhow::Result<()> {
         SetNamedSecurityInfoW(
             wide.as_mut_ptr(),
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
+            OWNER_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION,
+            owner.as_psid(),
             std::ptr::null_mut(),
             acl,
             std::ptr::null_mut(),
@@ -624,16 +625,18 @@ fn validate_owner_only_acl(path: &Path, label: &str) -> anyhow::Result<()> {
     let allowed = [owner.as_psid(), system.as_psid(), administrators.as_psid()];
 
     let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut object_owner: PSID = std::ptr::null_mut();
     let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     let mut wide = wide_path(path);
     // Safety invariant: `wide` is a NUL-terminated object path. Windows returns a security
-    // descriptor that this function only inspects to reject unsafe ACLs before reading secrets.
+    // descriptor that this function only inspects to reject unsafe owners/ACLs before reading
+    // secrets.
     let rc = unsafe {
         GetNamedSecurityInfoW(
             wide.as_mut_ptr(),
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut object_owner,
             std::ptr::null_mut(),
             &mut dacl,
             std::ptr::null_mut(),
@@ -644,8 +647,21 @@ fn validate_owner_only_acl(path: &Path, label: &str) -> anyhow::Result<()> {
         bail!("failed to read {label} ACL");
     }
     let _sd = LocalSecurityDescriptor(sd);
+    if !equal_sid(object_owner, owner.as_psid()) {
+        bail!("{label} owner is not the current user");
+    }
     if dacl.is_null() {
         bail!("{label} ACL is missing");
+    }
+    let mut control = 0u16;
+    let mut revision = 0u32;
+    // Safety invariant: `sd` is the live security descriptor returned above. This reads only
+    // descriptor control flags so avault can reject inherited DACLs before trusting access.
+    if unsafe { GetSecurityDescriptorControl(sd, &mut control, &mut revision) } == 0 {
+        bail!("failed to inspect {label} ACL protection");
+    }
+    if control & SE_DACL_PROTECTED == 0 {
+        bail!("{label} ACL inheritance is enabled");
     }
 
     // Safety invariant: `dacl` is owned by the Windows security descriptor above and remains
@@ -964,15 +980,16 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn atomic_secret_file_rejects_existing_loose_parent_without_chmod() {
+    fn atomic_secret_file_allows_project_parent_without_chmod() {
         let tmp = tempfile::tempdir().unwrap();
-        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o755)).unwrap();
         let out = tmp.path().join("inject.env");
 
-        assert!(atomic_write_secret_file(&out, b"SECRET='value'\n").is_err());
+        atomic_write_secret_file(&out, b"SECRET='value'\n").unwrap();
         let mode = fs::metadata(tmp.path()).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o777);
-        assert!(!out.exists());
+        assert_eq!(mode, 0o755);
+        let file_mode = fs::metadata(out).unwrap().permissions().mode() & 0o777;
+        assert_eq!(file_mode, 0o600);
     }
 
     #[test]

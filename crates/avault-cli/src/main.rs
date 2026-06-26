@@ -317,10 +317,16 @@ fn deliver_fetch_cmd(args: &[OsString]) -> anyhow::Result<u8> {
 
     let mut secret_header: Option<(String, Zeroizing<String>)> = None;
     let mut target_url = Zeroizing::new(fetch.request.url.clone());
+    let mut redaction_needle: Option<Zeroizing<Vec<u8>>> = None;
     match &fetch.request.inject {
         FetchInject::Bearer => {
-            let secret_text =
-                fetch_header_credential(secret.as_slice(), "fetch bearer credential")?;
+            let credential =
+                fetch_header_credential_bytes(secret.as_slice(), "fetch bearer credential")?;
+            if !credential.is_empty() {
+                redaction_needle = Some(Zeroizing::new(credential.to_vec()));
+            }
+            let secret_text = std::str::from_utf8(credential)
+                .context("fetch bearer credential is not valid UTF-8")?;
             let mut bearer =
                 Zeroizing::new(String::with_capacity("Bearer ".len() + secret_text.len()));
             bearer.push_str("Bearer ");
@@ -328,20 +334,23 @@ fn deliver_fetch_cmd(args: &[OsString]) -> anyhow::Result<u8> {
             secret_header = Some(("Authorization".to_string(), bearer));
         }
         FetchInject::Header { name } => {
-            let secret_text =
-                fetch_header_credential(secret.as_slice(), "fetch header credential")?;
+            let credential =
+                fetch_header_credential_bytes(secret.as_slice(), "fetch header credential")?;
+            if !credential.is_empty() {
+                redaction_needle = Some(Zeroizing::new(credential.to_vec()));
+            }
+            let secret_text = std::str::from_utf8(credential)
+                .context("fetch header credential is not valid UTF-8")?;
             secret_header = Some((name.clone(), Zeroizing::new(secret_text.to_string())));
         }
         FetchInject::Query { name } => {
             let secret_text = secret_utf8(secret.as_slice(), "fetch query credential")?;
+            if !secret.is_empty() {
+                redaction_needle = Some(Zeroizing::new(secret.as_slice().to_vec()));
+            }
             target_url = build_secret_query_url(&fetch.request.url, name, secret_text)?;
         }
     }
-    let redaction_needle = if secret.is_empty() {
-        None
-    } else {
-        Some(Zeroizing::new(secret.as_slice().to_vec()))
-    };
     secret.zeroize();
     drop(secret);
 
@@ -435,39 +444,81 @@ fn read_capped_fetch_body(
     let mut reader = response
         .into_reader()
         .take((MAX_FETCH_BODY_BYTES as u64) + 1);
-    let mut body = Vec::new();
+    let mut body = Zeroizing::new(Vec::with_capacity(MAX_FETCH_BODY_BYTES + 1));
     reader
         .read_to_end(&mut body)
         .map_err(|_| anyhow!("failed to read fetch response body"))?;
     if body.len() > MAX_FETCH_BODY_BYTES {
         bail!("fetch response body exceeds size limit");
     }
-    if let Some(needle) = redaction_needle {
-        redact_verbatim_bytes(&mut body, needle);
+    redact_fetch_body(&mut body, redaction_needle)?;
+    match String::from_utf8(std::mem::take(&mut *body)) {
+        Ok(body) => Ok(body),
+        Err(err) => {
+            let mut bytes = err.into_bytes();
+            bytes.zeroize();
+            Err(anyhow!("fetch response body is not valid UTF-8"))
+        }
     }
-    String::from_utf8(body).map_err(|_| anyhow!("fetch response body is not valid UTF-8"))
 }
 
-fn redact_verbatim_bytes(body: &mut Vec<u8>, needle: &[u8]) {
+fn redact_fetch_body(body: &mut Vec<u8>, redaction_needle: Option<&[u8]>) -> anyhow::Result<()> {
+    if let Some(needle) = redaction_needle {
+        redact_verbatim_bytes(body, needle)?;
+    }
+    Ok(())
+}
+
+fn redact_verbatim_bytes(body: &mut Vec<u8>, needle: &[u8]) -> anyhow::Result<()> {
     const REDACTION: &[u8] = b"[avault-redacted]";
     if needle.is_empty() {
-        return;
+        return Ok(());
     }
     let mut index = 0;
-    let mut redacted = Zeroizing::new(Vec::with_capacity(body.len()));
+    let mut matches = 0usize;
+    while let Some(relative) = find_subslice(&body[index..], needle) {
+        matches += 1;
+        index += relative + needle.len();
+    }
+    if matches == 0 {
+        return Ok(());
+    }
+    let output_len = redacted_body_len(body.len(), matches, needle.len(), REDACTION.len())?;
+    if output_len > MAX_FETCH_BODY_BYTES {
+        bail!("fetch response body exceeds size limit");
+    }
+
+    let mut index = 0;
+    let mut redacted = Zeroizing::new(Vec::with_capacity(output_len));
     while let Some(relative) = find_subslice(&body[index..], needle) {
         let found = index + relative;
         redacted.extend_from_slice(&body[index..found]);
         redacted.extend_from_slice(REDACTION);
         index = found + needle.len();
     }
-    if index == 0 {
-        return;
-    }
     redacted.extend_from_slice(&body[index..]);
     body.zeroize();
     body.clear();
     body.extend_from_slice(&redacted);
+    Ok(())
+}
+
+fn redacted_body_len(
+    body_len: usize,
+    matches: usize,
+    needle_len: usize,
+    redaction_len: usize,
+) -> anyhow::Result<usize> {
+    if redaction_len >= needle_len {
+        let growth = matches
+            .checked_mul(redaction_len - needle_len)
+            .context("fetch response body exceeds size limit")?;
+        body_len
+            .checked_add(growth)
+            .context("fetch response body exceeds size limit")
+    } else {
+        Ok(body_len - matches * (needle_len - redaction_len))
+    }
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -599,7 +650,7 @@ fn secret_utf8<'a>(bytes: &'a [u8], label: &str) -> anyhow::Result<&'a str> {
     std::str::from_utf8(bytes).with_context(|| format!("{label} is not valid UTF-8"))
 }
 
-fn fetch_header_credential<'a>(bytes: &'a [u8], label: &str) -> anyhow::Result<&'a str> {
+fn fetch_header_credential_bytes<'a>(bytes: &'a [u8], label: &str) -> anyhow::Result<&'a [u8]> {
     let trimmed = match bytes.last() {
         Some(b'\r') | Some(b'\n') => &bytes[..bytes.len() - 1],
         _ => bytes,
@@ -610,7 +661,7 @@ fn fetch_header_credential<'a>(bytes: &'a [u8], label: &str) -> anyhow::Result<&
     if trimmed.iter().any(|byte| is_http_control_byte(*byte)) {
         bail!("{label} contains invalid HTTP header byte");
     }
-    std::str::from_utf8(trimmed).with_context(|| format!("{label} is not valid UTF-8"))
+    Ok(trimmed)
 }
 
 fn is_http_control_byte(byte: u8) -> bool {
@@ -778,7 +829,8 @@ fn reject_header_conflict(
 }
 
 fn validate_header_name(name: &str) -> anyhow::Result<()> {
-    if name.eq_ignore_ascii_case("host")
+    if name.is_empty()
+        || name.eq_ignore_ascii_case("host")
         || name
             .as_bytes()
             .iter()
@@ -1273,5 +1325,13 @@ mod tests {
         let blob = import_blob_from_json(input).unwrap();
 
         assert_eq!(blob.scheme, "machine-key-export-v1");
+    }
+
+    #[test]
+    fn redacted_fetch_body_enforces_size_cap_after_growth() {
+        let mut body = vec![b'b'; MAX_FETCH_BODY_BYTES];
+        body[0] = b'a';
+
+        assert!(redact_fetch_body(&mut body, Some(b"a")).is_err());
     }
 }
