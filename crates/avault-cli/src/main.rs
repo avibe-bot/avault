@@ -28,7 +28,6 @@ use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
-#[cfg(unix)]
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
