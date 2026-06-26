@@ -5,9 +5,14 @@
 //! buffer, with best-effort no-core/no-swap hardening. Stronger stores (Keychain /
 //! Secure Enclave / TPM / KMS) are P2+.
 
-use anyhow::{bail, Context};
+use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::{Aes256Gcm, Nonce};
+use anyhow::{anyhow, bail, Context};
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use rand::rngs::OsRng;
 use rand::RngCore;
+use serde::{Deserialize, Serialize};
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::env;
 use std::fs::{self, File};
@@ -16,7 +21,7 @@ use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(windows)]
 use std::ffi::OsStr;
@@ -64,6 +69,11 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken}
 
 /// Master key size for the standard-tier store.
 pub const MASTER_KEY_BYTES: usize = 32;
+const NONCE_BYTES: usize = 12;
+const PASSPHRASE_STORE_SCHEME: &str = "machine-key-passphrase-v1";
+const SCRYPT_N: u32 = 1 << 15;
+const SCRYPT_R: u32 = 8;
+const SCRYPT_P: u32 = 1;
 
 /// Selected master-key storage backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +81,7 @@ pub enum Backend {
     Tpm,
     Keychain,
     File,
+    FilePassphrase,
 }
 
 /// The loaded master key. The buffer is zeroized on drop and mlock'd where available.
@@ -225,6 +236,18 @@ pub fn default_master_key_path() -> anyhow::Result<PathBuf> {
         .join("machine.key"))
 }
 
+/// Return the opt-in passphrase-wrapped master-key path.
+pub fn default_passphrase_master_key_path() -> anyhow::Result<PathBuf> {
+    if let Some(home) = env::var_os("AVAULT_HOME") {
+        return Ok(PathBuf::from(home).join("machine.passphrase.json"));
+    }
+    Ok(user_home_dir()?
+        .join(".avibe")
+        .join("state")
+        .join("vault")
+        .join("machine.passphrase.json"))
+}
+
 #[cfg(not(windows))]
 fn user_home_dir() -> anyhow::Result<PathBuf> {
     env::var_os("HOME")
@@ -251,6 +274,9 @@ fn user_home_dir() -> anyhow::Result<PathBuf> {
 pub fn load_or_create_master_key(backend: Backend) -> anyhow::Result<MasterKey> {
     match backend {
         Backend::File => FileStore::new(default_master_key_path()?).get_or_create(),
+        Backend::FilePassphrase => {
+            bail!("passphrase backend requires an explicit passphrase unlock")
+        }
         Backend::Tpm | Backend::Keychain => {
             bail!("requested master-key backend is not implemented in P1")
         }
@@ -261,10 +287,23 @@ pub fn load_or_create_master_key(backend: Backend) -> anyhow::Result<MasterKey> 
 pub fn load_master_key(backend: Backend) -> anyhow::Result<MasterKey> {
     match backend {
         Backend::File => FileStore::new(default_master_key_path()?).get(),
+        Backend::FilePassphrase => {
+            bail!("passphrase backend requires an explicit passphrase unlock")
+        }
         Backend::Tpm | Backend::Keychain => {
             bail!("requested master-key backend is not implemented in P1")
         }
     }
+}
+
+/// Load or create the passphrase-wrapped master key with an explicit passphrase.
+pub fn load_or_create_passphrase_master_key(passphrase: &[u8]) -> anyhow::Result<MasterKey> {
+    PassphraseFileStore::new(default_passphrase_master_key_path()?).get_or_create(passphrase)
+}
+
+/// Unlock the existing passphrase-wrapped master key with an explicit passphrase.
+pub fn load_passphrase_master_key(passphrase: &[u8]) -> anyhow::Result<MasterKey> {
+    PassphraseFileStore::new(default_passphrase_master_key_path()?).get(passphrase)
 }
 
 /// P1 file-backed master-key store.
@@ -372,6 +411,276 @@ impl FileStore {
         validate_directory_mode(parent)?;
         Ok(())
     }
+}
+
+/// Passphrase-wrapped file store for the standard-tier master key.
+///
+/// Disk contains only a scrypt + AES-256-GCM wrapper. The plaintext master is
+/// generated and unlocked only into [`MasterKey`]'s locked, zeroizing page.
+#[derive(Debug, Clone)]
+pub struct PassphraseFileStore {
+    path: PathBuf,
+}
+
+impl PassphraseFileStore {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Return the master key, creating a wrapped store atomically if missing.
+    pub fn get_or_create(&self, passphrase: &[u8]) -> anyhow::Result<MasterKey> {
+        match self.get(passphrase) {
+            Ok(key) => Ok(key),
+            Err(_) => {
+                self.create_atomic(passphrase)?;
+                self.get(passphrase)
+            }
+        }
+    }
+
+    /// Unlock an existing passphrase-wrapped master key.
+    pub fn get(&self, passphrase: &[u8]) -> anyhow::Result<MasterKey> {
+        validate_passphrase(passphrase)?;
+        validate_parent_directory_mode(&self.path)?;
+        validate_file_mode(&self.path)?;
+        let bytes = fs::read(&self.path).context("passphrase master key not found")?;
+        let blob: PassphraseMasterBlob =
+            serde_json::from_slice(&bytes).context("passphrase master key JSON is invalid")?;
+        let mut key = unwrap_passphrase_master(&blob, passphrase)?;
+        let locked = MasterKey::from_bytes(&key).context("failed to lock unlocked master key")?;
+        key.zeroize();
+        Ok(locked)
+    }
+
+    /// Import a master key into the wrapped store, refusing to overwrite unless `force` is true.
+    pub fn import(
+        &self,
+        key: &[u8; MASTER_KEY_BYTES],
+        passphrase: &[u8],
+        force: bool,
+    ) -> anyhow::Result<()> {
+        validate_passphrase(passphrase)?;
+        self.ensure_parent()?;
+        if self.path.exists() && !force {
+            bail!("passphrase master key already exists");
+        }
+        let blob = wrap_passphrase_master(key, passphrase)?;
+        let bytes =
+            Zeroizing::new(serde_json::to_vec(&blob).context("failed to encode passphrase store")?);
+        let parent = writable_parent(&self.path);
+        let tmp = write_synced_temp_secret_file(
+            parent,
+            ".machine-passphrase.",
+            ".tmp",
+            bytes.as_slice(),
+            CreatedFileOwner::SetCurrentUser,
+        )?;
+
+        if force {
+            tmp.persist(&self.path)
+                .map_err(|err| err.error)
+                .context("failed to install passphrase master key")?;
+        } else {
+            tmp.persist_noclobber(&self.path)
+                .map_err(|err| err.error)
+                .context("passphrase master key already exists")?;
+        }
+        validate_file_mode(&self.path)?;
+        sync_parent_dir(&self.path)?;
+        Ok(())
+    }
+
+    fn create_atomic(&self, passphrase: &[u8]) -> anyhow::Result<()> {
+        validate_passphrase(passphrase)?;
+        self.ensure_parent()?;
+
+        let key = MasterKey::generate_locked()?;
+        let blob = wrap_passphrase_master(key.as_bytes(), passphrase)?;
+        let bytes =
+            Zeroizing::new(serde_json::to_vec(&blob).context("failed to encode passphrase store")?);
+        let parent = writable_parent(&self.path);
+        let tmp = write_synced_temp_secret_file(
+            parent,
+            ".machine-passphrase.",
+            ".tmp",
+            bytes.as_slice(),
+            CreatedFileOwner::SetCurrentUser,
+        )?;
+        drop(key);
+
+        match tmp.persist_noclobber(&self.path) {
+            Ok(_) => {
+                validate_file_mode(&self.path)?;
+                sync_parent_dir(&self.path)?;
+                Ok(())
+            }
+            Err(err) if err.error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(err) => Err(err.error).context("failed to install passphrase master key"),
+        }
+    }
+
+    fn ensure_parent(&self) -> anyhow::Result<()> {
+        let parent = writable_parent(&self.path);
+        ensure_secret_parent_directory(parent)?;
+        validate_directory_mode(parent)?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PassphraseMasterBlob {
+    pub scheme: String,
+    pub kdf: String,
+    pub n: u32,
+    pub r: u32,
+    pub p: u32,
+    pub salt: String,
+    pub nonce: String,
+    pub wrapped_master: String,
+}
+
+fn wrap_passphrase_master(
+    master_key: &[u8; MASTER_KEY_BYTES],
+    passphrase: &[u8],
+) -> anyhow::Result<PassphraseMasterBlob> {
+    validate_passphrase(passphrase)?;
+    let mut salt = [0u8; 16];
+    OsRng.fill_bytes(&mut salt);
+    let kek = derive_kek_scrypt(passphrase, &salt, SCRYPT_N, SCRYPT_R, SCRYPT_P)?;
+
+    let mut nonce = [0u8; NONCE_BYTES];
+    OsRng.fill_bytes(&mut nonce);
+    let wrapped_master = encrypt_with_key(&kek, &nonce, master_key, &[])?;
+
+    Ok(PassphraseMasterBlob {
+        scheme: PASSPHRASE_STORE_SCHEME.to_string(),
+        kdf: "scrypt".to_string(),
+        n: SCRYPT_N,
+        r: SCRYPT_R,
+        p: SCRYPT_P,
+        salt: b64(&salt),
+        nonce: b64(&nonce),
+        wrapped_master: b64(&wrapped_master),
+    })
+}
+
+fn unwrap_passphrase_master(
+    blob: &PassphraseMasterBlob,
+    passphrase: &[u8],
+) -> anyhow::Result<Zeroizing<[u8; MASTER_KEY_BYTES]>> {
+    validate_passphrase(passphrase)?;
+    if blob.scheme != PASSPHRASE_STORE_SCHEME || blob.kdf != "scrypt" {
+        bail!("unrecognized passphrase master key");
+    }
+    validate_scrypt_params(blob.n, blob.r, blob.p)?;
+    let salt = unb64(&blob.salt, "salt")?;
+    let nonce = decode_nonce(&blob.nonce, "nonce")?;
+    let wrapped_master = unb64(&blob.wrapped_master, "wrapped_master")?;
+    let kek = derive_kek_scrypt(passphrase, &salt, blob.n, blob.r, blob.p)?;
+    let key = Zeroizing::new(
+        decrypt_with_key(&kek, &nonce, &wrapped_master, &[]).context("passphrase unlock failed")?,
+    );
+    if key.len() != MASTER_KEY_BYTES {
+        bail!("unlocked master key has invalid length");
+    }
+    let mut out = Zeroizing::new([0u8; MASTER_KEY_BYTES]);
+    out.as_mut().copy_from_slice(&key);
+    Ok(out)
+}
+
+fn validate_passphrase(passphrase: &[u8]) -> anyhow::Result<()> {
+    if passphrase.is_empty() {
+        bail!("a non-empty passphrase is required");
+    }
+    Ok(())
+}
+
+fn derive_kek_scrypt(
+    passphrase: &[u8],
+    salt: &[u8],
+    n: u32,
+    r: u32,
+    p: u32,
+) -> anyhow::Result<Zeroizing<[u8; MASTER_KEY_BYTES]>> {
+    validate_scrypt_params(n, r, p)?;
+    let log_n = n.checked_ilog2().context("invalid scrypt N")?;
+    let params = scrypt::Params::new(log_n as u8, r, p, MASTER_KEY_BYTES)
+        .context("invalid scrypt parameters")?;
+    let mut out = Zeroizing::new([0u8; MASTER_KEY_BYTES]);
+    scrypt::scrypt(passphrase, salt, &params, out.as_mut()).context("scrypt derivation failed")?;
+    Ok(out)
+}
+
+fn validate_scrypt_params(n: u32, r: u32, p: u32) -> anyhow::Result<()> {
+    if n < 2 || !n.is_power_of_two() || n > (1 << 17) {
+        bail!("scrypt N out of bounds");
+    }
+    if !(1..=16).contains(&r) {
+        bail!("scrypt r out of bounds");
+    }
+    if !(1..=16).contains(&p) {
+        bail!("scrypt p out of bounds");
+    }
+    Ok(())
+}
+
+fn encrypt_with_key(
+    key: &[u8; MASTER_KEY_BYTES],
+    nonce: &[u8; NONCE_BYTES],
+    plaintext: &[u8],
+    aad: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    let cipher = Aes256Gcm::new(key.into());
+    cipher
+        .encrypt(
+            Nonce::from_slice(nonce),
+            aes_gcm::aead::Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        .map_err(|_| anyhow!("encryption failed"))
+}
+
+fn decrypt_with_key(
+    key: &[u8; MASTER_KEY_BYTES],
+    nonce: &[u8; NONCE_BYTES],
+    ciphertext: &[u8],
+    aad: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    let cipher = Aes256Gcm::new(key.into());
+    cipher
+        .decrypt(
+            Nonce::from_slice(nonce),
+            aes_gcm::aead::Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
+        .map_err(|_| anyhow!("authentication failed"))
+}
+
+fn b64(raw: &[u8]) -> String {
+    B64.encode(raw)
+}
+
+fn unb64(text: &str, field: &str) -> anyhow::Result<Vec<u8>> {
+    B64.decode(text.as_bytes())
+        .with_context(|| format!("{field} is not valid base64"))
+}
+
+fn decode_nonce(text: &str, field: &str) -> anyhow::Result<[u8; NONCE_BYTES]> {
+    let raw = unb64(text, field)?;
+    if raw.len() != NONCE_BYTES {
+        bail!("{field} has invalid length");
+    }
+    let mut nonce = [0u8; NONCE_BYTES];
+    nonce.copy_from_slice(&raw);
+    Ok(nonce)
 }
 
 /// Atomically write a secret-bearing file using owner-only permissions / ACLs.
@@ -1086,6 +1395,60 @@ mod tests {
         assert!(store.import(&key, false).is_err());
         store.import(&key, true).unwrap();
         assert_eq!(store.get().unwrap().as_bytes(), &key);
+    }
+
+    #[test]
+    fn passphrase_store_wraps_and_unlocks_master_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            PassphraseFileStore::new(tmp.path().join("vault").join("machine.passphrase.json"));
+        let first = store
+            .get_or_create(b"correct horse battery staple")
+            .unwrap();
+        let second = store.get(b"correct horse battery staple").unwrap();
+
+        assert_eq!(first.as_bytes(), second.as_bytes());
+        #[cfg(unix)]
+        {
+            let mode = fs::metadata(store.path()).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn passphrase_store_rejects_wrong_passphrase() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            PassphraseFileStore::new(tmp.path().join("vault").join("machine.passphrase.json"));
+        store
+            .get_or_create(b"correct horse battery staple")
+            .unwrap();
+
+        assert!(store.get(b"wrong passphrase").is_err());
+    }
+
+    #[test]
+    fn passphrase_store_never_writes_plaintext_master_to_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store =
+            PassphraseFileStore::new(tmp.path().join("vault").join("machine.passphrase.json"));
+        let key = [0x41u8; MASTER_KEY_BYTES];
+        store
+            .import(&key, b"correct horse battery staple", false)
+            .unwrap();
+
+        let disk = fs::read(store.path()).unwrap();
+        assert!(!disk.windows(key.len()).any(|window| window == key));
+        let disk_text = String::from_utf8(disk.clone()).unwrap();
+        assert!(!disk_text.contains(&b64(&key)));
+        assert!(!disk_text.contains(
+            &key.iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        ));
+        let blob: PassphraseMasterBlob = serde_json::from_slice(&disk).unwrap();
+        assert_eq!(blob.scheme, PASSPHRASE_STORE_SCHEME);
+        assert!(!blob.wrapped_master.is_empty());
     }
 
     #[test]

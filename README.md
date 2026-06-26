@@ -2,10 +2,10 @@
 
 A small, hardened **Rust key-custody core** for [Avibe](https://github.com/avibe-bot/avibe) Vaults — the one component that ever holds a key or performs cryptography, so the agent (and Python) never do.
 
-> **Status: P2 Phase A core.** The standard-tier Rust crypto core, cross-platform
-> file master-key store, one-shot delivery surface, blind-box create path, and
-> secp256k1 signing verbs are implemented. The resident grant agent and hardware
-> stores remain future work.
+> **Status: P2 core.** The standard-tier Rust crypto core, cross-platform file
+> master-key store, opt-in passphrase-wrapped file store, one-shot delivery
+> surface, blind-box create path, secp256k1 signing verbs, and resident grant
+> agent are implemented. Hardware stores remain future work.
 
 ## Why
 
@@ -55,6 +55,22 @@ The P1 file store uses `$AVAULT_HOME/machine.key` when `AVAULT_HOME` is set, or
 On Unix it requires a 0700 parent directory and a 0600 key file. On Windows it
 sets and validates a protected owner-only DACL for the key directory and key file
 (existing broad ACLs are rejected rather than silently rewritten).
+
+The default store is still the headless `file` store. For stronger at-rest
+protection on no-hardware hosts, select the opt-in passphrase-wrapped store with
+`avault --store file-passphrase ...` or `AVAULT_STORE=file-passphrase`. It stores
+`$AVAULT_HOME/machine.passphrase.json` (or the default vault state path) containing
+only a scrypt + AES-GCM wrapped master key. One-shot commands read the store
+unlock passphrase from the first stdin line, then read the command's normal stdin
+payload from the remaining bytes. The resident agent uses:
+
+```sh
+printf '%s\n' "$AVAULT_STORE_PASSPHRASE" | avault agent --store file-passphrase --unlock
+```
+
+This defends stolen disks/backups and same-uid file reads at rest; after unlock,
+the plaintext master is intentionally resident in avault's locked memory until the
+one-shot command exits or the agent restarts.
 
 `deliver run` reads envelope JSON from stdin by default, opens it with the local
 master key, injects the value into the requested env var for the child command,
@@ -136,8 +152,8 @@ Unix and a protected owner-only DACL on Windows. `yaml` and `toml` remain deferr
 reads `{"scheme":"hpke-x25519-hkdfsha256-aes256gcm-v1","enc":"...","ct":"..."}`
 from stdin and returns the normal `{ciphertext, nonce, wrap_meta}` envelope.
 The one-shot CLI derives the receiver keypair from the local master key so `pubkey`
-and `seal --blind-box` work across processes without persisting a new private key;
-the resident agent later uses a fresh in-memory keypair for its process lifetime.
+and `seal --blind-box` work across processes without persisting a new private key.
+The resident agent uses a fresh in-memory keypair for its process lifetime.
 
 `sign` reads:
 
@@ -160,15 +176,15 @@ stays outside avault.
 
 Like the `askill` dependency: ensured by `vibe runtime prepare`, resolved on `PATH`, shown in Settings · Dependencies. Two transports:
 
-- **CLI subprocess** (P1) — argv/JSON in, blobs via stdin, results via stdout.
-- **Resident agent** (future) — unix socket at `~/.avibe/run/avault.sock` (0600), length-prefixed JSON, authorized by `SO_PEERCRED` / `LOCAL_PEERCRED` (no shared token).
+- **CLI subprocess** — argv/JSON in, blobs via stdin, results via stdout.
+- **Resident agent** — unix socket at `~/.avibe/run/avault.sock` (0600), length-prefixed JSON, authorized by `SO_PEERCRED` / `LOCAL_PEERCRED` (no shared token).
 
 ## Layout
 
 ```
 crates/
   avault-core/    pure crypto: AEAD+AAD, DEK wrap, blind-box open, sign — no I/O, zeroized
-  avault-store/   cross-platform master/VMK store: file+mlock / Windows DACL → keychain/SE/TPM/KMS
+  avault-store/   cross-platform master/VMK store: file+mlock, file+passphrase → keychain/SE/TPM/KMS
   avault-cli/     the `avault` binary: one-shot CLI + resident agent
 docs/
   DESIGN.md       the full custody-core design (authoritative)
@@ -187,7 +203,8 @@ cargo clippy --all-targets
 - **P1** — `avault-core` + CLI + cross-platform file store; Rust takes the standard-tier seal/open. Closes the Python memory-hygiene gap.
 - **P1.1** — complete standard-tier delivery: multi-secret run, brokered fetch, and atomic dotenv/json inject.
 - **P2 Phase A** — blind-box create, secp256k1 digest signing, and pinned JSON contracts.
-- **Future** — resident agent + `SO_PEERCRED` + scope-grant DEK cache, passphrase/hardware stores, and external signer providers.
+- **P2 Phase B/C** — resident agent + `SO_PEERCRED` + scope-grant DEK cache, protected deliver/sign, and opt-in file+passphrase store.
+- **Future** — hardware stores and external signer providers behind the existing seams.
 
 ## License
 

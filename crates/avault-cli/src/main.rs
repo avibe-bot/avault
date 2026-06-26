@@ -8,9 +8,7 @@ use avault_core::BlindBoxKeypair;
 use avault_core::{
     BlindBox, ExportBlob, LocalSignerProvider, Sealed, SignatureScheme, SignerProvider,
 };
-#[cfg(unix)]
-use avault_store::MasterKey;
-use avault_store::{Backend, FileStore};
+use avault_store::{Backend, FileStore, MasterKey, PassphraseFileStore};
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::collections::HashMap;
@@ -40,6 +38,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 const MAX_STDIN_SECRET_BYTES: usize = 1024 * 1024;
 const MAX_STDIN_ENVELOPE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_STDIN_PASSPHRASE_BYTES: usize = 64 * 1024;
 const STDIN_READ_CHUNK_BYTES: usize = 8192;
 #[cfg(unix)]
 const MAX_AGENT_FRAME_BYTES: usize = 2 * 1024 * 1024;
@@ -57,6 +56,7 @@ const USAGE: &str = "\
 avault — Avibe Vaults custody core
 
 USAGE:
+    avault [--store file|file-passphrase] COMMAND ...
     avault seal --name NAME
     avault seal --name NAME --blind-box
     avault deliver run --name NAME --env VAR [--envelope-file PATH] -- COMMAND [ARGS...]
@@ -67,11 +67,12 @@ USAGE:
     avault key import [--force]
     avault pubkey
     avault sign < sign-request.json
-    avault agent [--socket PATH] [--idle-timeout-secs SECS]
+    avault agent [--store file|file-passphrase] [--unlock] [--socket PATH] [--idle-timeout-secs SECS]
     avault version
 
 P1 reads secret values, envelopes, and passphrases from stdin. Plaintext never belongs in argv.
 deliver fetch requires request.allowed_hosts before attaching a credential.
+file-passphrase is opt-in. Its unlock passphrase is read from the first stdin line.
 ";
 
 fn main() -> ExitCode {
@@ -86,6 +87,8 @@ fn main() -> ExitCode {
 
 fn run(args: Vec<OsString>) -> anyhow::Result<u8> {
     avault_store::harden_process_memory();
+    let (config, args) = parse_global_options(args)?;
+    let mut stdin = io::stdin();
 
     let Some(cmd) = args.first().and_then(|s| s.to_str()) else {
         print!("{USAGE}");
@@ -101,12 +104,12 @@ fn run(args: Vec<OsString>) -> anyhow::Result<u8> {
             print!("{USAGE}");
             Ok(0)
         }
-        "seal" => seal_cmd(&args[1..]),
-        "deliver" => deliver_cmd(&args[1..]),
-        "key" => key_cmd(&args[1..]),
-        "pubkey" => pubkey_cmd(&args[1..]),
-        "sign" => sign_cmd(&args[1..]),
-        "agent" => agent_cmd(&args[1..]),
+        "seal" => seal_cmd(&args[1..], &config, &mut stdin),
+        "deliver" => deliver_cmd(&args[1..], &config, &mut stdin),
+        "key" => key_cmd(&args[1..], &config, &mut stdin),
+        "pubkey" => pubkey_cmd(&args[1..], &config, &mut stdin),
+        "sign" => sign_cmd(&args[1..], &config, &mut stdin),
+        "agent" => agent_cmd(&args[1..], &config, &mut stdin),
         other => {
             eprintln!("avault: unknown command '{other}'\n");
             print!("{USAGE}");
@@ -115,13 +118,112 @@ fn run(args: Vec<OsString>) -> anyhow::Result<u8> {
     }
 }
 
-fn seal_cmd(args: &[OsString]) -> anyhow::Result<u8> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CliConfig {
+    store: StoreSelection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoreSelection {
+    File,
+    FilePassphrase,
+}
+
+impl StoreSelection {
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "file" => Ok(Self::File),
+            "file-passphrase" | "file+passphrase" | "passphrase" => Ok(Self::FilePassphrase),
+            _ => bail!("unknown store backend"),
+        }
+    }
+}
+
+enum StoreUnlock {
+    File,
+    FilePassphrase(Zeroizing<Vec<u8>>),
+}
+
+fn parse_global_options(args: Vec<OsString>) -> anyhow::Result<(CliConfig, Vec<OsString>)> {
+    let mut store = match env::var("AVAULT_STORE") {
+        Ok(value) => StoreSelection::parse(&value)?,
+        Err(env::VarError::NotPresent) => StoreSelection::File,
+        Err(env::VarError::NotUnicode(_)) => bail!("AVAULT_STORE must be valid UTF-8"),
+    };
+    let mut index = 0;
+    while index < args.len() {
+        let Some(flag) = args[index].to_str() else {
+            break;
+        };
+        match flag {
+            "--store" => {
+                let value = args
+                    .get(index + 1)
+                    .and_then(|s| s.to_str())
+                    .context("--store requires a value")?;
+                store = StoreSelection::parse(value)?;
+                index += 2;
+            }
+            _ => break,
+        }
+    }
+    Ok((CliConfig { store }, args[index..].to_vec()))
+}
+
+fn read_store_unlock(config: &CliConfig, input: &mut impl Read) -> anyhow::Result<StoreUnlock> {
+    match config.store {
+        StoreSelection::File => Ok(StoreUnlock::File),
+        StoreSelection::FilePassphrase => Ok(StoreUnlock::FilePassphrase(
+            read_passphrase_line(input).context("failed to read store passphrase from stdin")?,
+        )),
+    }
+}
+
+fn load_existing_master_from_unlock(unlock: &StoreUnlock) -> anyhow::Result<MasterKey> {
+    match unlock {
+        StoreUnlock::File => avault_store::load_master_key(Backend::File),
+        StoreUnlock::FilePassphrase(passphrase) => {
+            avault_store::load_passphrase_master_key(passphrase.as_slice())
+                .context("failed to unlock passphrase master key")
+        }
+    }
+}
+
+fn load_or_create_master_from_unlock(unlock: &StoreUnlock) -> anyhow::Result<MasterKey> {
+    match unlock {
+        StoreUnlock::File => avault_store::load_or_create_master_key(Backend::File),
+        StoreUnlock::FilePassphrase(passphrase) => {
+            avault_store::load_or_create_passphrase_master_key(passphrase.as_slice())
+                .context("failed to unlock passphrase master key")
+        }
+    }
+}
+
+fn import_master_with_unlock(
+    unlock: &StoreUnlock,
+    key: &[u8; avault_store::MASTER_KEY_BYTES],
+    force: bool,
+) -> anyhow::Result<()> {
+    match unlock {
+        StoreUnlock::File => FileStore::new(avault_store::default_master_key_path()?)
+            .import(key, force)
+            .context("failed to store imported master key"),
+        StoreUnlock::FilePassphrase(passphrase) => {
+            PassphraseFileStore::new(avault_store::default_passphrase_master_key_path()?)
+                .import(key, passphrase.as_slice(), force)
+                .context("failed to store imported passphrase master key")
+        }
+    }
+}
+
+fn seal_cmd(args: &[OsString], config: &CliConfig, input: &mut impl Read) -> anyhow::Result<u8> {
     let options = parse_seal_options(args)?;
+    let unlock = read_store_unlock(config, input)?;
     let (sealed, mut value) = if options.blind_box {
-        let input = read_json_stdin("failed to read blind-box JSON from stdin")?;
+        let input = read_json_input(input, "failed to read blind-box JSON from stdin")?;
         let blind_box: BlindBox =
             serde_json::from_slice(input.as_slice()).context("blind-box JSON is invalid")?;
-        let master = avault_store::load_master_key(Backend::File)?;
+        let master = load_existing_master_from_unlock(&unlock)?;
         let keypair = avault_core::derive_blind_box_keypair_from_master(master.as_bytes());
         let value = keypair.open(&blind_box).context("blind-box open failed")?;
         drop(keypair);
@@ -130,14 +232,16 @@ fn seal_cmd(args: &[OsString]) -> anyhow::Result<u8> {
         drop(master);
         (sealed, value)
     } else {
-        let value = read_stdin_zeroizing().context("failed to read plaintext value from stdin")?;
-        let master = avault_store::load_or_create_master_key(Backend::File)?;
+        let value = read_stdin_zeroizing_from(input)
+            .context("failed to read plaintext value from stdin")?;
+        let master = load_or_create_master_from_unlock(&unlock)?;
         let sealed = avault_core::seal(master.as_bytes(), &options.name, value.as_slice())
             .context("seal failed")?;
         drop(master);
         (sealed, value)
     };
     value.zeroize();
+    drop(unlock);
     serde_json::to_writer(io::stdout(), &sealed).context("failed to write envelope JSON")?;
     println!();
     Ok(0)
@@ -191,11 +295,12 @@ struct PubkeyOutput {
     fingerprint: String,
 }
 
-fn pubkey_cmd(args: &[OsString]) -> anyhow::Result<u8> {
+fn pubkey_cmd(args: &[OsString], config: &CliConfig, input: &mut impl Read) -> anyhow::Result<u8> {
     if !args.is_empty() {
         bail!("pubkey takes no options");
     }
-    let master = avault_store::load_or_create_master_key(Backend::File)?;
+    let unlock = read_store_unlock(config, input)?;
+    let master = load_or_create_master_from_unlock(&unlock)?;
     let keypair = avault_core::derive_blind_box_keypair_from_master(master.as_bytes());
     let output = PubkeyOutput {
         public_key: keypair.public_key_b64(),
@@ -203,6 +308,7 @@ fn pubkey_cmd(args: &[OsString]) -> anyhow::Result<u8> {
     };
     drop(keypair);
     drop(master);
+    drop(unlock);
     serde_json::to_writer(io::stdout(), &output).context("failed to write pubkey JSON")?;
     println!();
     Ok(0)
@@ -224,18 +330,19 @@ struct SignOutput {
     recovery_id: Option<u8>,
 }
 
-fn sign_cmd(args: &[OsString]) -> anyhow::Result<u8> {
+fn sign_cmd(args: &[OsString], config: &CliConfig, input: &mut impl Read) -> anyhow::Result<u8> {
     if !args.is_empty() {
         bail!("sign reads its JSON request from stdin and takes no options");
     }
-    let input = read_json_stdin("failed to read sign JSON from stdin")?;
+    let unlock = read_store_unlock(config, input)?;
+    let input = read_json_input(input, "failed to read sign JSON from stdin")?;
     let request: SignInput =
         serde_json::from_slice(input.as_slice()).context("sign JSON is invalid")?;
     let digest = decode_hex_32(&request.digest, "digest")?;
     let scheme = SignatureScheme::from_str(&request.scheme)?;
 
     let key_plaintext = if let Some(dek_blindbox) = &request.dek_blindbox {
-        let master = avault_store::load_master_key(Backend::File)?;
+        let master = load_existing_master_from_unlock(&unlock)?;
         let keypair = avault_core::derive_blind_box_keypair_from_master(master.as_bytes());
         let dek_plaintext = keypair
             .open(dek_blindbox)
@@ -248,12 +355,13 @@ fn sign_cmd(args: &[OsString]) -> anyhow::Result<u8> {
         drop(dek);
         opened
     } else {
-        let master = avault_store::load_master_key(Backend::File)?;
+        let master = load_existing_master_from_unlock(&unlock)?;
         let opened = avault_core::open(master.as_bytes(), &request.name, &request.key_envelope)
             .context("key envelope open failed")?;
         drop(master);
         opened
     };
+    drop(unlock);
     let output = sign_digest_with_key(scheme, &digest, key_plaintext)?;
     serde_json::to_writer(io::stdout(), &output).context("failed to write signature JSON")?;
     println!();
@@ -302,19 +410,23 @@ fn zeroizing_vec_to_key32(
     Ok(out)
 }
 
-fn deliver_cmd(args: &[OsString]) -> anyhow::Result<u8> {
+fn deliver_cmd(args: &[OsString], config: &CliConfig, input: &mut impl Read) -> anyhow::Result<u8> {
     let Some(subcmd) = args.first().and_then(|s| s.to_str()) else {
         bail!("missing deliver subcommand");
     };
     match subcmd {
-        "run" => deliver_run_cmd(&args[1..]),
-        "fetch" => deliver_fetch_cmd(&args[1..]),
-        "inject" => deliver_inject_cmd(&args[1..]),
+        "run" => deliver_run_cmd(&args[1..], config, input),
+        "fetch" => deliver_fetch_cmd(&args[1..], config, input),
+        "inject" => deliver_inject_cmd(&args[1..], config, input),
         other => bail!("unknown deliver subcommand: {other}"),
     }
 }
 
-fn deliver_run_cmd(args: &[OsString]) -> anyhow::Result<u8> {
+fn deliver_run_cmd(
+    args: &[OsString],
+    config: &CliConfig,
+    input: &mut impl Read,
+) -> anyhow::Result<u8> {
     let split = args
         .iter()
         .position(|arg| arg == "--")
@@ -324,16 +436,19 @@ fn deliver_run_cmd(args: &[OsString]) -> anyhow::Result<u8> {
     if command.is_empty() {
         bail!("deliver run requires a command");
     }
+    let unlock = read_store_unlock(config, input)?;
 
     if options.is_empty() {
-        let input = read_json_stdin("failed to read deliver run JSON from stdin")?;
+        let input = read_json_input(input, "failed to read deliver run JSON from stdin")?;
         let secrets: Vec<EnvSecretInput> =
             serde_json::from_slice(input.as_slice()).context("deliver run JSON is invalid")?;
-        run_child_with_secret_env(command, secrets, true)
+        let opened = open_env_secrets(secrets, &unlock)?;
+        drop(unlock);
+        run_child_with_opened_env(command, opened, true)
     } else {
         let run_options = parse_deliver_run_options(options)?;
         let envelope_stdin = run_options.envelope_file.is_none();
-        let envelope = read_envelope(run_options.envelope_file.as_deref())?;
+        let envelope = read_envelope(run_options.envelope_file.as_deref(), input)?;
         let sealed: Sealed =
             serde_json::from_slice(envelope.as_slice()).context("envelope JSON is invalid")?;
         let secrets = vec![EnvSecretInput {
@@ -342,7 +457,9 @@ fn deliver_run_cmd(args: &[OsString]) -> anyhow::Result<u8> {
             envelope: sealed,
             dek_blindbox: None,
         }];
-        run_child_with_secret_env(command, secrets, envelope_stdin)
+        let opened = open_env_secrets(secrets, &unlock)?;
+        drop(unlock);
+        run_child_with_opened_env(command, opened, envelope_stdin)
     }
 }
 
@@ -426,19 +543,6 @@ fn default_inject_format() -> String {
     "dotenv".to_string()
 }
 
-fn run_child_with_secret_env(
-    command: &[OsString],
-    secrets: Vec<EnvSecretInput>,
-    envelope_stdin: bool,
-) -> anyhow::Result<u8> {
-    if secrets.is_empty() {
-        bail!("deliver run requires at least one secret");
-    }
-
-    let opened = open_env_secrets(secrets)?;
-    run_child_with_opened_env(command, opened, envelope_stdin)
-}
-
 fn run_child_with_opened_env(
     command: &[OsString],
     mut opened: Vec<OpenedSecret>,
@@ -473,17 +577,26 @@ fn run_child_with_opened_env(
     Ok(status_to_exit_code(status))
 }
 
-fn open_env_secrets(secrets: Vec<EnvSecretInput>) -> anyhow::Result<Vec<OpenedSecret>> {
+fn open_env_secrets(
+    secrets: Vec<EnvSecretInput>,
+    unlock: &StoreUnlock,
+) -> anyhow::Result<Vec<OpenedSecret>> {
     let mut opened = Vec::with_capacity(secrets.len());
     let mut seen = BTreeSet::new();
+    let master = load_existing_master_from_unlock(unlock)?;
     for secret in secrets {
         validate_shell_name(&secret.env, "env var name")?;
         if !seen.insert(secret.env.clone()) {
             bail!("duplicate env var name");
         }
-        let plaintext =
-            open_one_shot_secret(&secret.name, &secret.envelope, secret.dek_blindbox.as_ref())
-                .with_context(|| format!("open failed for {}", secret.name))?;
+        let plaintext = open_one_shot_secret(
+            &secret.name,
+            &secret.envelope,
+            secret.dek_blindbox.as_ref(),
+            unlock,
+            Some(&master),
+        )
+        .with_context(|| format!("open failed for {}", secret.name))?;
         opened.push(OpenedSecret {
             name: secret.env,
             plaintext,
@@ -496,25 +609,39 @@ fn open_one_shot_secret(
     name: &str,
     envelope: &Sealed,
     dek_blindbox: Option<&BlindBox>,
+    unlock: &StoreUnlock,
+    loaded_master: Option<&MasterKey>,
 ) -> anyhow::Result<Zeroizing<Vec<u8>>> {
     if let Some(dek_blindbox) = dek_blindbox {
-        let master = avault_store::load_master_key(Backend::File)?;
+        let master;
+        let master = match loaded_master {
+            Some(master) => master,
+            None => {
+                master = load_existing_master_from_unlock(unlock)?;
+                &master
+            }
+        };
         let keypair = avault_core::derive_blind_box_keypair_from_master(master.as_bytes());
         let dek_plaintext = keypair
             .open(dek_blindbox)
             .context("DEK blind-box open failed")?;
         drop(keypair);
-        drop(master);
         let dek = zeroizing_vec_to_key32(dek_plaintext, "released DEK")?;
         let opened =
             avault_core::open_with_dek(&dek, name, envelope).context("envelope open failed")?;
         drop(dek);
         Ok(opened)
     } else {
-        let master = avault_store::load_master_key(Backend::File)?;
+        let master;
+        let master = match loaded_master {
+            Some(master) => master,
+            None => {
+                master = load_existing_master_from_unlock(unlock)?;
+                &master
+            }
+        };
         let opened =
             avault_core::open(master.as_bytes(), name, envelope).context("envelope open failed")?;
-        drop(master);
         Ok(opened)
     }
 }
@@ -525,19 +652,30 @@ impl Zeroize for OpenedSecret {
     }
 }
 
-fn deliver_fetch_cmd(args: &[OsString]) -> anyhow::Result<u8> {
+fn deliver_fetch_cmd(
+    args: &[OsString],
+    config: &CliConfig,
+    input: &mut impl Read,
+) -> anyhow::Result<u8> {
     if !args.is_empty() {
         bail!("deliver fetch reads its JSON request from stdin and takes no options");
     }
 
-    let input = read_json_stdin("failed to read deliver fetch JSON from stdin")?;
+    let unlock = read_store_unlock(config, input)?;
+    let input = read_json_input(input, "failed to read deliver fetch JSON from stdin")?;
     let fetch: FetchInput =
         serde_json::from_slice(input.as_slice()).context("deliver fetch JSON is invalid")?;
     let (_url, is_loopback) = validate_fetch_input(&fetch)?;
 
-    let mut secret =
-        open_one_shot_secret(&fetch.name, &fetch.envelope, fetch.dek_blindbox.as_ref())
-            .context("open failed")?;
+    let mut secret = open_one_shot_secret(
+        &fetch.name,
+        &fetch.envelope,
+        fetch.dek_blindbox.as_ref(),
+        &unlock,
+        None,
+    )
+    .context("open failed")?;
+    drop(unlock);
     let output = execute_fetch_request(fetch.request, &mut secret, is_loopback)
         .context("fetch request failed")?;
     secret.zeroize();
@@ -789,12 +927,17 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|window| window == needle)
 }
 
-fn deliver_inject_cmd(args: &[OsString]) -> anyhow::Result<u8> {
+fn deliver_inject_cmd(
+    args: &[OsString],
+    config: &CliConfig,
+    input: &mut impl Read,
+) -> anyhow::Result<u8> {
     if !args.is_empty() {
         bail!("deliver inject reads its JSON request from stdin and takes no options");
     }
 
-    let input = read_json_stdin("failed to read deliver inject JSON from stdin")?;
+    let unlock = read_store_unlock(config, input)?;
+    let input = read_json_input(input, "failed to read deliver inject JSON from stdin")?;
     let inject: InjectInput =
         serde_json::from_slice(input.as_slice()).context("deliver inject JSON is invalid")?;
     if inject.secrets.is_empty() {
@@ -805,7 +948,8 @@ fn deliver_inject_cmd(args: &[OsString]) -> anyhow::Result<u8> {
         bail!("deliver inject format is not implemented in P1.1");
     }
 
-    let mut opened = open_named_secrets(inject.secrets)?;
+    let mut opened = open_named_secrets(inject.secrets, &unlock)?;
+    drop(unlock);
     let mut rendered = render_inject_file(&opened, &format)?;
     opened.zeroize();
     drop(opened);
@@ -817,9 +961,13 @@ fn deliver_inject_cmd(args: &[OsString]) -> anyhow::Result<u8> {
     Ok(0)
 }
 
-fn open_named_secrets(secrets: Vec<NamedSecretInput>) -> anyhow::Result<Vec<OpenedSecret>> {
+fn open_named_secrets(
+    secrets: Vec<NamedSecretInput>,
+    unlock: &StoreUnlock,
+) -> anyhow::Result<Vec<OpenedSecret>> {
     let mut opened = Vec::with_capacity(secrets.len());
     let mut seen = BTreeSet::new();
+    let master = load_existing_master_from_unlock(unlock)?;
     for secret in secrets {
         let target_name = secret
             .key
@@ -829,9 +977,14 @@ fn open_named_secrets(secrets: Vec<NamedSecretInput>) -> anyhow::Result<Vec<Open
         if !seen.insert(target_name.clone()) {
             bail!("duplicate secret target name");
         }
-        let plaintext =
-            open_one_shot_secret(&secret.name, &secret.envelope, secret.dek_blindbox.as_ref())
-                .with_context(|| format!("open failed for {}", secret.name))?;
+        let plaintext = open_one_shot_secret(
+            &secret.name,
+            &secret.envelope,
+            secret.dek_blindbox.as_ref(),
+            unlock,
+            Some(&master),
+        )
+        .with_context(|| format!("open failed for {}", secret.name))?;
         opened.push(OpenedSecret {
             name: target_name,
             plaintext,
@@ -1154,33 +1307,42 @@ fn status_to_exit_code(status: ExitStatus) -> u8 {
         .unwrap_or(1)
 }
 
-fn key_cmd(args: &[OsString]) -> anyhow::Result<u8> {
+fn key_cmd(args: &[OsString], config: &CliConfig, input: &mut impl Read) -> anyhow::Result<u8> {
     let Some(subcmd) = args.first().and_then(|s| s.to_str()) else {
         bail!("missing key subcommand");
     };
     match subcmd {
-        "export" => key_export_cmd(),
-        "import" => key_import_cmd(&args[1..]),
+        "export" => key_export_cmd(config, input),
+        "import" => key_import_cmd(&args[1..], config, input),
         other => bail!("unknown key subcommand: {other}"),
     }
 }
 
-fn key_export_cmd() -> anyhow::Result<u8> {
-    let mut passphrase = read_stdin_zeroizing().context("failed to read passphrase from stdin")?;
+fn key_export_cmd(config: &CliConfig, input: &mut impl Read) -> anyhow::Result<u8> {
+    let unlock = read_store_unlock(config, input)?;
+    let mut passphrase =
+        read_stdin_zeroizing_from(input).context("failed to read passphrase from stdin")?;
     trim_trailing_newlines(passphrase.as_mut());
-    let master = avault_store::load_master_key(Backend::File)?;
+    let master = load_existing_master_from_unlock(&unlock)?;
     let blob = avault_core::export_master_key(master.as_bytes(), passphrase.as_slice())
         .context("key export failed")?;
     drop(master);
+    drop(unlock);
     passphrase.zeroize();
     serde_json::to_writer(io::stdout(), &blob).context("failed to write key export JSON")?;
     println!();
     Ok(0)
 }
 
-fn key_import_cmd(args: &[OsString]) -> anyhow::Result<u8> {
+fn key_import_cmd(
+    args: &[OsString],
+    config: &CliConfig,
+    input: &mut impl Read,
+) -> anyhow::Result<u8> {
     let force = parse_flag(args, "--force")?;
-    let mut input = read_stdin_zeroizing().context("failed to read key import JSON from stdin")?;
+    let unlock = read_store_unlock(config, input)?;
+    let mut input =
+        read_stdin_zeroizing_from(input).context("failed to read key import JSON from stdin")?;
     let mut passphrase =
         import_passphrase_from_json(input.as_slice()).context("key import JSON is invalid")?;
     let blob = import_blob_from_json(input.as_slice()).context("key import JSON is invalid")?;
@@ -1191,9 +1353,8 @@ fn key_import_cmd(args: &[OsString]) -> anyhow::Result<u8> {
         .context("key import failed")?;
     passphrase.zeroize();
 
-    FileStore::new(avault_store::default_master_key_path()?)
-        .import(&key, force)
-        .context("failed to store imported master key")?;
+    import_master_with_unlock(&unlock, &key, force)?;
+    drop(unlock);
     drop(key);
     println!(r#"{{"ok":true}}"#);
     Ok(0)
@@ -1480,23 +1641,31 @@ fn parse_flag(args: &[OsString], flag: &str) -> anyhow::Result<bool> {
 struct AgentOptions {
     socket_path: PathBuf,
     idle_timeout: Duration,
+    store: StoreSelection,
+    unlock: bool,
 }
 
 #[cfg(unix)]
-fn agent_cmd(args: &[OsString]) -> anyhow::Result<u8> {
-    let options = parse_agent_options(args)?;
-    run_agent(options)
+fn agent_cmd(args: &[OsString], config: &CliConfig, input: &mut impl Read) -> anyhow::Result<u8> {
+    let options = parse_agent_options(args, config)?;
+    run_agent(options, input)
 }
 
 #[cfg(not(unix))]
-fn agent_cmd(_args: &[OsString]) -> anyhow::Result<u8> {
+fn agent_cmd(
+    _args: &[OsString],
+    _config: &CliConfig,
+    _input: &mut impl Read,
+) -> anyhow::Result<u8> {
     bail!("avault agent is only supported on Unix platforms")
 }
 
 #[cfg(unix)]
-fn parse_agent_options(args: &[OsString]) -> anyhow::Result<AgentOptions> {
+fn parse_agent_options(args: &[OsString], config: &CliConfig) -> anyhow::Result<AgentOptions> {
     let mut socket_path = None;
     let mut idle_timeout_secs = DEFAULT_AGENT_IDLE_TIMEOUT_SECS;
+    let mut store = config.store;
+    let mut unlock = false;
     let mut index = 0;
     while index < args.len() {
         let flag = args[index]
@@ -1527,13 +1696,33 @@ fn parse_agent_options(args: &[OsString]) -> anyhow::Result<AgentOptions> {
                 }
                 index += 2;
             }
+            "--store" => {
+                let value = args
+                    .get(index + 1)
+                    .and_then(|s| s.to_str())
+                    .context("--store requires a value")?;
+                store = StoreSelection::parse(value)?;
+                index += 2;
+            }
+            "--unlock" => {
+                if unlock {
+                    bail!("--unlock was provided more than once");
+                }
+                unlock = true;
+                index += 1;
+            }
             other => bail!("unknown agent option: {other}"),
         }
+    }
+    if unlock && store != StoreSelection::FilePassphrase {
+        bail!("--unlock requires --store file-passphrase");
     }
 
     Ok(AgentOptions {
         socket_path: socket_path.unwrap_or(default_agent_socket_path()?),
         idle_timeout: Duration::from_secs(idle_timeout_secs),
+        store,
+        unlock,
     })
 }
 
@@ -1570,15 +1759,17 @@ struct AgentState {
     grants: HashMap<GrantKey, GrantEntry>,
     last_activity: Instant,
     idle_timeout: Duration,
+    _master: Option<MasterKey>,
 }
 
 #[cfg(unix)]
 impl AgentState {
-    fn new(idle_timeout: Duration) -> Self {
+    fn new(idle_timeout: Duration, master: Option<MasterKey>) -> Self {
         Self {
             grants: HashMap::new(),
             last_activity: Instant::now(),
             idle_timeout,
+            _master: master,
         }
     }
 
@@ -1704,14 +1895,29 @@ struct AgentRunOutput {
 }
 
 #[cfg(unix)]
-fn run_agent(options: AgentOptions) -> anyhow::Result<u8> {
+fn run_agent(options: AgentOptions, input: &mut impl Read) -> anyhow::Result<u8> {
     avault_store::harden_process_memory();
+    let master = if options.unlock {
+        let mut passphrase =
+            read_passphrase_line(input).context("failed to read store passphrase from stdin")?;
+        let master = avault_store::load_or_create_passphrase_master_key(passphrase.as_slice())
+            .context("failed to unlock passphrase master key")?;
+        passphrase.zeroize();
+        Some(master)
+    } else {
+        match options.store {
+            StoreSelection::File => None,
+            StoreSelection::FilePassphrase => {
+                bail!("file-passphrase agent requires --unlock")
+            }
+        }
+    };
     let keypair = avault_core::generate_blind_box_keypair();
     let listener = bind_agent_socket(&options.socket_path)?;
     listener
         .set_nonblocking(true)
         .context("failed to configure agent socket")?;
-    let mut state = AgentState::new(options.idle_timeout);
+    let mut state = AgentState::new(options.idle_timeout, master);
 
     loop {
         state.purge();
@@ -2180,12 +2386,15 @@ fn unsafe_geteuid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-fn read_stdin_zeroizing() -> anyhow::Result<Zeroizing<Vec<u8>>> {
-    read_zeroizing_to_cap(io::stdin(), MAX_STDIN_SECRET_BYTES)
+fn read_stdin_zeroizing_from(reader: &mut impl Read) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+    read_zeroizing_to_cap(reader, MAX_STDIN_SECRET_BYTES)
 }
 
-fn read_json_stdin(context: &'static str) -> anyhow::Result<Zeroizing<Vec<u8>>> {
-    read_zeroizing_to_cap(io::stdin(), MAX_STDIN_ENVELOPE_BYTES).context(context)
+fn read_json_input(
+    reader: &mut impl Read,
+    context: &'static str,
+) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+    read_zeroizing_to_cap(reader, MAX_STDIN_ENVELOPE_BYTES).context(context)
 }
 
 fn read_zeroizing_to_cap(
@@ -2213,12 +2422,39 @@ fn read_zeroizing_to_cap(
     }
 }
 
-fn read_envelope(path: Option<&str>) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+fn read_passphrase_line(reader: &mut impl Read) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+    let mut out = Zeroizing::new(Vec::with_capacity(MAX_STDIN_PASSPHRASE_BYTES));
+    let mut scratch = Zeroizing::new([0u8; 1]);
+    loop {
+        if out.len() >= MAX_STDIN_PASSPHRASE_BYTES {
+            bail!("store passphrase exceeds the supported size limit");
+        }
+        let n = reader.read(scratch.as_mut())?;
+        if n == 0 {
+            break;
+        }
+        let byte = scratch[0];
+        scratch[0].zeroize();
+        if byte == b'\n' {
+            break;
+        }
+        out.push(byte);
+    }
+    if matches!(out.last(), Some(b'\r')) {
+        out.pop();
+    }
+    if out.is_empty() {
+        bail!("a non-empty store passphrase is required");
+    }
+    Ok(out)
+}
+
+fn read_envelope(path: Option<&str>, reader: &mut impl Read) -> anyhow::Result<Zeroizing<Vec<u8>>> {
     match path {
         Some(path) => fs::read(path)
             .map(Zeroizing::new)
             .context("failed to read envelope file"),
-        None => read_zeroizing_to_cap(io::stdin(), MAX_STDIN_ENVELOPE_BYTES)
+        None => read_zeroizing_to_cap(reader, MAX_STDIN_ENVELOPE_BYTES)
             .context("failed to read envelope JSON from stdin"),
     }
 }

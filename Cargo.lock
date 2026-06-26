@@ -91,9 +91,14 @@ dependencies = [
 name = "avault-store"
 version = "0.1.2"
 dependencies = [
+ "aes-gcm",
  "anyhow",
+ "base64",
  "libc",
  "rand",
+ "scrypt",
+ "serde",
+ "serde_json",
  "tempfile",
  "windows-sys 0.59.0",
  "zeroize",

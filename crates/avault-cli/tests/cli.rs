@@ -152,7 +152,7 @@ fn envelope_encrypted_with_dek(name: &str, dek: &[u8; 32], value: &[u8]) -> serd
 }
 
 fn connect_agent(socket: &std::path::Path) -> UnixStream {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         match UnixStream::connect(socket) {
             Ok(stream) => return stream,
@@ -194,6 +194,33 @@ fn spawn_agent(socket: &std::path::Path, idle_timeout_secs: u64) -> std::process
         .stderr(Stdio::piped())
         .spawn()
         .unwrap()
+}
+
+fn spawn_passphrase_agent(
+    socket: &std::path::Path,
+    idle_timeout_secs: u64,
+    passphrase: &[u8],
+    home: &std::path::Path,
+) -> std::process::Child {
+    let mut child = avault()
+        .arg("agent")
+        .arg("--store")
+        .arg("file-passphrase")
+        .arg("--unlock")
+        .arg("--socket")
+        .arg(socket)
+        .arg("--idle-timeout-secs")
+        .arg(idle_timeout_secs.to_string())
+        .env("AVAULT_HOME", home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(passphrase).unwrap();
+    child.stdin.as_mut().unwrap().write_all(b"\n").unwrap();
+    drop(child.stdin.take());
+    child
 }
 
 #[test]
@@ -247,6 +274,133 @@ fn seal_and_deliver_run_roundtrip() {
     let deliver_output = deliver.wait_with_output().unwrap();
     assert!(deliver_output.status.success());
     assert_eq!(deliver_output.stdout, b"ok");
+}
+
+#[test]
+fn passphrase_store_seal_and_deliver_roundtrip() {
+    let home = tempfile::tempdir().unwrap();
+    let vault_home = home.path().join("vault");
+
+    let mut seal = avault()
+        .arg("--store")
+        .arg("file-passphrase")
+        .arg("seal")
+        .arg("--name")
+        .arg("OPENAI_API_KEY")
+        .env("AVAULT_HOME", &vault_home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    seal.stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"correct horse battery staple\ns3cr3t")
+        .unwrap();
+    let seal_output = seal.wait_with_output().unwrap();
+    assert!(seal_output.status.success());
+    assert!(!vault_home.join("machine.key").exists());
+    assert!(vault_home.join("machine.passphrase.json").exists());
+
+    let request = json!([
+        {
+            "name": "OPENAI_API_KEY",
+            "env": "SECRET_VALUE",
+            "envelope": serde_json::from_slice::<serde_json::Value>(&seal_output.stdout).unwrap()
+        }
+    ]);
+    let mut deliver = avault()
+        .arg("--store")
+        .arg("file-passphrase")
+        .arg("deliver")
+        .arg("run")
+        .arg("--")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg(r#"test "$SECRET_VALUE" = "s3cr3t" && printf ok"#)
+        .env("AVAULT_HOME", &vault_home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    deliver
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"correct horse battery staple\n")
+        .unwrap();
+    deliver
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let output = deliver.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"ok");
+}
+
+#[test]
+fn passphrase_store_wrong_passphrase_fails_without_plaintext_key_file() {
+    let home = tempfile::tempdir().unwrap();
+    let vault_home = home.path().join("vault");
+    let mut seal = avault()
+        .arg("--store")
+        .arg("file-passphrase")
+        .arg("seal")
+        .arg("--name")
+        .arg("OPENAI_API_KEY")
+        .env("AVAULT_HOME", &vault_home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    seal.stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"correct horse battery staple\ns3cr3t")
+        .unwrap();
+    let seal_output = seal.wait_with_output().unwrap();
+    assert!(seal_output.status.success());
+
+    let mut deliver = avault()
+        .arg("--store")
+        .arg("file-passphrase")
+        .arg("deliver")
+        .arg("run")
+        .arg("--name")
+        .arg("OPENAI_API_KEY")
+        .arg("--env")
+        .arg("SECRET_VALUE")
+        .arg("--")
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg("exit 0")
+        .env("AVAULT_HOME", &vault_home)
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    deliver
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"wrong passphrase\n")
+        .unwrap();
+    deliver
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(&seal_output.stdout)
+        .unwrap();
+    let output = deliver.wait_with_output().unwrap();
+
+    assert_eq!(output.status.code(), Some(70));
+    assert!(!vault_home.join("machine.key").exists());
+    assert!(vault_home.join("machine.passphrase.json").exists());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("failed to unlock passphrase master key"));
+    assert!(!stderr.contains("s3cr3t"));
 }
 
 #[test]
@@ -522,6 +676,25 @@ fn agent_grant_deliver_inject_release_roundtrip() {
     );
     assert_eq!(denied["ok"], false);
     assert!(denied["error"].as_str().unwrap().contains("grant"));
+
+    let _ = agent.kill();
+    let _ = agent.wait();
+}
+
+#[test]
+fn agent_unlocks_passphrase_store_at_startup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("run").join("avault.sock");
+    let vault_home = tmp.path().join("vault");
+    let mut agent =
+        spawn_passphrase_agent(&socket, 60, b"correct horse battery staple", &vault_home);
+    let mut stream = connect_agent(&socket);
+
+    let response = agent_request(&mut stream, json!({"type": "pubkey"}));
+    assert_eq!(response["ok"], true);
+    assert!(response["result"]["public_key"].as_str().unwrap().len() > 40);
+    assert!(vault_home.join("machine.passphrase.json").exists());
+    assert!(!vault_home.join("machine.key").exists());
 
     let _ = agent.kill();
     let _ = agent.wait();
