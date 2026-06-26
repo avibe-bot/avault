@@ -37,6 +37,10 @@ libc = "0.2"
 tempfile = "3"
 ureq = { version = "2", default-features = false, features = ["tls"] }
 url = "2"
+hpke = { version = "0.13", default-features = false, features = ["alloc", "x25519"] }
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
+k256 = { version = "0.13", features = ["ecdsa", "schnorr", "sha256", "arithmetic"] }
+hex = "0.4"
 
 [profile.release]
 # Custody binary: keep symbols lean; the memory-hardening lives in code, not flags.

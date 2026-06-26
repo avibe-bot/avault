@@ -22,6 +22,19 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+mod blind_box;
+mod signing;
+
+pub use blind_box::{
+    derive_blind_box_keypair_from_master, generate_blind_box_keypair, BlindBox, BlindBoxKeypair,
+    BLIND_BOX_HPKE_INFO, BLIND_BOX_SCHEME,
+};
+pub use signing::{
+    LocalSignerProvider, SignatureResult, SignatureScheme, SignerProvider,
+    SIGN_SCHEME_ECDSA_SECP256K1_DER, SIGN_SCHEME_ECDSA_SECP256K1_RECOVERABLE,
+    SIGN_SCHEME_SCHNORR_SECP256K1_BIP340,
+};
+
 /// Wrap-meta scheme tag used by the P0 Python standard-tier envelope.
 pub const WRAP_SCHEME: &str = "machine-aesgcm-v1";
 /// P1 envelope version stored in `wrap_meta.v`.
@@ -135,25 +148,27 @@ pub fn open(
         bail!("DEK unwrap produced invalid length");
     }
 
-    let value_nonce = decode_nonce(&sealed.nonce, "nonce")?;
-    let ciphertext = unb64(&sealed.ciphertext, "ciphertext")?;
-    match decrypt_with_key(
-        slice_to_key(dek.as_slice())?,
-        &value_nonce,
-        &ciphertext,
-        &aad(name),
-    ) {
-        Ok(plaintext) => Ok(Zeroizing::new(plaintext)),
-        Err(p1_err) => decrypt_with_key(
-            slice_to_key(dek.as_slice())?,
-            &value_nonce,
-            &ciphertext,
-            &[],
-        )
-        .map(Zeroizing::new)
-        .map_err(|_| p1_err)
-        .context("value decrypt failed"),
+    open_value_with_dek(slice_to_key(dek.as_slice())?, name, sealed)
+}
+
+/// Open an envelope when the per-record DEK was released through a blind box.
+///
+/// This is the protected-tier companion to [`open`]: the master key is not used,
+/// but the value ciphertext is still authenticated with the same name/scheme/version AAD.
+pub fn open_with_dek(
+    dek: &[u8; KEY_BYTES],
+    name: &str,
+    sealed: &Sealed,
+) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+    let meta: WrapMeta =
+        serde_json::from_str(&sealed.wrap_meta).context("wrap_meta is not valid JSON")?;
+    if meta.scheme != WRAP_SCHEME {
+        bail!("unsupported wrap scheme");
     }
+    if meta.v != WRAP_META_VERSION {
+        bail!("unsupported wrap_meta version");
+    }
+    open_value_with_dek(dek, name, sealed)
 }
 
 /// Export an existing master key as a P0-compatible scrypt + AES-256-GCM blob.
@@ -249,6 +264,22 @@ fn decrypt_with_key(
             },
         )
         .map_err(|_| anyhow!("authentication failed"))
+}
+
+fn open_value_with_dek(
+    dek: &[u8; KEY_BYTES],
+    name: &str,
+    sealed: &Sealed,
+) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+    let value_nonce = decode_nonce(&sealed.nonce, "nonce")?;
+    let ciphertext = unb64(&sealed.ciphertext, "ciphertext")?;
+    match decrypt_with_key(dek, &value_nonce, &ciphertext, &aad(name)) {
+        Ok(plaintext) => Ok(Zeroizing::new(plaintext)),
+        Err(p1_err) => decrypt_with_key(dek, &value_nonce, &ciphertext, &[])
+            .map(Zeroizing::new)
+            .map_err(|_| p1_err)
+            .context("value decrypt failed"),
+    }
 }
 
 fn derive_kek_scrypt(
@@ -401,6 +432,29 @@ mod tests {
         };
         let opened = open(&MASTER_KEY, "OPENAI_API_KEY", &sealed).unwrap();
         assert_eq!(opened.as_slice(), b"p0-python-value");
+    }
+
+    #[test]
+    fn opens_with_released_dek_and_preserves_aad_rejection() {
+        let dek = [0x99u8; KEY_BYTES];
+        let value_nonce = [0x11u8; NONCE_BYTES];
+        let ciphertext =
+            encrypt_with_key(&dek, &value_nonce, b"protected-key", &aad("PROTECTED_KEY")).unwrap();
+        let sealed = Sealed {
+            ciphertext: b64(&ciphertext),
+            nonce: b64(&value_nonce),
+            wrap_meta: json!({
+                "v": 1,
+                "scheme": WRAP_SCHEME,
+                "wrapped_dek": "",
+                "dek_nonce": ""
+            })
+            .to_string(),
+        };
+
+        let opened = open_with_dek(&dek, "PROTECTED_KEY", &sealed).unwrap();
+        assert_eq!(opened.as_slice(), b"protected-key");
+        assert!(open_with_dek(&dek, "OTHER_KEY", &sealed).is_err());
     }
 
     #[test]
