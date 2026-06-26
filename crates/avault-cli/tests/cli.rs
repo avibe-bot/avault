@@ -1107,6 +1107,30 @@ fn agent_rejects_socket_under_world_writable_ancestor() {
 }
 
 #[test]
+fn agent_rejects_relative_socket_under_world_writable_cwd() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("shared");
+    let run = cwd.join("run");
+    fs::create_dir_all(&run).unwrap();
+    fs::set_permissions(&cwd, fs::Permissions::from_mode(0o777)).unwrap();
+    fs::set_permissions(&run, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let output = avault()
+        .arg("agent")
+        .arg("--socket")
+        .arg("run/avault.sock")
+        .current_dir(&cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("socket ancestor"));
+}
+
+#[test]
 fn agent_closes_idle_partial_frame_and_accepts_next_client() {
     let tmp = tempfile::tempdir().unwrap();
     let socket = tmp.path().join("run").join("avault.sock");
@@ -1563,14 +1587,14 @@ fn agent_fast_fetch_keeps_unexpired_grant() {
             "type": "grant",
             "scope_type": "session",
             "scope_ref": "fast-fetch",
-            "ttl_secs": 20,
+            "ttl_secs": 60,
             "deks": [
                 {
                     "name": "API_TOKEN",
                     "dek_blindbox": fixed_blind_box(
                         public_key,
                         &dek,
-                        &aad_agent_deliver("session", "fast-fetch", "API_TOKEN", approval_nonce, approval_expires_at, 20)
+                        &aad_agent_deliver("session", "fast-fetch", "API_TOKEN", approval_nonce, approval_expires_at, 60)
                     ),
                     "approval": approval_json(approval_nonce, approval_expires_at)
                 }
@@ -1613,6 +1637,91 @@ fn agent_fast_fetch_keeps_unexpired_grant() {
         assert_eq!(response["ok"], true);
     }
     server.join().unwrap();
+
+    let _ = agent.kill();
+    let _ = agent.wait();
+}
+
+#[test]
+fn agent_fetch_drops_grant_that_expires_during_blocking_window() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("run").join("avault.sock");
+    let mut agent = spawn_agent(&socket, 60);
+    let mut stream = connect_agent(&socket);
+    let pubkey = agent_request(&mut stream, json!({"type": "pubkey"}));
+    let public_key = pubkey["result"]["public_key"].as_str().unwrap();
+    let dek = [0x5cu8; 32];
+    let approval_nonce = b"agent-short-fetch";
+    let approval_expires_at = future_expiry();
+    let grant = agent_request(
+        &mut stream,
+        json!({
+            "type": "grant",
+            "scope_type": "session",
+            "scope_ref": "short-fetch",
+            "ttl_secs": 1,
+            "deks": [
+                {
+                    "name": "API_TOKEN",
+                    "dek_blindbox": fixed_blind_box(
+                        public_key,
+                        &dek,
+                        &aad_agent_deliver("session", "short-fetch", "API_TOKEN", approval_nonce, approval_expires_at, 1)
+                    ),
+                    "approval": approval_json(approval_nonce, approval_expires_at)
+                }
+            ]
+        }),
+    );
+    assert_eq!(grant["ok"], true);
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = stream.read(&mut buf).unwrap();
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+            .unwrap();
+    });
+    let envelope = envelope_encrypted_with_dek("API_TOKEN", &dek, b"short-token");
+    let response = agent_request(
+        &mut stream,
+        json!({
+            "type": "deliver",
+            "scope_type": "session",
+            "scope_ref": "short-fetch",
+            "mode": "fetch",
+            "name": "API_TOKEN",
+            "envelope": envelope.clone(),
+            "request": {
+                "method": "GET",
+                "url": format!("http://127.0.0.1:{}/resource", addr.port()),
+                "allowed_hosts": ["127.0.0.1"],
+                "inject": {"type": "bearer"}
+            }
+        }),
+    );
+    assert_eq!(response["ok"], true);
+    server.join().unwrap();
+
+    let denied = agent_request(
+        &mut stream,
+        json!({
+            "type": "deliver",
+            "scope_type": "session",
+            "scope_ref": "short-fetch",
+            "mode": "inject",
+            "path": tmp.path().join("short.env"),
+            "format": "dotenv",
+            "secrets": [
+                {"name": "API_TOKEN", "key": "API_TOKEN", "envelope": envelope}
+            ]
+        }),
+    );
+    assert_eq!(denied["ok"], false);
+    assert!(denied["error"].as_str().unwrap().contains("grant"));
 
     let _ = agent.kill();
     let _ = agent.wait();

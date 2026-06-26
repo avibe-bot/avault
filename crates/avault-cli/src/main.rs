@@ -1260,42 +1260,70 @@ fn redact_form_encoded_equivalent_bytes(body: &mut Vec<u8>, needle: &[u8]) -> an
 }
 
 fn find_form_encoded_equivalent_ranges(body: &[u8], needle: &[u8]) -> Vec<(usize, usize)> {
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let prefix = kmp_prefix_table(needle);
+    let mut token_starts = vec![0usize; needle.len()];
     let mut ranges = Vec::new();
-    let mut search_start = 0usize;
-    while search_start < body.len() {
-        let mut body_index = search_start;
-        let mut needle_index = 0usize;
-        while needle_index < needle.len() && body_index < body.len() {
-            let Some((decoded, next_body_index)) = decode_form_encoded_byte(body, body_index)
-            else {
-                break;
-            };
-            if decoded != needle[needle_index] {
-                break;
+    let mut matched = 0usize;
+    let mut decoded_index = 0usize;
+    let mut body_index = 0usize;
+
+    while body_index < body.len() {
+        let token_start = body_index;
+        let (decoded, next_body_index) = decode_form_encoded_byte(body, body_index);
+        token_starts[decoded_index % needle.len()] = token_start;
+
+        while matched > 0 && decoded != needle[matched] {
+            matched = prefix[matched - 1];
+        }
+        if decoded == needle[matched] {
+            matched += 1;
+            if matched == needle.len() {
+                let start_decoded_index = decoded_index + 1 - needle.len();
+                let start = token_starts[start_decoded_index % needle.len()];
+                ranges.push((start, next_body_index));
+                matched = 0;
             }
-            body_index = next_body_index;
-            needle_index += 1;
         }
-        if needle_index == needle.len() && body_index > search_start {
-            ranges.push((search_start, body_index));
-            search_start = body_index;
-        } else {
-            search_start += 1;
-        }
+
+        decoded_index += 1;
+        body_index = next_body_index;
     }
     ranges
 }
 
-fn decode_form_encoded_byte(input: &[u8], index: usize) -> Option<(u8, usize)> {
-    match *input.get(index)? {
+fn kmp_prefix_table(needle: &[u8]) -> Vec<usize> {
+    let mut prefix = vec![0usize; needle.len()];
+    let mut matched = 0usize;
+    for index in 1..needle.len() {
+        while matched > 0 && needle[index] != needle[matched] {
+            matched = prefix[matched - 1];
+        }
+        if needle[index] == needle[matched] {
+            matched += 1;
+            prefix[index] = matched;
+        }
+    }
+    prefix
+}
+
+fn decode_form_encoded_byte(input: &[u8], index: usize) -> (u8, usize) {
+    match input[index] {
         b'+' => Some((b' ', index + 1)),
         b'%' => {
-            let high = from_hex(*input.get(index + 1)?)?;
-            let low = from_hex(*input.get(index + 2)?)?;
-            Some(((high << 4) | low, index + 3))
+            match (
+                input.get(index + 1).and_then(|byte| from_hex(*byte)),
+                input.get(index + 2).and_then(|byte| from_hex(*byte)),
+            ) {
+                (Some(high), Some(low)) => Some(((high << 4) | low, index + 3)),
+                _ => Some((b'%', index + 1)),
+            }
         }
         byte => Some((byte, index + 1)),
     }
+    .expect("form decoder always returns one decoded byte")
 }
 
 fn from_hex(byte: u8) -> Option<u8> {
@@ -2232,6 +2260,9 @@ impl AgentState {
         {
             self.grants.clear();
         }
+        let expiry_cutoff = now.checked_add(max_block).unwrap_or(now);
+        self.grants
+            .retain(|_, grant| grant.expires_at > expiry_cutoff);
     }
 
     fn get_grant(&mut self, scope: &GrantKey) -> anyhow::Result<&GrantEntry> {
@@ -2495,7 +2526,9 @@ fn ensure_agent_socket_parent(parent: &Path) -> anyhow::Result<()> {
         }
     }
     validate_agent_runtime_directory(parent)?;
-    validate_agent_socket_ancestors(parent)?;
+    let canonical_parent =
+        fs::canonicalize(parent).context("failed to resolve agent socket parent")?;
+    validate_agent_socket_ancestors(&canonical_parent)?;
     Ok(())
 }
 
