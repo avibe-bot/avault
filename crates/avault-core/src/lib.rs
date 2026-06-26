@@ -26,8 +26,8 @@ mod blind_box;
 mod signing;
 
 pub use blind_box::{
-    derive_blind_box_keypair_from_master, generate_blind_box_keypair, BlindBox, BlindBoxKeypair,
-    BLIND_BOX_HPKE_INFO, BLIND_BOX_SCHEME,
+    derive_blind_box_keypair_from_master, generate_blind_box_keypair, BlindBox, BlindBoxContext,
+    BlindBoxKeypair, BLIND_BOX_AAD_DOMAIN, BLIND_BOX_HPKE_INFO, BLIND_BOX_SCHEME,
 };
 pub use signing::{
     LocalSignerProvider, SignatureResult, SignatureScheme, SignerProvider,
@@ -168,7 +168,7 @@ pub fn open_with_dek(
     if meta.v != WRAP_META_VERSION {
         bail!("unsupported wrap_meta version");
     }
-    open_value_with_dek(dek, name, sealed)
+    open_value_with_dek_aad_only(dek, name, sealed)
 }
 
 /// Export an existing master key as a P0-compatible scrypt + AES-256-GCM blob.
@@ -280,6 +280,18 @@ fn open_value_with_dek(
             .map_err(|_| p1_err)
             .context("value decrypt failed"),
     }
+}
+
+fn open_value_with_dek_aad_only(
+    dek: &[u8; KEY_BYTES],
+    name: &str,
+    sealed: &Sealed,
+) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+    let value_nonce = decode_nonce(&sealed.nonce, "nonce")?;
+    let ciphertext = unb64(&sealed.ciphertext, "ciphertext")?;
+    decrypt_with_key(dek, &value_nonce, &ciphertext, &aad(name))
+        .map(Zeroizing::new)
+        .context("value decrypt failed")
 }
 
 fn derive_kek_scrypt(
@@ -455,6 +467,26 @@ mod tests {
         let opened = open_with_dek(&dek, "PROTECTED_KEY", &sealed).unwrap();
         assert_eq!(opened.as_slice(), b"protected-key");
         assert!(open_with_dek(&dek, "OTHER_KEY", &sealed).is_err());
+    }
+
+    #[test]
+    fn released_dek_rejects_legacy_empty_aad_ciphertext() {
+        let dek = [0x99u8; KEY_BYTES];
+        let value_nonce = [0x11u8; NONCE_BYTES];
+        let ciphertext = encrypt_with_key(&dek, &value_nonce, b"protected-key", &[]).unwrap();
+        let sealed = Sealed {
+            ciphertext: b64(&ciphertext),
+            nonce: b64(&value_nonce),
+            wrap_meta: json!({
+                "v": 1,
+                "scheme": WRAP_SCHEME,
+                "wrapped_dek": "",
+                "dek_nonce": ""
+            })
+            .to_string(),
+        };
+
+        assert!(open_with_dek(&dek, "PROTECTED_KEY", &sealed).is_err());
     }
 
     #[test]

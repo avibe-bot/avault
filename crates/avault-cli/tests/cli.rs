@@ -65,7 +65,60 @@ fn p0_no_aad_envelope() -> serde_json::Value {
     })
 }
 
-fn fixed_blind_box(public_key: &str, plaintext: &[u8]) -> serde_json::Value {
+fn blind_box_aad(
+    purpose: &str,
+    name: &str,
+    scope_type: &str,
+    scope_ref: &str,
+    scheme: &str,
+    digest: &[u8],
+) -> Vec<u8> {
+    fn push_field(out: &mut Vec<u8>, value: &[u8]) {
+        out.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        out.extend_from_slice(value);
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(b"avault:blind-box:aad:v1");
+    push_field(&mut out, purpose.as_bytes());
+    push_field(&mut out, name.as_bytes());
+    push_field(&mut out, b"machine-aesgcm-v1");
+    push_field(&mut out, &[1]);
+    push_field(&mut out, scope_type.as_bytes());
+    push_field(&mut out, scope_ref.as_bytes());
+    push_field(&mut out, scheme.as_bytes());
+    push_field(&mut out, digest);
+    out
+}
+
+fn aad_seal(name: &str) -> Vec<u8> {
+    blind_box_aad("seal", name, "", "", "", &[])
+}
+
+fn aad_deliver(name: &str) -> Vec<u8> {
+    blind_box_aad("deliver", name, "", "", "", &[])
+}
+
+fn aad_agent_deliver(scope_type: &str, scope_ref: &str, name: &str) -> Vec<u8> {
+    blind_box_aad("agent-deliver", name, scope_type, scope_ref, "", &[])
+}
+
+fn aad_sign(name: &str, scheme: &str, digest_hex: &str) -> Vec<u8> {
+    let digest = hex::decode(digest_hex).unwrap();
+    blind_box_aad("sign", name, "", "", scheme, &digest)
+}
+
+fn aad_agent_sign(
+    scope_type: &str,
+    scope_ref: &str,
+    name: &str,
+    scheme: &str,
+    digest_hex: &str,
+) -> Vec<u8> {
+    let digest = hex::decode(digest_hex).unwrap();
+    blind_box_aad("agent-sign", name, scope_type, scope_ref, scheme, &digest)
+}
+
+fn fixed_blind_box(public_key: &str, plaintext: &[u8], aad: &[u8]) -> serde_json::Value {
     struct FixedRng([u8; 32], u64);
     impl hpke::rand_core::RngCore for FixedRng {
         fn next_u32(&mut self) -> u32 {
@@ -108,7 +161,7 @@ fn fixed_blind_box(public_key: &str, plaintext: &[u8]) -> serde_json::Value {
         &public_key,
         b"avault:blind-box:v1",
         plaintext,
-        b"hpke-x25519-hkdfsha256-aes256gcm-v1",
+        aad,
         &mut rng,
     )
     .unwrap();
@@ -420,7 +473,11 @@ fn pubkey_and_blind_box_seal_roundtrip() {
     assert_eq!(pubkey["public_key"], vector["blind_box"]["public_key"]);
     assert_eq!(pubkey["fingerprint"], vector["blind_box"]["fingerprint"]);
 
-    let blind_box = fixed_blind_box(pubkey["public_key"].as_str().unwrap(), b"blind-value");
+    let blind_box = fixed_blind_box(
+        pubkey["public_key"].as_str().unwrap(),
+        b"blind-value",
+        &aad_seal("BLIND_SECRET"),
+    );
     let mut seal = avault()
         .arg("seal")
         .arg("--name")
@@ -525,7 +582,15 @@ fn protected_sign_uses_dek_blindbox() {
         .unwrap();
     assert!(output.status.success());
     let pubkey: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let dek_blindbox = fixed_blind_box(pubkey["public_key"].as_str().unwrap(), &dek);
+    let dek_blindbox = fixed_blind_box(
+        pubkey["public_key"].as_str().unwrap(),
+        &dek,
+        &aad_sign(
+            "PROTECTED_KEY",
+            "ecdsa-secp256k1-der",
+            signing["digest_hex"].as_str().unwrap(),
+        ),
+    );
     let expected = signing["schemes"]
         .as_array()
         .unwrap()
@@ -572,7 +637,11 @@ fn protected_deliver_run_uses_dek_blindbox() {
         .unwrap();
     assert!(pubkey_output.status.success());
     let pubkey: serde_json::Value = serde_json::from_slice(&pubkey_output.stdout).unwrap();
-    let dek_blindbox = fixed_blind_box(pubkey["public_key"].as_str().unwrap(), &dek);
+    let dek_blindbox = fixed_blind_box(
+        pubkey["public_key"].as_str().unwrap(),
+        &dek,
+        &aad_deliver("PROTECTED_VALUE"),
+    );
     let request = json!([
         {
             "name": "PROTECTED_VALUE",
@@ -625,7 +694,14 @@ fn agent_grant_deliver_inject_release_roundtrip() {
             "scope_ref": "agent-test",
             "ttl_secs": 60,
             "deks": [
-                {"name": "API_TOKEN", "dek_blindbox": fixed_blind_box(public_key, &dek)}
+                {
+                    "name": "API_TOKEN",
+                    "dek_blindbox": fixed_blind_box(
+                        public_key,
+                        &dek,
+                        &aad_agent_deliver("session", "agent-test", "API_TOKEN")
+                    )
+                }
             ]
         }),
     );
@@ -717,7 +793,14 @@ fn agent_expires_grants_by_ttl() {
             "scope_ref": "ttl-test",
             "ttl_secs": 1,
             "deks": [
-                {"name": "API_TOKEN", "dek_blindbox": fixed_blind_box(public_key, &dek)}
+                {
+                    "name": "API_TOKEN",
+                    "dek_blindbox": fixed_blind_box(
+                        public_key,
+                        &dek,
+                        &aad_agent_deliver("session", "ttl-test", "API_TOKEN")
+                    )
+                }
             ]
         }),
     );
@@ -766,7 +849,23 @@ fn agent_signs_with_cached_dek_grant() {
             "scope_ref": "sign-test",
             "ttl_secs": 60,
             "deks": [
-                {"name": "AGENT_SIGNING_KEY", "dek_blindbox": fixed_blind_box(public_key, &dek)}
+                {
+                    "name": "AGENT_SIGNING_KEY",
+                    "purpose": "sign",
+                    "scheme": "ecdsa-secp256k1-der",
+                    "digest": signing["digest_hex"],
+                    "dek_blindbox": fixed_blind_box(
+                        public_key,
+                        &dek,
+                        &aad_agent_sign(
+                            "session",
+                            "sign-test",
+                            "AGENT_SIGNING_KEY",
+                            "ecdsa-secp256k1-der",
+                            signing["digest_hex"].as_str().unwrap()
+                        )
+                    )
+                }
             ]
         }),
     );
@@ -795,6 +894,21 @@ fn agent_signs_with_cached_dek_grant() {
     assert_eq!(response["result"]["signature"], expected["signature_hex"]);
     assert_eq!(response["result"]["recovery_id"], serde_json::Value::Null);
 
+    let replayed = agent_request(
+        &mut stream,
+        json!({
+            "type": "sign",
+            "scope_type": "session",
+            "scope_ref": "sign-test",
+            "name": "AGENT_SIGNING_KEY",
+            "key_envelope": key_envelope,
+            "digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "scheme": "ecdsa-secp256k1-der"
+        }),
+    );
+    assert_eq!(replayed["ok"], false);
+    assert!(replayed["error"].as_str().unwrap().contains("grant"));
+
     let _ = agent.kill();
     let _ = agent.wait();
 }
@@ -816,7 +930,14 @@ fn agent_idle_timeout_clears_grants() {
             "scope_ref": "idle-test",
             "ttl_secs": 60,
             "deks": [
-                {"name": "API_TOKEN", "dek_blindbox": fixed_blind_box(public_key, &dek)}
+                {
+                    "name": "API_TOKEN",
+                    "dek_blindbox": fixed_blind_box(
+                        public_key,
+                        &dek,
+                        &aad_agent_deliver("session", "idle-test", "API_TOKEN")
+                    )
+                }
             ]
         }),
     );

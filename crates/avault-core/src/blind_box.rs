@@ -1,4 +1,4 @@
-use crate::{b64, unb64, KEY_BYTES};
+use crate::{b64, unb64, KEY_BYTES, WRAP_META_VERSION, WRAP_SCHEME};
 use anyhow::bail;
 use hkdf::Hkdf;
 use hpke::{
@@ -19,8 +19,15 @@ type HpkeEncappedKey = <HpkeKem as Kem>::EncappedKey;
 pub const BLIND_BOX_SCHEME: &str = "hpke-x25519-hkdfsha256-aes256gcm-v1";
 /// HPKE `info` string for avault blind boxes.
 pub const BLIND_BOX_HPKE_INFO: &[u8] = b"avault:blind-box:v1";
+/// Domain separator for operation-bound blind-box AAD.
+pub const BLIND_BOX_AAD_DOMAIN: &[u8] = b"avault:blind-box:aad:v1";
 const CLI_DERIVED_RECEIVER_SALT: &[u8] = b"avault:blind-box:receiver-salt:v1";
 const CLI_DERIVED_RECEIVER_INFO: &[u8] = b"avault:blind-box:receiver-x25519:v1";
+const BLIND_BOX_PURPOSE_SEAL: &str = "seal";
+const BLIND_BOX_PURPOSE_DELIVER: &str = "deliver";
+const BLIND_BOX_PURPOSE_AGENT_DELIVER: &str = "agent-deliver";
+const BLIND_BOX_PURPOSE_SIGN: &str = "sign";
+const BLIND_BOX_PURPOSE_AGENT_SIGN: &str = "agent-sign";
 
 /// Browser-to-avault blind box.
 ///
@@ -32,6 +39,120 @@ pub struct BlindBox {
     pub scheme: String,
     pub enc: String,
     pub ct: String,
+}
+
+/// Operation context authenticated by a blind box.
+///
+/// The browser constructs the same context before HPKE sealing. avault constructs
+/// it again from the approved operation before opening; a blind box from one
+/// operation therefore cannot be replayed into a different name, scope, or
+/// signing digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlindBoxContext {
+    purpose: &'static str,
+    name: String,
+    scope_type: Option<String>,
+    scope_ref: Option<String>,
+    sign_scheme: Option<String>,
+    digest: Option<[u8; KEY_BYTES]>,
+}
+
+impl BlindBoxContext {
+    /// Context for `seal --blind-box` standard-tier creation.
+    pub fn seal(name: &str) -> Self {
+        Self::new(BLIND_BOX_PURPOSE_SEAL, name)
+    }
+
+    /// Context for one-shot protected delivery with a DEK blind box.
+    pub fn deliver(name: &str) -> Self {
+        Self::new(BLIND_BOX_PURPOSE_DELIVER, name)
+    }
+
+    /// Context for an agent grant that caches a delivery DEK under a scope.
+    pub fn agent_deliver(scope_type: &str, scope_ref: &str, name: &str) -> Self {
+        Self::new(BLIND_BOX_PURPOSE_AGENT_DELIVER, name).with_scope(scope_type, scope_ref)
+    }
+
+    /// Context for one-shot protected signing with a DEK blind box.
+    pub fn sign(name: &str, sign_scheme: &str, digest: &[u8; KEY_BYTES]) -> Self {
+        Self::new(BLIND_BOX_PURPOSE_SIGN, name).with_signing(sign_scheme, digest)
+    }
+
+    /// Context for an agent grant that caches a signing DEK for one approved digest.
+    pub fn agent_sign(
+        scope_type: &str,
+        scope_ref: &str,
+        name: &str,
+        sign_scheme: &str,
+        digest: &[u8; KEY_BYTES],
+    ) -> Self {
+        Self::new(BLIND_BOX_PURPOSE_AGENT_SIGN, name)
+            .with_scope(scope_type, scope_ref)
+            .with_signing(sign_scheme, digest)
+    }
+
+    fn new(purpose: &'static str, name: &str) -> Self {
+        Self {
+            purpose,
+            name: name.to_string(),
+            scope_type: None,
+            scope_ref: None,
+            sign_scheme: None,
+            digest: None,
+        }
+    }
+
+    fn with_scope(mut self, scope_type: &str, scope_ref: &str) -> Self {
+        self.scope_type = Some(scope_type.to_string());
+        self.scope_ref = Some(scope_ref.to_string());
+        self
+    }
+
+    fn with_signing(mut self, sign_scheme: &str, digest: &[u8; KEY_BYTES]) -> Self {
+        self.sign_scheme = Some(sign_scheme.to_string());
+        self.digest = Some(*digest);
+        self
+    }
+
+    /// Return the exact HPKE AAD bytes for this context.
+    ///
+    /// Encoding:
+    /// `BLIND_BOX_AAD_DOMAIN || field(purpose) || field(name) ||
+    /// field(WRAP_SCHEME) || field([WRAP_META_VERSION]) || field(scope_type or "")
+    /// || field(scope_ref or "") || field(sign_scheme or "") || field(digest or "")`,
+    /// where `field(x) = uint32_be(len(x)) || x`.
+    pub fn aad_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(BLIND_BOX_AAD_DOMAIN);
+        push_aad_field(&mut out, self.purpose.as_bytes());
+        push_aad_field(&mut out, self.name.as_bytes());
+        push_aad_field(&mut out, WRAP_SCHEME.as_bytes());
+        push_aad_field(&mut out, &[WRAP_META_VERSION]);
+        push_aad_field(
+            &mut out,
+            self.scope_type.as_deref().unwrap_or("").as_bytes(),
+        );
+        push_aad_field(&mut out, self.scope_ref.as_deref().unwrap_or("").as_bytes());
+        push_aad_field(
+            &mut out,
+            self.sign_scheme.as_deref().unwrap_or("").as_bytes(),
+        );
+        push_aad_field(
+            &mut out,
+            self.digest.as_ref().map(|d| d.as_slice()).unwrap_or(&[]),
+        );
+        out
+    }
+
+    pub fn purpose(&self) -> &'static str {
+        self.purpose
+    }
+}
+
+fn push_aad_field(out: &mut Vec<u8>, value: &[u8]) {
+    let len = u32::try_from(value.len()).expect("blind-box AAD field length fits u32");
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(value);
 }
 
 /// In-memory X25519 receiver keypair for opening blind boxes.
@@ -57,8 +178,12 @@ impl BlindBoxKeypair {
         hex::encode(digest)
     }
 
-    pub fn open(&self, blind_box: &BlindBox) -> anyhow::Result<Zeroizing<Vec<u8>>> {
-        open_blind_box_with_private_key(&self.private_key, blind_box)
+    pub fn open(
+        &self,
+        blind_box: &BlindBox,
+        context: &BlindBoxContext,
+    ) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+        open_blind_box_with_private_key(&self.private_key, blind_box, context)
     }
 }
 
@@ -94,6 +219,7 @@ fn derive_blind_box_keypair(ikm: &[u8]) -> BlindBoxKeypair {
 fn open_blind_box_with_private_key(
     private_key: &HpkePrivateKey,
     blind_box: &BlindBox,
+    context: &BlindBoxContext,
 ) -> anyhow::Result<Zeroizing<Vec<u8>>> {
     if blind_box.scheme != BLIND_BOX_SCHEME {
         bail!("unsupported blind-box scheme");
@@ -108,7 +234,7 @@ fn open_blind_box_with_private_key(
         &encapped_key,
         BLIND_BOX_HPKE_INFO,
         &ct,
-        BLIND_BOX_SCHEME.as_bytes(),
+        &context.aad_bytes(),
     )
     .map_err(|_| anyhow::anyhow!("blind-box open failed"))?;
     Ok(Zeroizing::new(plaintext))
@@ -119,6 +245,7 @@ pub(crate) fn seal_blind_box_for_tests(
     public_key_b64: &str,
     plaintext: &[u8],
     rng_seed: [u8; 32],
+    context: &BlindBoxContext,
 ) -> anyhow::Result<BlindBox> {
     use hpke::rand_core::{CryptoRng, RngCore};
     use hpke::{single_shot_seal, OpModeS};
@@ -162,7 +289,7 @@ pub(crate) fn seal_blind_box_for_tests(
         &public_key,
         BLIND_BOX_HPKE_INFO,
         plaintext,
-        BLIND_BOX_SCHEME.as_bytes(),
+        &context.aad_bytes(),
         &mut rng,
     )
     .map_err(|_| anyhow::anyhow!("blind-box seal failed"))?;
@@ -186,13 +313,15 @@ mod tests {
     #[test]
     fn derived_keypair_opens_blind_box() {
         let keypair = derive_blind_box_keypair_from_master(&MASTER_KEY);
+        let context = BlindBoxContext::seal("BLIND_SECRET");
         let blind_box = seal_blind_box_for_tests(
             &keypair.public_key_b64(),
             b"blind secret",
             [0x42u8; KEY_BYTES],
+            &context,
         )
         .unwrap();
-        let opened = keypair.open(&blind_box).unwrap();
+        let opened = keypair.open(&blind_box, &context).unwrap();
         assert_eq!(opened.as_slice(), b"blind secret");
     }
 
@@ -207,14 +336,16 @@ mod tests {
             blind["hpke_info_utf8"],
             std::str::from_utf8(BLIND_BOX_HPKE_INFO).unwrap()
         );
-        assert_eq!(blind["aad_utf8"], BLIND_BOX_SCHEME);
+        assert_eq!(blind["aad_domain_utf8"], "avault:blind-box:aad:v1");
         let master_key = hex::decode(blind["master_key_hex"].as_str().unwrap()).unwrap();
         let master_key: [u8; KEY_BYTES] = master_key.try_into().unwrap();
         let keypair = derive_blind_box_keypair_from_master(&master_key);
         assert_eq!(keypair.public_key_b64(), blind["public_key"]);
         assert_eq!(keypair.fingerprint_hex(), blind["fingerprint"]);
         let blind_box: BlindBox = serde_json::from_value(blind["box"].clone()).unwrap();
-        let opened = keypair.open(&blind_box).unwrap();
+        let context = BlindBoxContext::seal(blind["context"]["name"].as_str().unwrap());
+        assert_eq!(hex::encode(context.aad_bytes()), blind["aad_hex"]);
+        let opened = keypair.open(&blind_box, &context).unwrap();
         assert_eq!(
             hex::encode(opened.as_slice()),
             blind["plaintext_hex"].as_str().unwrap()
@@ -222,15 +353,78 @@ mod tests {
     }
 
     #[test]
+    fn blind_box_aad_examples_match_vector_file() {
+        let vector: serde_json::Value =
+            serde_json::from_str(include_str!("../../../tests/vectors/p2_core_crypto.json"))
+                .unwrap();
+        let cases = vector["blind_box_aad_examples"]["cases"]
+            .as_array()
+            .unwrap();
+        for case in cases {
+            let purpose = case["purpose"].as_str().unwrap();
+            let name = case["name"].as_str().unwrap();
+            let scope_type = case["scope_type"].as_str().unwrap();
+            let scope_ref = case["scope_ref"].as_str().unwrap();
+            let sign_scheme = case["sign_scheme"].as_str().unwrap();
+            let digest_hex = case["digest_hex"].as_str().unwrap();
+            let context = match purpose {
+                "seal" => BlindBoxContext::seal(name),
+                "deliver" => BlindBoxContext::deliver(name),
+                "sign" => {
+                    let digest: [u8; KEY_BYTES] =
+                        hex::decode(digest_hex).unwrap().try_into().unwrap();
+                    BlindBoxContext::sign(name, sign_scheme, &digest)
+                }
+                "agent-deliver" => BlindBoxContext::agent_deliver(scope_type, scope_ref, name),
+                "agent-sign" => {
+                    let digest: [u8; KEY_BYTES] =
+                        hex::decode(digest_hex).unwrap().try_into().unwrap();
+                    BlindBoxContext::agent_sign(scope_type, scope_ref, name, sign_scheme, &digest)
+                }
+                _ => panic!("unexpected blind-box AAD vector purpose"),
+            };
+            assert_eq!(hex::encode(context.aad_bytes()), case["aad_hex"]);
+        }
+    }
+
+    #[test]
+    fn rejects_wrong_blind_box_context() {
+        let keypair = derive_blind_box_keypair_from_master(&MASTER_KEY);
+        let context = BlindBoxContext::sign(
+            "SIGNING_KEY",
+            "ecdsa-secp256k1-recoverable",
+            &[0x11u8; KEY_BYTES],
+        );
+        let blind_box = seal_blind_box_for_tests(
+            &keypair.public_key_b64(),
+            b"blind secret",
+            [0x42u8; KEY_BYTES],
+            &context,
+        )
+        .unwrap();
+        let wrong_digest = BlindBoxContext::sign(
+            "SIGNING_KEY",
+            "ecdsa-secp256k1-recoverable",
+            &[0x22u8; KEY_BYTES],
+        );
+        assert!(keypair.open(&blind_box, &wrong_digest).is_err());
+        assert!(keypair
+            .open(&blind_box, &BlindBoxContext::deliver("SIGNING_KEY"))
+            .is_err());
+    }
+
+    #[test]
     fn rejects_wrong_blind_box_scheme() {
         let keypair = derive_blind_box_keypair_from_master(&MASTER_KEY);
+        let context = BlindBoxContext::seal("BLIND_SECRET");
         let mut blind_box = seal_blind_box_for_tests(
             &keypair.public_key_b64(),
             b"blind secret",
             [0x42u8; KEY_BYTES],
+            &context,
         )
         .unwrap();
         blind_box.scheme = "wrong".to_string();
-        assert!(keypair.open(&blind_box).is_err());
+        assert!(keypair.open(&blind_box, &context).is_err());
     }
 }

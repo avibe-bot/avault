@@ -151,6 +151,9 @@ Unix and a protected owner-only DACL on Windows. `yaml` and `toml` remain deferr
 `pubkey` emits `{public_key, fingerprint}` for HPKE blind boxes. `seal --blind-box`
 reads `{"scheme":"hpke-x25519-hkdfsha256-aes256gcm-v1","enc":"...","ct":"..."}`
 from stdin and returns the normal `{ciphertext, nonce, wrap_meta}` envelope.
+Blind boxes are authenticated with operation-bound HPKE AAD (`purpose`, `name`,
+scheme/version, optional scope, and signing digest), as pinned in
+`docs/DESIGN.md` and `tests/vectors/p2_core_crypto.json`.
 The one-shot CLI derives the receiver keypair from the local master key so `pubkey`
 and `seal --blind-box` work across processes without persisting a new private key.
 The resident agent uses a fresh in-memory keypair for its process lifetime.
@@ -170,7 +173,8 @@ The resident agent uses a fresh in-memory keypair for its process lifetime.
 Supported schemes are `ecdsa-secp256k1-recoverable`, `ecdsa-secp256k1-der`, and
 `schnorr-secp256k1-bip340`. Output is `{"signature":"<hex>","recovery_id":0|null}`.
 avault signs exactly the caller-provided digest; chain-specific sighash construction
-stays outside avault.
+stays outside avault. Protected `dek_blindbox` opens are AAD-only; the P0 empty-AAD
+read fallback applies only to legacy standard-tier rows.
 
 ## How Avibe talks to it
 

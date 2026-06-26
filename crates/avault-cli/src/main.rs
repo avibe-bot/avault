@@ -6,7 +6,8 @@ use anyhow::{anyhow, bail, Context};
 #[cfg(unix)]
 use avault_core::BlindBoxKeypair;
 use avault_core::{
-    BlindBox, ExportBlob, LocalSignerProvider, Sealed, SignatureScheme, SignerProvider,
+    BlindBox, BlindBoxContext, ExportBlob, LocalSignerProvider, Sealed, SignatureScheme,
+    SignerProvider,
 };
 use avault_store::{Backend, FileStore, MasterKey, PassphraseFileStore};
 use serde::{Deserialize, Serialize};
@@ -225,7 +226,9 @@ fn seal_cmd(args: &[OsString], config: &CliConfig, input: &mut impl Read) -> any
             serde_json::from_slice(input.as_slice()).context("blind-box JSON is invalid")?;
         let master = load_existing_master_from_unlock(&unlock)?;
         let keypair = avault_core::derive_blind_box_keypair_from_master(master.as_bytes());
-        let value = keypair.open(&blind_box).context("blind-box open failed")?;
+        let value = keypair
+            .open(&blind_box, &BlindBoxContext::seal(&options.name))
+            .context("blind-box open failed")?;
         drop(keypair);
         let sealed = avault_core::seal(master.as_bytes(), &options.name, value.as_slice())
             .context("seal failed")?;
@@ -344,8 +347,9 @@ fn sign_cmd(args: &[OsString], config: &CliConfig, input: &mut impl Read) -> any
     let key_plaintext = if let Some(dek_blindbox) = &request.dek_blindbox {
         let master = load_existing_master_from_unlock(&unlock)?;
         let keypair = avault_core::derive_blind_box_keypair_from_master(master.as_bytes());
+        let context = BlindBoxContext::sign(&request.name, scheme.as_str(), &digest);
         let dek_plaintext = keypair
-            .open(dek_blindbox)
+            .open(dek_blindbox, &context)
             .context("DEK blind-box open failed")?;
         drop(keypair);
         drop(master);
@@ -622,8 +626,9 @@ fn open_one_shot_secret(
             }
         };
         let keypair = avault_core::derive_blind_box_keypair_from_master(master.as_bytes());
+        let context = BlindBoxContext::deliver(name);
         let dek_plaintext = keypair
-            .open(dek_blindbox)
+            .open(dek_blindbox, &context)
             .context("DEK blind-box open failed")?;
         drop(keypair);
         let dek = zeroizing_vec_to_key32(dek_plaintext, "released DEK")?;
@@ -1751,7 +1756,34 @@ struct GrantKey {
 #[cfg(unix)]
 struct GrantEntry {
     expires_at: Instant,
-    deks: HashMap<String, MasterKey>,
+    deks: HashMap<AgentDekKey, MasterKey>,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AgentDekKey {
+    purpose: AgentDekPurpose,
+    name: String,
+    scheme: Option<String>,
+    digest_hex: Option<String>,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum AgentDekPurpose {
+    Deliver,
+    Sign,
+}
+
+#[cfg(unix)]
+impl AgentDekPurpose {
+    fn parse(value: Option<&str>) -> anyhow::Result<Self> {
+        match value.unwrap_or("deliver") {
+            "deliver" => Ok(Self::Deliver),
+            "sign" => Ok(Self::Sign),
+            _ => bail!("unsupported grant DEK purpose"),
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1827,6 +1859,12 @@ struct AgentGrantRequest {
 struct AgentDekInput {
     name: String,
     dek_blindbox: BlindBox,
+    #[serde(default)]
+    purpose: Option<String>,
+    #[serde(default)]
+    scheme: Option<String>,
+    #[serde(default)]
+    digest: Option<String>,
 }
 
 #[cfg(unix)]
@@ -2038,23 +2076,63 @@ fn handle_agent_frame_inner(
                 bail!("grant ttl_secs must be positive");
             }
             let mut deks = HashMap::with_capacity(request.deks.len());
+            let scope_type = request.scope_type;
+            let scope_ref = request.scope_ref;
             for dek in request.deks {
-                if deks.contains_key(&dek.name) {
+                let purpose = AgentDekPurpose::parse(dek.purpose.as_deref())?;
+                let (context, key) = match purpose {
+                    AgentDekPurpose::Deliver => {
+                        if dek.scheme.is_some() || dek.digest.is_some() {
+                            bail!("deliver grant DEK must not include signing fields");
+                        }
+                        (
+                            BlindBoxContext::agent_deliver(&scope_type, &scope_ref, &dek.name),
+                            AgentDekKey {
+                                purpose,
+                                name: dek.name.clone(),
+                                scheme: None,
+                                digest_hex: None,
+                            },
+                        )
+                    }
+                    AgentDekPurpose::Sign => {
+                        let scheme = dek.scheme.context("sign grant DEK requires scheme")?;
+                        let digest_hex = dek.digest.context("sign grant DEK requires digest")?;
+                        let digest = decode_hex_32(&digest_hex, "digest")?;
+                        let digest_key_hex = hex::encode(digest);
+                        (
+                            BlindBoxContext::agent_sign(
+                                &scope_type,
+                                &scope_ref,
+                                &dek.name,
+                                &scheme,
+                                &digest,
+                            ),
+                            AgentDekKey {
+                                purpose,
+                                name: dek.name.clone(),
+                                scheme: Some(scheme),
+                                digest_hex: Some(digest_key_hex),
+                            },
+                        )
+                    }
+                };
+                if deks.contains_key(&key) {
                     bail!("duplicate grant DEK name");
                 }
                 let opened = keypair
-                    .open(&dek.dek_blindbox)
+                    .open(&dek.dek_blindbox, &context)
                     .context("DEK blind-box open failed")?;
                 let released_dek = zeroizing_vec_to_key32(opened, "released DEK")?;
                 let locked =
                     MasterKey::from_bytes(&released_dek).context("failed to lock released DEK")?;
                 drop(released_dek);
-                deks.insert(dek.name, locked);
+                deks.insert(key, locked);
             }
             let granted = deks.len();
             let key = GrantKey {
-                scope_type: request.scope_type,
-                scope_ref: request.scope_ref,
+                scope_type,
+                scope_ref,
             };
             state.grants.insert(
                 key,
@@ -2119,8 +2197,13 @@ fn handle_agent_frame_inner(
             let grant = state.get_grant(&scope)?;
             let digest = decode_hex_32(&request.digest, "digest")?;
             let scheme = SignatureScheme::from_str(&request.scheme)?;
-            let key_plaintext = open_secret_with_grant(&request.name, &request.key_envelope, grant)
-                .context("key envelope open failed")?;
+            let key_plaintext = open_signing_key_with_grant(
+                &request.name,
+                &request.key_envelope,
+                &request.scheme,
+                &digest,
+                grant,
+            )?;
             let output = sign_digest_with_key(scheme, &digest, key_plaintext)?;
             agent_ok(output)
         }
@@ -2204,8 +2287,33 @@ fn open_secret_with_grant(
 ) -> anyhow::Result<Zeroizing<Vec<u8>>> {
     let dek = grant
         .deks
-        .get(name)
+        .get(&AgentDekKey {
+            purpose: AgentDekPurpose::Deliver,
+            name: name.to_string(),
+            scheme: None,
+            digest_hex: None,
+        })
         .context("grant does not cover secret")?;
+    avault_core::open_with_dek(dek.as_bytes(), name, envelope).context("envelope open failed")
+}
+
+#[cfg(unix)]
+fn open_signing_key_with_grant(
+    name: &str,
+    envelope: &Sealed,
+    scheme: &str,
+    digest: &[u8; 32],
+    grant: &GrantEntry,
+) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+    let dek = grant
+        .deks
+        .get(&AgentDekKey {
+            purpose: AgentDekPurpose::Sign,
+            name: name.to_string(),
+            scheme: Some(scheme.to_string()),
+            digest_hex: Some(hex::encode(digest)),
+        })
+        .context("grant does not cover signing operation")?;
     avault_core::open_with_dek(dek.as_bytes(), name, envelope).context("envelope open failed")
 }
 
