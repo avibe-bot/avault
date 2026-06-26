@@ -29,7 +29,7 @@ This matches the distribution decision in `docs/DESIGN.md` Section 16, decision
 | Manifest target | Rust target | Runner |
 | --- | --- | --- |
 | `macos-arm64` | `aarch64-apple-darwin` | `macos-14` |
-| `macos-x64` | `x86_64-apple-darwin` | `macos-13` |
+| `macos-x64` | `x86_64-apple-darwin` | `macos-15-intel` |
 | `linux-x64` | `x86_64-unknown-linux-musl` | `ubuntu-latest` |
 | `linux-arm64` | `aarch64-unknown-linux-musl` | `ubuntu-24.04-arm` |
 | `windows-x64` | `x86_64-pc-windows-msvc` | `windows-latest` |

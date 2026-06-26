@@ -27,7 +27,7 @@ jobs:
             required: true
           - target_name: macos-x64
             rust_target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-15-intel
             binary: avault
             strip: true
             required: true
@@ -169,7 +169,7 @@ jobs:
             os: macos-14
             binary: avault
           - target_name: macos-x64
-            os: macos-13
+            os: macos-15-intel
             binary: avault
 
     steps:
