@@ -18,7 +18,7 @@ Avibe (Python) keeps only **metadata and orchestration**. It never holds the mas
 
 Two **trust roots**, chosen per secret:
 
-- **Standard tier (machine-rooted):** the root key lives on the machine (hardware keystore where available, `file+mlock` fallback). Headless use is allowed. Protects at-rest/disk-theft and keeps values out of the LLM, but does **not** survive a compromised machine.
+- **Standard tier (machine-rooted):** the root key lives on the machine (hardware keystore where available, cross-platform file-store fallback). Headless use is allowed. Protects at-rest/disk-theft and keeps values out of the LLM, but does **not** survive a compromised machine.
 - **Protected tier (human-rooted):** the root (VMK) is wrapped by a factor only the user can supply in the browser (passkey-PRF or password). The machine alone cannot decrypt. **No headless use.** Survives a compromised machine.
 
 ---
@@ -99,7 +99,7 @@ If a secret must be usable by an unattended agent, the machine must be able to d
 
 ### 4.1 Standard tier — machine-rooted
 
-- **Where the key lives:** the OS hardware keystore where available — macOS Keychain/Secure Enclave, Linux TPM — with `file+mlock` (0600) as the headless fallback.
+- **Where the key lives:** the OS hardware keystore where available — macOS Keychain/Secure Enclave, Linux TPM — with the file-store floor as the headless fallback (0600 + `mlock` on Unix; protected owner-only DACL + `VirtualLock` on Windows).
 - **How it decrypts:** `avault` asks the keystore to release/use the master key. With a hardware element, the unwrap can happen inside the element and the raw key never leaves it.
 - **Headless:** yes. This is the point of the tier.
 - **What it protects:** at-rest encryption (a stolen disk/backup is useless); other processes (with a hardware store + ACL); swap/coredump; and values never enter the LLM, transcript, or Python's persistent state.
@@ -119,7 +119,7 @@ If a secret must be usable by an unattended agent, the machine must be able to d
 
 | | Standard (machine-rooted) | Protected (human-rooted) |
 |---|---|---|
-| Root key at rest | master key in hardware keystore / `file+mlock` | only `wrapped_vmk`; machine can't open it |
+| Root key at rest | master key in hardware keystore / cross-platform file store | only `wrapped_vmk`; machine can't open it |
 | Unlock factor | none (OS account + hardware element) | passkey-PRF or password, **in browser** |
 | Headless use | ✅ yes | ❌ no |
 | Survives stolen disk | ✅ | ✅ |
@@ -357,7 +357,7 @@ Peer-cred gates *other users* and remote, not a same-uid process — which is co
 
 - **Hardware / cloud (strongest roots):** macOS **Keychain / Secure Enclave**, Linux **TPM 2.0** (seal/unseal, optional PCR/auth binding), cloud **KMS** KEK. Non-extractable keys; can also serve as protected-tier factors on the machine for the no-browser case. Best for servers that must **auto-restart unattended**.
 - **`file + passphrase` (P2 — the cloud/no-hardware sweet spot):** wrap the master key under a KEK derived from an operator passphrase (`scrypt` / Argon2id); store only `wrapped_master`, so **the plaintext master never touches disk**. Unlock **once at startup** (passphrase via stdin) into `mlock`'d memory. Same "wrap the root under a factor-KEK" idea as the protected-tier VMK, applied to the standard master. *Honest limits:* it defends **at-rest** (stolen disk / leaked backup / same-uid file read are useless without the passphrase) but **not the running machine** (after unlock the master is in memory); and it needs a human passphrase **per restart**, trading fully-unattended auto-restart for at-rest safety. Pairs with the resident agent (unlock once, hold in memory) or, for one-shot CLI on Linux, the **kernel keyring** (hold the unwrapped master between invocations; cleared on reboot).
-- **`file + mlock` (0600) — P1 baseline / floor:** works headless on Linux and macOS. At-rest the key file is **plaintext** (protected only by the OS account + `mlock` / no-coredump), so it is the floor, not a strong at-rest guarantee.
+- **File store + memory lock — P1 baseline / floor:** works headless on Linux, macOS, and Windows. Unix uses a 0700 parent directory, 0600 key file, `mlock`, and no-coredump hardening. Windows uses a protected owner-only DACL on the key directory/key file plus best-effort `VirtualLock` and crash-dump hardening. Existing broad modes/ACLs are rejected rather than silently tightened. At-rest the key file is **plaintext** (protected only by the OS account + page-lock/no-coredump hardening), so it is the floor, not a strong at-rest guarantee.
 
 This is an internal store selection inside `avault`, not an Avibe-level plugin layer.
 
@@ -372,7 +372,7 @@ This is an internal store selection inside `avault`, not an Avibe-level plugin l
   avault/
   ├─ crates/
   │  ├─ avault-core/    # pure crypto: AEAD+AAD, derive/wrap DEK, envelope, Zeroizing. No I/O, no platform deps. Unit-tested, auditable.
-  │  ├─ avault-store/   # cross-platform master/VMK store: file+mlock (P1) → keychain/SE/TPM/KMS
+  │  ├─ avault-store/   # cross-platform master/VMK store: file+mlock / Windows DACL (P1) → keychain/SE/TPM/KMS
   │  └─ avault-cli/     # the `avault` binary: one-shot ops + the resident agent
   └─ ...
   ```
@@ -386,7 +386,7 @@ This is an internal store selection inside `avault`, not an Avibe-level plugin l
 | Phase | Scope | State |
 |---|---|---|
 | **P0** | Python standard tier: DB + envelope + delivery + `$<NAME>` (#631) | **done — keep & merge; not replaced before P1** |
-| **P1** | `avault-core` + CLI + `file+mlock` store; Rust takes standard-tier seal/open; blind-box create; `vibe runtime prepare` ensure + Dependencies card. Closes the memory-hygiene gap. | done |
+| **P1** | `avault-core` + CLI + cross-platform file store; Rust takes standard-tier seal/open; blind-box create; `vibe runtime prepare` ensure + Dependencies card. Closes the memory-hygiene gap. | done |
 | **P1.1** | Complete the standard-tier delivery surface so Avibe can route every value-open through `avault`: multi-secret `deliver run`, brokered `deliver fetch`, and atomic-file `deliver inject` (dotenv/json). | current |
 | **P2** | Resident agent + `SO_PEERCRED` + scope-grant DEK cache + signer (secp256k1; approval-card context in the sign prompt). Protected-tier non-browser factors via hardware stores. | after P1 |
 | **P3** | Multi-factor (passkey-PRF copies, TPM, KMS KEK); external `SignerProvider` (hardware wallet / WalletConnect). | later |
@@ -399,8 +399,8 @@ This is an internal store selection inside `avault`, not an Avibe-level plugin l
 
 1. **Name → `avault`.** Short, ownable; already the repo / binary / crate prefix. Not published to crates.io, so no registry-name collision concern.
 2. **Envelope → wrapped_dek (Scheme A).** Random per-record DEK, wrapped under the root (master / VMK); store `wrapped_dek`. Cheap rotation (re-wrap, never re-encrypt), no DB break, and it unifies the standard + protected envelopes. The protected tier extends it with **N `wrapped_vmk` factor-copies** (password via `scrypt`, passkey via WebAuthn-PRF, second device, recovery code) — **any one factor unlocks the same random VMK**, and add / remove / change-password is a re-wrap of the VMK, not a re-encrypt of data. The only "derive" is *factor → KEK*; the DEK and VMK are random and wrapped. (Rejected: `vt`'s pure-derive — forces full re-encrypt on rotation and a second envelope format.)
-3. **Distribution → a real manifest-pinned release pipeline**, version-locked to the avibe release (Show-Runtime model); build the full path **stub-first**; targets `macos-arm64` + `linux-x64`; macOS signing/notarization is an explicit sub-task. (Rejected: `curl | sh` and any throwaway dev installer.)
-4. **P1 scope → standard-tier CLI core.** In: `avault-core` seal/open (AES-256-GCM + wrapped_dek + AAD), `avault-store` `file+mlock`, `avault-cli` (`seal` via stdin, `deliver run`, `key export/import`), the stub-first delivery pipeline, and the avibe-side wiring (route `vault_crypto.py`'s standard value path through avault; `vault_secrets` stays the metadata source of truth). P1.1 pulls the remaining standard-tier delivery modes (`deliver fetch`, `deliver inject`) forward so Avibe can remove the Python open path all at once. Out → P2: resident agent, scope grants + approval-card UX, signing, the protected tier, hardware/passphrase stores. The standard-create transient-plaintext-in-Python residual stays in P1 (§11.3); the blind box eliminates it in P2.
+3. **Distribution → a real manifest-pinned release pipeline**, version-locked to the avibe release (Show-Runtime model); build the full path **stub-first**; current required targets are `macos-arm64`, `macos-x64`, `linux-x64`, `linux-arm64`, and `windows-x64`, with `windows-arm64` best-effort. macOS signing/notarization is an explicit sub-task. (Rejected: `curl | sh` and any throwaway dev installer.)
+4. **P1 scope → standard-tier CLI core.** In: `avault-core` seal/open (AES-256-GCM + wrapped_dek + AAD), `avault-store` cross-platform file store, `avault-cli` (`seal` via stdin, `deliver run`, `key export/import`), the stub-first delivery pipeline, and the avibe-side wiring (route `vault_crypto.py`'s standard value path through avault; `vault_secrets` stays the metadata source of truth). P1.1 pulls the remaining standard-tier delivery modes (`deliver fetch`, `deliver inject`) forward so Avibe can remove the Python open path all at once. Out → P2: resident agent, scope grants + approval-card UX, signing, the protected tier, hardware/passphrase stores. The standard-create transient-plaintext-in-Python residual stays in P1 (§11.3); the blind box eliminates it in P2.
 5. **Protected-tier pubkey trust → deferred to P2** (the protected tier itself is P2). Lean **attest** (sign the ephemeral X25519 pubkey with an identity key the browser already trusts) — it pairs with the ephemeral-keypair choice and defeats first-use MITM; interim **pin** (TOFU) is acceptable. Not on the P1 path.
 6. **Transport safety → CLI is the conservative default (P1); the resident agent (P2) is a deliberate, hardened tradeoff.** CLI has no listening surface and a tiny key-in-memory window. The agent (for grant-cache + signing only) is more exposed → idle-timeout zeroize, cache DEKs not the master 24/7, `mlock` + no-coredump, peer-cred auth. See §12.
 7. **Master-key store on no-hardware hosts → add `file + passphrase`** (passphrase-wrapped master, unlock once at startup; plaintext never on disk). The cloud/no-TPM sweet spot; defends at-rest, not the running machine; P2, pairs with the agent or the Linux kernel keyring. See §13.
@@ -425,7 +425,7 @@ This is an internal store selection inside `avault`, not an Avibe-level plugin l
 
 **Don't inherit (the ≈3.6k-LOC macOS shell):** the Keychain-only store, the SSH-agent user surface, FIDO2 enrollment, TOTP, the remote-sudo PAM path, the `VT_AUTH` shared-token channel, and the legacy `vt://mac` format.
 
-**Build fresh for us:** cross-platform store (`file+mlock` → keychain/SE/TPM/KMS), per-record standard/protected policy, `SO_PEERCRED` daemon authorization, scope-typed grants fed by UI/IM approval, the `name+scheme+version` AAD aligned to our columns, a secp256k1 signer, and the browser-sign path for protected ETH keys.
+**Build fresh for us:** cross-platform store (file-store floor → keychain/SE/TPM/KMS), per-record standard/protected policy, `SO_PEERCRED` daemon authorization, scope-typed grants fed by UI/IM approval, the `name+scheme+version` AAD aligned to our columns, a secp256k1 signer, and the browser-sign path for protected ETH keys.
 
 Net: `vt` proves the model and donates the crypto shapes; `avault` is the clean, cross-platform, agent-shaped custody core those shapes belong in.
 
@@ -520,7 +520,10 @@ before the secret is opened. Header credentials trim one trailing CR or LF, then
 reject remaining HTTP control bytes before ureq receives a header copy. Output is
 JSON: `{"status":200,"headers":{...},"body":"..."}`. Fetch uses bounded connect,
 read, write, and overall timeouts; transport errors are sanitized so injected
-credentials cannot appear in stderr, and the response body is capped.
+credentials cannot appear in stderr, and the response body is capped. Before
+returning the body, avault performs a best-effort verbatim byte redaction of the
+credential. This only covers direct substring echoes; encoded/transformed echoes
+are intentionally left to the `allowed_hosts` policy boundary.
 
 `deliver inject` accepts a target file, a format, and a secret array:
 
@@ -539,8 +542,9 @@ credentials cannot appear in stderr, and the response body is capped.
 ```
 
 `key` names the rendered entry, and `env` is accepted as an alias. P1.1 implements
-`dotenv` and `json`; `yaml` and `toml` remain deferred. Files are written atomically
-through a 0600 temporary file, fsync, rename, and parent-directory fsync.
+`dotenv` and `json`; `yaml` and `toml` remain deferred. Files are written
+atomically through an owner-only temporary file, fsync, rename, and
+parent-directory fsync. Unix uses 0600; Windows uses a protected owner-only DACL.
 
 ### Transport
 
@@ -555,13 +559,13 @@ Two modes, the same integration touchpoints as `askill`. **Both channels carry o
 - **Master-key store on Linux (strongest available wins):**
   - **TPM 2.0** (present on most Linux hosts) — seal the master key to the TPM; the wrapping key never leaves the chip, optionally bound to PCRs/policy. This is the Linux analog of Keychain/Secure Enclave.
   - **systemd-creds / kernel keyring** — unseal at service start (via TPM or a host key) into non-swappable kernel memory; good for headless services.
-  - **`file (0600) + mlock`** (the no-hardware floor) — owned by the service user, kept out of swap and coredumps.
-- **Honest floor:** with no hardware root and no operator factor, the master key's at-rest protection reduces to the **OS user account** (the fundamental law again). `file+mlock` is plaintext-at-rest: it resists other users / remote / a stolen disk (with full-disk encryption), but not an attacker already running as your uid. Optional hardening: wrap the master key under a **boot-time passphrase KEK** or a **cloud KMS KEK** (stronger at rest, at the cost of headless start or a network + bootstrap credential). And note: the **protected tier stores nothing decryptable on the box at all** — for high-value secrets, that side-steps the Linux at-rest question entirely.
+  - **`file (0600) + mlock` / Windows protected DACL + `VirtualLock`** (the no-hardware floor) — owned by the service user, kept out of swap and coredumps where the OS allows it.
+- **Honest floor:** with no hardware root and no operator factor, the master key's at-rest protection reduces to the **OS user account** (the fundamental law again). The file store is plaintext-at-rest: it resists other users / remote / a stolen disk (with full-disk encryption), but not an attacker already running as your uid. Optional hardening: wrap the master key under a **boot-time passphrase KEK** or a **cloud KMS KEK** (stronger at rest, at the cost of headless start or a network + bootstrap credential). And note: the **protected tier stores nothing decryptable on the box at all** — for high-value secrets, that side-steps the Linux at-rest question entirely.
 
 ### Authentication — who may call avault
 
 - **Other users / remote: refused.** The socket is `0600`, owned by the service user; `avault` checks the kernel-supplied peer **uid** (`SO_PEERCRED`/`LOCAL_PEERCRED`, unforgeable) and accepts only its own uid. There is no network listener. The P1 CLI is `fork`/`exec`-ed directly by the daemon, so there is no "someone else connects" surface at all.
-- **Another program running as the *same* user: can call avault — by design.** The standard tier's boundary *is* the OS account: an attacker already running as your uid can read the `file+mlock` master key, `ptrace` the daemon, etc. — so refusing same-uid callers would be security theater.
+- **Another program running as the *same* user: can call avault — by design.** The standard tier's boundary *is* the OS account: an attacker already running as your uid can read the file-store master key, `ptrace` the daemon, etc. — so refusing same-uid callers would be security theater.
 - **Why same-uid is still acceptable — three backstops + one root answer:**
   1. **Narrow interface** — even a same-uid caller can only `deliver`/`sign` (results); there is no `decrypt → plaintext`.
   2. **Full audit** — every call is recorded.

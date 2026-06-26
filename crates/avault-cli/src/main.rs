@@ -10,12 +10,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsString;
-use std::fs::{self, File};
+use std::fs;
 use std::io::{self, Read, Write};
-use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
 use std::time::Duration;
 use url::{Host, Url};
@@ -338,6 +337,11 @@ fn deliver_fetch_cmd(args: &[OsString]) -> anyhow::Result<u8> {
             target_url = build_secret_query_url(&fetch.request.url, name, secret_text)?;
         }
     }
+    let redaction_needle = if secret.is_empty() {
+        None
+    } else {
+        Some(Zeroizing::new(secret.as_slice().to_vec()))
+    };
     secret.zeroize();
     drop(secret);
 
@@ -348,8 +352,10 @@ fn deliver_fetch_cmd(args: &[OsString]) -> anyhow::Result<u8> {
         secret_header,
         fetch.request.body,
         is_loopback,
+        redaction_needle.as_deref().map(Vec::as_slice),
     )
     .context("fetch request failed")?;
+    drop(redaction_needle);
     let exit_code = if (200..=299).contains(&output.status) {
         0
     } else {
@@ -367,6 +373,7 @@ fn perform_fetch(
     mut secret_header: Option<(String, Zeroizing<String>)>,
     body: Option<String>,
     is_loopback: bool,
+    redaction_needle: Option<&[u8]>,
 ) -> anyhow::Result<FetchOutput> {
     let method = method.to_ascii_uppercase();
     let connect_timeout = Duration::from_secs(FETCH_CONNECT_TIMEOUT_SECS);
@@ -413,7 +420,7 @@ fn perform_fetch(
             response_headers.insert(name, value.to_string());
         }
     }
-    let body = read_capped_fetch_body(response)?;
+    let body = read_capped_fetch_body(response, redaction_needle)?;
     Ok(FetchOutput {
         status,
         headers: response_headers,
@@ -421,7 +428,10 @@ fn perform_fetch(
     })
 }
 
-fn read_capped_fetch_body(response: ureq::Response) -> anyhow::Result<String> {
+fn read_capped_fetch_body(
+    response: ureq::Response,
+    redaction_needle: Option<&[u8]>,
+) -> anyhow::Result<String> {
     let mut reader = response
         .into_reader()
         .take((MAX_FETCH_BODY_BYTES as u64) + 1);
@@ -432,7 +442,38 @@ fn read_capped_fetch_body(response: ureq::Response) -> anyhow::Result<String> {
     if body.len() > MAX_FETCH_BODY_BYTES {
         bail!("fetch response body exceeds size limit");
     }
+    if let Some(needle) = redaction_needle {
+        redact_verbatim_bytes(&mut body, needle);
+    }
     String::from_utf8(body).map_err(|_| anyhow!("fetch response body is not valid UTF-8"))
+}
+
+fn redact_verbatim_bytes(body: &mut Vec<u8>, needle: &[u8]) {
+    const REDACTION: &[u8] = b"[avault-redacted]";
+    if needle.is_empty() {
+        return;
+    }
+    let mut index = 0;
+    let mut redacted = Zeroizing::new(Vec::with_capacity(body.len()));
+    while let Some(relative) = find_subslice(&body[index..], needle) {
+        let found = index + relative;
+        redacted.extend_from_slice(&body[index..found]);
+        redacted.extend_from_slice(REDACTION);
+        index = found + needle.len();
+    }
+    if index == 0 {
+        return;
+    }
+    redacted.extend_from_slice(&body[index..]);
+    body.zeroize();
+    body.clear();
+    body.extend_from_slice(&redacted);
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
 
 fn deliver_inject_cmd(args: &[OsString]) -> anyhow::Result<u8> {
@@ -456,7 +497,8 @@ fn deliver_inject_cmd(args: &[OsString]) -> anyhow::Result<u8> {
     opened.zeroize();
     drop(opened);
 
-    atomic_write_0600(&inject.path, rendered.as_slice()).context("failed to write inject file")?;
+    avault_store::atomic_write_secret_file(&inject.path, rendered.as_slice())
+        .context("failed to write inject file")?;
     rendered.zeroize();
     println!(r#"{{"ok":true}}"#);
     Ok(0)
@@ -498,7 +540,11 @@ fn render_inject_file(
 }
 
 fn render_dotenv(secrets: &[OpenedSecret]) -> anyhow::Result<Zeroizing<Vec<u8>>> {
-    let mut out = Zeroizing::new(Vec::new());
+    let capacity = secrets
+        .iter()
+        .map(|secret| secret.name.len() + secret.plaintext.len() + 8)
+        .sum();
+    let mut out = Zeroizing::new(Vec::with_capacity(capacity));
     for secret in secrets {
         let value = secret_utf8(secret.plaintext.as_slice(), "dotenv value")?;
         write!(out, "{}=", secret.name).context("failed to render dotenv")?;
@@ -509,7 +555,11 @@ fn render_dotenv(secrets: &[OpenedSecret]) -> anyhow::Result<Zeroizing<Vec<u8>>>
 }
 
 fn render_json(secrets: &[OpenedSecret]) -> anyhow::Result<Zeroizing<Vec<u8>>> {
-    let mut out = Zeroizing::new(Vec::new());
+    let capacity = 4 + secrets
+        .iter()
+        .map(|secret| secret.name.len() + secret.plaintext.len() + 12)
+        .sum::<usize>();
+    let mut out = Zeroizing::new(Vec::with_capacity(capacity));
     out.extend_from_slice(b"{\n");
     for (index, secret) in secrets.iter().enumerate() {
         let value = secret_utf8(secret.plaintext.as_slice(), "json value")?;
@@ -525,40 +575,6 @@ fn render_json(secrets: &[OpenedSecret]) -> anyhow::Result<Zeroizing<Vec<u8>>> {
     out.push(b'}');
     out.push(b'\n');
     Ok(out)
-}
-
-fn atomic_write_0600(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    let parent = writable_parent(path);
-    fs::create_dir_all(parent).context("failed to create inject output directory")?;
-    let mut tmp = tempfile::Builder::new()
-        .prefix(".avault-inject.")
-        .suffix(".tmp")
-        .tempfile_in(parent)
-        .context("failed to create temporary inject file")?;
-    tmp.as_file_mut()
-        .set_permissions(fs::Permissions::from_mode(0o600))
-        .context("failed to set temporary inject file mode")?;
-    tmp.as_file_mut()
-        .write_all(bytes)
-        .context("failed to write temporary inject file")?;
-    tmp.as_file_mut()
-        .sync_all()
-        .context("failed to sync temporary inject file")?;
-    tmp.persist(path)
-        .map_err(|err| err.error)
-        .context("failed to install inject file")?;
-    File::open(parent)
-        .context("failed to open inject output directory")?
-        .sync_all()
-        .context("failed to sync inject output directory")?;
-    Ok(())
-}
-
-fn writable_parent(path: &Path) -> &Path {
-    match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    }
 }
 
 fn validate_shell_name(name: &str, label: &str) -> anyhow::Result<()> {
@@ -588,6 +604,9 @@ fn fetch_header_credential<'a>(bytes: &'a [u8], label: &str) -> anyhow::Result<&
         Some(b'\r') | Some(b'\n') => &bytes[..bytes.len() - 1],
         _ => bytes,
     };
+    if !trimmed.is_ascii() {
+        bail!("{label} contains non-ASCII byte");
+    }
     if trimmed.iter().any(|byte| is_http_control_byte(*byte)) {
         bail!("{label} contains invalid HTTP header byte");
     }
@@ -621,7 +640,7 @@ fn build_secret_query_url(url: &str, name: &str, value: &str) -> anyhow::Result<
     let (base, fragment) = url.split_at(fragment_start);
     let separator = if base.contains('?') { '&' } else { '?' };
     let mut out = Zeroizing::new(String::with_capacity(
-        url.len() + 1 + name.len() + 1 + value.len(),
+        base.len() + 1 + encoded_query_len(name) + 1 + encoded_query_len(value) + fragment.len(),
     ));
     out.push_str(base);
     out.push(separator);
@@ -647,6 +666,17 @@ fn push_query_encoded(out: &mut String, value: &str) {
             }
         }
     }
+}
+
+fn encoded_query_len(value: &str) -> usize {
+    value
+        .as_bytes()
+        .iter()
+        .map(|byte| match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b' ' => 1,
+            _ => 3,
+        })
+        .sum()
 }
 
 fn validate_fetch_method(method: &str) -> anyhow::Result<()> {
@@ -748,15 +778,38 @@ fn reject_header_conflict(
 }
 
 fn validate_header_name(name: &str) -> anyhow::Result<()> {
-    if name.trim().is_empty()
-        || name.contains('\r')
-        || name.contains('\n')
-        || name.contains(':')
-        || name.eq_ignore_ascii_case("host")
+    if name.eq_ignore_ascii_case("host")
+        || name
+            .as_bytes()
+            .iter()
+            .any(|byte| !is_header_token_byte(*byte))
     {
         bail!("invalid fetch header name");
     }
     Ok(())
+}
+
+fn is_header_token_byte(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'!' | b'#'
+            | b'$'
+            | b'%'
+            | b'&'
+            | b'\''
+            | b'*'
+            | b'+'
+            | b'-'
+            | b'.'
+            | b'^'
+            | b'_'
+            | b'`'
+            | b'|'
+            | b'~'
+            | b'0'..=b'9'
+            | b'A'..=b'Z'
+            | b'a'..=b'z'
+    )
 }
 
 fn validate_query_name(name: &str) -> anyhow::Result<()> {

@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use serde_json::json;
 use std::fs;
 use std::io::{Read, Write};
@@ -27,6 +29,7 @@ fn seal_secret(home: &std::path::Path, name: &str, value: &[u8]) -> serde_json::
 }
 
 fn write_p0_master(home: &std::path::Path) {
+    fs::create_dir_all(home).unwrap();
     fs::set_permissions(home, fs::Permissions::from_mode(0o700)).unwrap();
     fs::write(
         home.join("machine.key"),
@@ -61,7 +64,7 @@ fn seal_and_deliver_run_roundtrip() {
         .arg("seal")
         .arg("--name")
         .arg("OPENAI_API_KEY")
-        .env("AVAULT_HOME", home.path())
+        .env("AVAULT_HOME", home.path().join("vault"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -69,8 +72,8 @@ fn seal_and_deliver_run_roundtrip() {
     seal.stdin.as_mut().unwrap().write_all(b"s3cr3t").unwrap();
     let seal_output = seal.wait_with_output().unwrap();
     assert!(seal_output.status.success());
-    assert!(home.path().join("machine.key").exists());
-    assert!(!home.path().join("master.key").exists());
+    assert!(home.path().join("vault").join("machine.key").exists());
+    assert!(!home.path().join("vault").join("master.key").exists());
     let sealed: serde_json::Value = serde_json::from_slice(&seal_output.stdout).unwrap();
     assert!(!sealed["ciphertext"].as_str().unwrap().is_empty());
     assert!(!sealed["nonce"].as_str().unwrap().is_empty());
@@ -90,7 +93,7 @@ fn seal_and_deliver_run_roundtrip() {
         .arg("/bin/sh")
         .arg("-c")
         .arg(r#"test "$SECRET_VALUE" = "s3cr3t" && printf ok"#)
-        .env("AVAULT_HOME", home.path())
+        .env("AVAULT_HOME", home.path().join("vault"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -114,7 +117,7 @@ fn deliver_run_returns_child_exit_code() {
         .arg("seal")
         .arg("--name")
         .arg("OPENAI_API_KEY")
-        .env("AVAULT_HOME", home.path())
+        .env("AVAULT_HOME", home.path().join("vault"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -134,7 +137,7 @@ fn deliver_run_returns_child_exit_code() {
         .arg("/bin/sh")
         .arg("-c")
         .arg("exit 7")
-        .env("AVAULT_HOME", home.path())
+        .env("AVAULT_HOME", home.path().join("vault"))
         .stdin(Stdio::piped())
         .spawn()
         .unwrap();
@@ -151,8 +154,16 @@ fn deliver_run_returns_child_exit_code() {
 #[test]
 fn deliver_run_accepts_multiple_secrets_for_one_child() {
     let home = tempfile::tempdir().unwrap();
-    let first = seal_secret(home.path(), "FIRST_SECRET", b"alpha");
-    let second = seal_secret(home.path(), "SECOND_SECRET", b"beta");
+    let first = seal_secret(
+        home.path().join("vault").as_path(),
+        "FIRST_SECRET",
+        b"alpha",
+    );
+    let second = seal_secret(
+        home.path().join("vault").as_path(),
+        "SECOND_SECRET",
+        b"beta",
+    );
     let request = json!([
         {"name": "FIRST_SECRET", "env": "FIRST_ENV", "envelope": first},
         {"name": "SECOND_SECRET", "env": "SECOND_ENV", "envelope": second}
@@ -165,7 +176,7 @@ fn deliver_run_accepts_multiple_secrets_for_one_child() {
         .arg("/bin/sh")
         .arg("-c")
         .arg(r#"test "$FIRST_ENV" = alpha && test "$SECOND_ENV" = beta && printf ok"#)
-        .env("AVAULT_HOME", home.path())
+        .env("AVAULT_HOME", home.path().join("vault"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -185,7 +196,11 @@ fn deliver_run_accepts_multiple_secrets_for_one_child() {
 #[test]
 fn deliver_run_preserves_signal_exit_code() {
     let home = tempfile::tempdir().unwrap();
-    let sealed = seal_secret(home.path(), "OPENAI_API_KEY", b"s3cr3t");
+    let sealed = seal_secret(
+        home.path().join("vault").as_path(),
+        "OPENAI_API_KEY",
+        b"s3cr3t",
+    );
     let request = json!([
         {"name": "OPENAI_API_KEY", "env": "SECRET_VALUE", "envelope": sealed}
     ]);
@@ -197,7 +212,7 @@ fn deliver_run_preserves_signal_exit_code() {
         .arg("/bin/sh")
         .arg("-c")
         .arg("kill -TERM $$")
-        .env("AVAULT_HOME", home.path())
+        .env("AVAULT_HOME", home.path().join("vault"))
         .stdin(Stdio::piped())
         .spawn()
         .unwrap();
@@ -222,7 +237,7 @@ fn envelope_file_preserves_child_stdin() {
         .arg("seal")
         .arg("--name")
         .arg("OPENAI_API_KEY")
-        .env("AVAULT_HOME", home.path())
+        .env("AVAULT_HOME", home.path().join("vault"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -245,7 +260,7 @@ fn envelope_file_preserves_child_stdin() {
         .arg("/bin/sh")
         .arg("-c")
         .arg(r#"read line; test "$SECRET_VALUE" = "s3cr3t" && printf "$line""#)
-        .env("AVAULT_HOME", home.path())
+        .env("AVAULT_HOME", home.path().join("vault"))
         .stdin(fs::File::open(&input_file).unwrap())
         .stdout(Stdio::piped())
         .output()
@@ -262,7 +277,7 @@ fn child_exit_2_is_distinct_from_avault_internal_failure() {
         .arg("seal")
         .arg("--name")
         .arg("OPENAI_API_KEY")
-        .env("AVAULT_HOME", home.path())
+        .env("AVAULT_HOME", home.path().join("vault"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -282,7 +297,7 @@ fn child_exit_2_is_distinct_from_avault_internal_failure() {
         .arg("/bin/sh")
         .arg("-c")
         .arg("exit 2")
-        .env("AVAULT_HOME", home.path())
+        .env("AVAULT_HOME", home.path().join("vault"))
         .stdin(Stdio::piped())
         .spawn()
         .unwrap();
@@ -305,7 +320,7 @@ fn child_exit_2_is_distinct_from_avault_internal_failure() {
         .arg("/bin/sh")
         .arg("-c")
         .arg("exit 0")
-        .env("AVAULT_HOME", home.path())
+        .env("AVAULT_HOME", home.path().join("vault"))
         .stdin(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -327,7 +342,7 @@ fn deliver_run_rejects_name_mismatch() {
         .arg("seal")
         .arg("--name")
         .arg("OPENAI_API_KEY")
-        .env("AVAULT_HOME", home.path())
+        .env("AVAULT_HOME", home.path().join("vault"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -347,7 +362,7 @@ fn deliver_run_rejects_name_mismatch() {
         .arg("/bin/sh")
         .arg("-c")
         .arg("exit 0")
-        .env("AVAULT_HOME", home.path())
+        .env("AVAULT_HOME", home.path().join("vault"))
         .stdin(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -366,7 +381,11 @@ fn deliver_run_rejects_name_mismatch() {
 #[test]
 fn deliver_fetch_injects_bearer_to_loopback_and_returns_response_json() {
     let home = tempfile::tempdir().unwrap();
-    let sealed = seal_secret(home.path(), "API_TOKEN", b"token-123\n");
+    let sealed = seal_secret(
+        home.path().join("vault").as_path(),
+        "API_TOKEN",
+        b"token-123\n",
+    );
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
@@ -396,7 +415,7 @@ fn deliver_fetch_injects_bearer_to_loopback_and_returns_response_json() {
     let mut fetch = avault()
         .arg("deliver")
         .arg("fetch")
-        .env("AVAULT_HOME", home.path())
+        .env("AVAULT_HOME", home.path().join("vault"))
         .env("HTTP_PROXY", "http://127.0.0.1:9")
         .env("HTTPS_PROXY", "http://127.0.0.1:9")
         .env("ALL_PROXY", "http://127.0.0.1:9")
@@ -419,6 +438,64 @@ fn deliver_fetch_injects_bearer_to_loopback_and_returns_response_json() {
 }
 
 #[test]
+fn deliver_fetch_redacts_verbatim_echoed_credential() {
+    let home = tempfile::tempdir().unwrap();
+    let sealed = seal_secret(
+        home.path().join("vault").as_path(),
+        "API_TOKEN",
+        b"token-echo",
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = stream.read(&mut buf).unwrap();
+        let body = b"prefix token-echo suffix token-echo";
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        stream.write_all(body).unwrap();
+    });
+    let request = json!({
+        "name": "API_TOKEN",
+        "envelope": sealed,
+        "request": {
+            "method": "GET",
+            "url": format!("http://127.0.0.1:{}/resource", addr.port()),
+            "allowed_hosts": ["127.0.0.1"],
+            "inject": {"type": "bearer"}
+        }
+    });
+
+    let mut fetch = avault()
+        .arg("deliver")
+        .arg("fetch")
+        .env("AVAULT_HOME", home.path().join("vault"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    fetch
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let output = fetch.wait_with_output().unwrap();
+    server.join().unwrap();
+    assert!(output.status.success());
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        response["body"],
+        "prefix [avault-redacted] suffix [avault-redacted]"
+    );
+}
+
+#[test]
 fn deliver_fetch_rejects_plaintext_non_loopback_before_opening() {
     let home = tempfile::tempdir().unwrap();
     let request = json!({
@@ -438,7 +515,7 @@ fn deliver_fetch_rejects_plaintext_non_loopback_before_opening() {
     let mut fetch = avault()
         .arg("deliver")
         .arg("fetch")
-        .env("AVAULT_HOME", home.path())
+        .env("AVAULT_HOME", home.path().join("vault"))
         .stdin(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -473,7 +550,7 @@ fn deliver_fetch_requires_allowed_hosts_before_opening() {
     let mut fetch = avault()
         .arg("deliver")
         .arg("fetch")
-        .env("AVAULT_HOME", home.path())
+        .env("AVAULT_HOME", home.path().join("vault"))
         .stdin(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -511,7 +588,7 @@ fn deliver_fetch_rejects_unapproved_host_before_opening() {
     let mut fetch = avault()
         .arg("deliver")
         .arg("fetch")
-        .env("AVAULT_HOME", home.path())
+        .env("AVAULT_HOME", home.path().join("vault"))
         .stdin(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -551,7 +628,7 @@ fn deliver_fetch_rejects_injected_header_conflict_before_opening() {
     let mut fetch = avault()
         .arg("deliver")
         .arg("fetch")
-        .env("AVAULT_HOME", home.path())
+        .env("AVAULT_HOME", home.path().join("vault"))
         .stdin(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -566,6 +643,45 @@ fn deliver_fetch_rejects_injected_header_conflict_before_opening() {
     assert_eq!(output.status.code(), Some(70));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("already contains injected header"));
+    assert!(!stderr.contains("open failed"));
+}
+
+#[test]
+fn deliver_fetch_rejects_invalid_injected_header_name_before_opening() {
+    let home = tempfile::tempdir().unwrap();
+    let request = json!({
+        "name": "API_TOKEN",
+        "envelope": {
+            "ciphertext": "not-base64",
+            "nonce": "not-base64",
+            "wrap_meta": "{}"
+        },
+        "request": {
+            "method": "GET",
+            "url": "https://api.example.com/resource",
+            "allowed_hosts": ["api.example.com"],
+            "inject": {"type": "header", "name": "X Api Key"}
+        }
+    });
+
+    let mut fetch = avault()
+        .arg("deliver")
+        .arg("fetch")
+        .env("AVAULT_HOME", home.path().join("vault"))
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    fetch
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let output = fetch.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(70));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("invalid fetch header name"));
     assert!(!stderr.contains("open failed"));
 }
 
@@ -590,7 +706,7 @@ fn deliver_fetch_rejects_injected_query_conflict_before_opening() {
     let mut fetch = avault()
         .arg("deliver")
         .arg("fetch")
-        .env("AVAULT_HOME", home.path())
+        .env("AVAULT_HOME", home.path().join("vault"))
         .stdin(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -611,7 +727,11 @@ fn deliver_fetch_rejects_injected_query_conflict_before_opening() {
 #[test]
 fn deliver_fetch_rejects_invalid_header_credential_before_request() {
     let home = tempfile::tempdir().unwrap();
-    let sealed = seal_secret(home.path(), "API_TOKEN", b"token\tbad");
+    let sealed = seal_secret(
+        home.path().join("vault").as_path(),
+        "API_TOKEN",
+        b"token\tbad",
+    );
     let request = json!({
         "name": "API_TOKEN",
         "envelope": sealed,
@@ -626,7 +746,7 @@ fn deliver_fetch_rejects_invalid_header_credential_before_request() {
     let mut fetch = avault()
         .arg("deliver")
         .arg("fetch")
-        .env("AVAULT_HOME", home.path())
+        .env("AVAULT_HOME", home.path().join("vault"))
         .stdin(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -646,9 +766,54 @@ fn deliver_fetch_rejects_invalid_header_credential_before_request() {
 }
 
 #[test]
+fn deliver_fetch_rejects_non_ascii_header_credential_before_request() {
+    let home = tempfile::tempdir().unwrap();
+    let sealed = seal_secret(
+        home.path().join("vault").as_path(),
+        "API_TOKEN",
+        "tokén".as_bytes(),
+    );
+    let request = json!({
+        "name": "API_TOKEN",
+        "envelope": sealed,
+        "request": {
+            "method": "GET",
+            "url": "http://127.0.0.1:9/resource",
+            "allowed_hosts": ["127.0.0.1"],
+            "inject": {"type": "header", "name": "X-Api-Key"}
+        }
+    });
+
+    let mut fetch = avault()
+        .arg("deliver")
+        .arg("fetch")
+        .env("AVAULT_HOME", home.path().join("vault"))
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    fetch
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let output = fetch.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(70));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("non-ASCII byte"));
+    assert!(!stderr.contains("HTTP transport failed"));
+    assert!(!stderr.contains("tok"));
+}
+
+#[test]
 fn deliver_fetch_sanitizes_transport_errors_after_query_injection() {
     let home = tempfile::tempdir().unwrap();
-    let sealed = seal_secret(home.path(), "API_TOKEN", b"token-123");
+    let sealed = seal_secret(
+        home.path().join("vault").as_path(),
+        "API_TOKEN",
+        b"token-123",
+    );
     let port = {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.local_addr().unwrap().port()
@@ -667,7 +832,7 @@ fn deliver_fetch_sanitizes_transport_errors_after_query_injection() {
     let mut fetch = avault()
         .arg("deliver")
         .arg("fetch")
-        .env("AVAULT_HOME", home.path())
+        .env("AVAULT_HOME", home.path().join("vault"))
         .stdin(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -691,7 +856,11 @@ fn deliver_fetch_sanitizes_transport_errors_after_query_injection() {
 #[test]
 fn deliver_fetch_rejects_oversized_response_body() {
     let home = tempfile::tempdir().unwrap();
-    let sealed = seal_secret(home.path(), "API_TOKEN", b"token-123");
+    let sealed = seal_secret(
+        home.path().join("vault").as_path(),
+        "API_TOKEN",
+        b"token-123",
+    );
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
@@ -719,7 +888,7 @@ fn deliver_fetch_rejects_oversized_response_body() {
     let mut fetch = avault()
         .arg("deliver")
         .arg("fetch")
-        .env("AVAULT_HOME", home.path())
+        .env("AVAULT_HOME", home.path().join("vault"))
         .stdin(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -741,10 +910,11 @@ fn deliver_fetch_rejects_oversized_response_body() {
 #[test]
 fn deliver_inject_writes_dotenv_and_json_as_0600() {
     let home = tempfile::tempdir().unwrap();
-    let alpha = seal_secret(home.path(), "A_KEY", b"alpha-1");
-    let beta = seal_secret(home.path(), "B_KEY", b"beta-2");
-    let dotenv_path = home.path().join("secrets.env");
-    let json_path = home.path().join("secrets.json");
+    let alpha = seal_secret(home.path().join("vault").as_path(), "A_KEY", b"alpha-1");
+    let beta = seal_secret(home.path().join("vault").as_path(), "B_KEY", b"beta-2");
+    let inject_dir = home.path().join("inject");
+    let dotenv_path = inject_dir.join("secrets.env");
+    let json_path = inject_dir.join("secrets.json");
 
     let dotenv = json!({
         "path": dotenv_path,
@@ -757,7 +927,7 @@ fn deliver_inject_writes_dotenv_and_json_as_0600() {
     let mut inject = avault()
         .arg("deliver")
         .arg("inject")
-        .env("AVAULT_HOME", home.path())
+        .env("AVAULT_HOME", home.path().join("vault"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -791,7 +961,7 @@ fn deliver_inject_writes_dotenv_and_json_as_0600() {
     let mut inject = avault()
         .arg("deliver")
         .arg("inject")
-        .env("AVAULT_HOME", home.path())
+        .env("AVAULT_HOME", home.path().join("vault"))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .spawn()
@@ -815,7 +985,7 @@ fn deliver_inject_writes_dotenv_and_json_as_0600() {
 #[test]
 fn p0_no_aad_blob_opens_via_new_delivery_paths() {
     let home = tempfile::tempdir().unwrap();
-    write_p0_master(home.path());
+    write_p0_master(home.path().join("vault").as_path());
     let sealed = p0_no_aad_envelope();
 
     let run_request = json!([
@@ -828,7 +998,7 @@ fn p0_no_aad_blob_opens_via_new_delivery_paths() {
         .arg("/bin/sh")
         .arg("-c")
         .arg(r#"test "$SECRET_VALUE" = "p0-python-value""#)
-        .env("AVAULT_HOME", home.path())
+        .env("AVAULT_HOME", home.path().join("vault"))
         .stdin(Stdio::piped())
         .spawn()
         .unwrap();
@@ -839,7 +1009,7 @@ fn p0_no_aad_blob_opens_via_new_delivery_paths() {
         .unwrap();
     assert!(run.wait().unwrap().success());
 
-    let inject_path = home.path().join("p0.env");
+    let inject_path = home.path().join("inject").join("p0.env");
     let inject_request = json!({
         "path": inject_path,
         "format": "dotenv",
@@ -850,7 +1020,7 @@ fn p0_no_aad_blob_opens_via_new_delivery_paths() {
     let mut inject = avault()
         .arg("deliver")
         .arg("inject")
-        .env("AVAULT_HOME", home.path())
+        .env("AVAULT_HOME", home.path().join("vault"))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .spawn()
@@ -891,7 +1061,7 @@ fn p0_no_aad_blob_opens_via_new_delivery_paths() {
     let mut fetch = avault()
         .arg("deliver")
         .arg("fetch")
-        .env("AVAULT_HOME", home.path())
+        .env("AVAULT_HOME", home.path().join("vault"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -918,7 +1088,7 @@ fn key_export_and_import_interoperate_between_stores() {
         .arg("seal")
         .arg("--name")
         .arg("OPENAI_API_KEY")
-        .env("AVAULT_HOME", source_home.path())
+        .env("AVAULT_HOME", source_home.path().join("vault"))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .spawn()
@@ -926,12 +1096,12 @@ fn key_export_and_import_interoperate_between_stores() {
     seal.stdin.as_mut().unwrap().write_all(b"s3cr3t").unwrap();
     assert!(seal.wait().unwrap().success());
 
-    let source_key = fs::read(source_home.path().join("machine.key")).unwrap();
+    let source_key = fs::read(source_home.path().join("vault").join("machine.key")).unwrap();
 
     let mut export = avault()
         .arg("key")
         .arg("export")
-        .env("AVAULT_HOME", source_home.path())
+        .env("AVAULT_HOME", source_home.path().join("vault"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -954,7 +1124,7 @@ fn key_export_and_import_interoperate_between_stores() {
     let mut import = avault()
         .arg("key")
         .arg("import")
-        .env("AVAULT_HOME", target_home.path())
+        .env("AVAULT_HOME", target_home.path().join("vault"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -969,7 +1139,7 @@ fn key_export_and_import_interoperate_between_stores() {
     assert!(import_output.status.success());
     assert_eq!(import_output.stdout, b"{\"ok\":true}\n");
     assert_eq!(
-        fs::read(target_home.path().join("machine.key")).unwrap(),
+        fs::read(target_home.path().join("vault").join("machine.key")).unwrap(),
         source_key
     );
 }
@@ -980,7 +1150,7 @@ fn key_export_requires_existing_master_key() {
     let mut export = avault()
         .arg("key")
         .arg("export")
-        .env("AVAULT_HOME", home.path())
+        .env("AVAULT_HOME", home.path().join("vault"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -994,7 +1164,7 @@ fn key_export_requires_existing_master_key() {
         .unwrap();
     let output = export.wait_with_output().unwrap();
     assert!(!output.status.success());
-    assert!(!home.path().join("machine.key").exists());
+    assert!(!home.path().join("vault").join("machine.key").exists());
 }
 
 #[test]
@@ -1003,7 +1173,7 @@ fn key_import_rejects_malformed_json() {
     let mut import = avault()
         .arg("key")
         .arg("import")
-        .env("AVAULT_HOME", home.path())
+        .env("AVAULT_HOME", home.path().join("vault"))
         .stdin(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -1016,15 +1186,18 @@ fn key_import_rejects_malformed_json() {
         .unwrap();
     let output = import.wait_with_output().unwrap();
     assert_eq!(output.status.code(), Some(70));
-    assert!(!home.path().join("machine.key").exists());
+    assert!(!home.path().join("vault").join("machine.key").exists());
 }
 
 #[test]
 fn refuses_group_or_world_accessible_key_file() {
     let home = tempfile::tempdir().unwrap();
-    fs::write(home.path().join("machine.key"), [1u8; 32]).unwrap();
+    let vault_home = home.path().join("vault");
+    fs::create_dir_all(&vault_home).unwrap();
+    fs::set_permissions(&vault_home, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(vault_home.join("machine.key"), [1u8; 32]).unwrap();
     fs::set_permissions(
-        home.path().join("machine.key"),
+        vault_home.join("machine.key"),
         fs::Permissions::from_mode(0o644),
     )
     .unwrap();
@@ -1032,7 +1205,7 @@ fn refuses_group_or_world_accessible_key_file() {
     let mut export = avault()
         .arg("key")
         .arg("export")
-        .env("AVAULT_HOME", home.path())
+        .env("AVAULT_HOME", &vault_home)
         .stdin(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -1045,7 +1218,7 @@ fn refuses_group_or_world_accessible_key_file() {
         .unwrap();
     let output = export.wait_with_output().unwrap();
     assert_eq!(output.status.code(), Some(70));
-    let mode = fs::metadata(home.path().join("machine.key"))
+    let mode = fs::metadata(vault_home.join("machine.key"))
         .unwrap()
         .permissions()
         .mode()
@@ -1071,7 +1244,7 @@ fn python_aad_reference_opens_rust_envelope_and_rust_opens_python_envelope() {
         .arg("seal")
         .arg("--name")
         .arg("OPENAI_API_KEY")
-        .env("AVAULT_HOME", home.path())
+        .env("AVAULT_HOME", home.path().join("vault"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -1088,7 +1261,7 @@ fn python_aad_reference_opens_rust_envelope_and_rust_opens_python_envelope() {
         .arg("-c")
         .arg(PYTHON_AAD_REFERENCE)
         .arg("open")
-        .arg(home.path().join("machine.key"))
+        .arg(home.path().join("vault").join("machine.key"))
         .arg("OPENAI_API_KEY")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1109,7 +1282,7 @@ fn python_aad_reference_opens_rust_envelope_and_rust_opens_python_envelope() {
         .arg("-c")
         .arg(PYTHON_AAD_REFERENCE)
         .arg("seal")
-        .arg(home.path().join("machine.key"))
+        .arg(home.path().join("vault").join("machine.key"))
         .arg("OPENAI_API_KEY")
         .arg("python-value")
         .stdout(Stdio::piped())
@@ -1128,7 +1301,7 @@ fn python_aad_reference_opens_rust_envelope_and_rust_opens_python_envelope() {
         .arg("/bin/sh")
         .arg("-c")
         .arg(r#"test "$SECRET_VALUE" = "python-value""#)
-        .env("AVAULT_HOME", home.path())
+        .env("AVAULT_HOME", home.path().join("vault"))
         .stdin(Stdio::piped())
         .spawn()
         .unwrap();
