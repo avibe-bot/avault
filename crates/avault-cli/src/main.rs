@@ -477,9 +477,24 @@ fn one_shot_run_operation_hash(
     env_name: &str,
     command_fields: &[Vec<u8>],
 ) -> anyhow::Result<[u8; 32]> {
-    let mut fields = Vec::with_capacity(2 + command_fields.len());
+    let cwd = std::env::current_dir()
+        .context("failed to read current directory for protected approval binding")?;
+    let cwd = cwd
+        .to_str()
+        .context("current directory must be valid UTF-8 for protected approval binding")?;
+    let path = std::env::var_os("PATH")
+        .map(|value| {
+            value
+                .into_string()
+                .map_err(|_| anyhow!("PATH must be valid UTF-8 for protected approval binding"))
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let mut fields = Vec::with_capacity(4 + command_fields.len());
     fields.push(b"deliver-run".as_slice());
     fields.push(env_name.as_bytes());
+    fields.push(cwd.as_bytes());
+    fields.push(path.as_bytes());
     fields.extend(command_fields.iter().map(Vec::as_slice));
     Ok(BlindBoxContext::operation_hash(&fields))
 }
@@ -505,7 +520,7 @@ fn one_shot_fetch_operation_hash(request: &FetchRequest) -> anyhow::Result<[u8; 
         request.method.as_bytes(),
         request.url.as_bytes(),
         hosts.as_bytes(),
-        headers.as_bytes(),
+        headers.as_slice(),
         body.as_bytes(),
         inject.as_bytes(),
     ]))
@@ -519,12 +534,13 @@ fn canonical_fetch_inject(inject: &FetchInject) -> String {
     }
 }
 
-fn canonical_fetch_headers(headers: &BTreeMap<String, String>) -> String {
-    headers
-        .iter()
-        .map(|(name, value)| format!("{name}\0{value}"))
-        .collect::<Vec<_>>()
-        .join("\0")
+fn canonical_fetch_headers(headers: &BTreeMap<String, String>) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (name, value) in headers {
+        push_operation_field(&mut out, name.as_bytes());
+        push_operation_field(&mut out, value.as_bytes());
+    }
+    out
 }
 
 fn canonical_allowed_hosts(hosts: &[String]) -> String {
@@ -533,6 +549,12 @@ fn canonical_allowed_hosts(hosts: &[String]) -> String {
         .map(|host| host.to_ascii_lowercase())
         .collect::<Vec<_>>()
         .join("\0")
+}
+
+fn push_operation_field(out: &mut Vec<u8>, value: &[u8]) {
+    let len = u32::try_from(value.len()).expect("operation field length fits u32");
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(value);
 }
 
 fn one_shot_inject_operation_hash(
@@ -1511,7 +1533,7 @@ fn is_loopback_url(url: &Url) -> bool {
 
 fn validate_header(name: &str, value: &str) -> anyhow::Result<()> {
     validate_header_name(name)?;
-    if value.contains('\r') || value.contains('\n') {
+    if value.bytes().any(|byte| byte < 0x20 || byte == 0x7f) {
         bail!("invalid fetch header value");
     }
     Ok(())
@@ -2278,8 +2300,11 @@ fn run_agent(options: AgentOptions, input: &mut impl Read) -> anyhow::Result<u8>
             state.purge();
             match read_agent_frame(&mut stream, &mut state) {
                 Ok(Some(frame)) => {
-                    state.record_activity();
-                    let response = handle_agent_frame(frame.as_slice(), &keypair, &mut state);
+                    let (response, refresh_activity) =
+                        handle_agent_frame(frame.as_slice(), &keypair, &mut state);
+                    if refresh_activity {
+                        state.record_activity();
+                    }
                     if write_agent_json_frame(&mut stream, &response).is_err() {
                         break;
                     }
@@ -2345,15 +2370,18 @@ fn handle_agent_frame(
     frame: &[u8],
     keypair: &BlindBoxKeypair,
     state: &mut AgentState,
-) -> serde_json::Value {
+) -> (serde_json::Value, bool) {
     match handle_agent_frame_inner(frame, keypair, state) {
-        Ok(value) => value,
-        Err(err) => serde_json::to_value(AgentResponse::<serde_json::Value> {
-            ok: false,
-            result: None,
-            error: Some(err.to_string()),
-        })
-        .expect("agent error response serializes"),
+        Ok(response) => response,
+        Err(err) => (
+            serde_json::to_value(AgentResponse::<serde_json::Value> {
+                ok: false,
+                result: None,
+                error: Some(err.to_string()),
+            })
+            .expect("agent error response serializes"),
+            false,
+        ),
     }
 }
 
@@ -2362,14 +2390,17 @@ fn handle_agent_frame_inner(
     frame: &[u8],
     keypair: &BlindBoxKeypair,
     state: &mut AgentState,
-) -> anyhow::Result<serde_json::Value> {
+) -> anyhow::Result<(serde_json::Value, bool)> {
     let request: AgentRequest =
         serde_json::from_slice(frame).context("agent frame JSON is invalid")?;
     match request {
-        AgentRequest::Pubkey => agent_ok(PubkeyOutput {
-            public_key: keypair.public_key_b64(),
-            fingerprint: keypair.fingerprint_hex(),
-        }),
+        AgentRequest::Pubkey => Ok((
+            agent_ok(PubkeyOutput {
+                public_key: keypair.public_key_b64(),
+                fingerprint: keypair.fingerprint_hex(),
+            })?,
+            false,
+        )),
         AgentRequest::Grant(request) => {
             if request.deks.is_empty() {
                 bail!("grant requires at least one DEK");
@@ -2471,12 +2502,12 @@ fn handle_agent_frame_inner(
                     deks,
                 },
             );
-            agent_ok(AgentGrantOutput { granted, ttl_secs })
+            Ok((agent_ok(AgentGrantOutput { granted, ttl_secs })?, true))
         }
         AgentRequest::Release(request) | AgentRequest::Revoke(request) => {
             let key = grant_key_from_scope(request)?;
             let released = state.grants.remove(&key).is_some();
-            agent_ok(AgentReleaseOutput { released })
+            Ok((agent_ok(AgentReleaseOutput { released })?, true))
         }
         AgentRequest::Deliver(request) => {
             let scope = grant_key_from_parts(request.scope_type, request.scope_ref)?;
@@ -2492,7 +2523,7 @@ fn handle_agent_frame_inner(
                     let command: Vec<OsString> = command.into_iter().map(OsString::from).collect();
                     let opened = open_env_secrets_with_grant(secrets, grant)?;
                     let exit_code = run_agent_child_with_opened_env(&command, opened, true, state)?;
-                    agent_ok(AgentRunOutput { exit_code })
+                    Ok((agent_ok(AgentRunOutput { exit_code })?, true))
                 }
                 AgentDeliverMode::Fetch {
                     name,
@@ -2512,11 +2543,11 @@ fn handle_agent_frame_inner(
                     let output = execute_fetch_request(fetch.request, &mut secret, is_loopback)
                         .context("fetch request failed")?;
                     secret.zeroize();
-                    agent_ok(output)
+                    Ok((agent_ok(output)?, true))
                 }
                 AgentDeliverMode::Inject(inject) => {
                     write_inject_from_opened(inject, open_named_secrets_with_grant, grant)?;
-                    agent_ok(serde_json::json!({ "ok": true }))
+                    Ok((agent_ok(serde_json::json!({ "ok": true }))?, true))
                 }
             }
         }
@@ -2533,7 +2564,7 @@ fn handle_agent_frame_inner(
                 grant,
             )?;
             let output = sign_digest_with_key(scheme, &digest, key_plaintext)?;
-            agent_ok(output)
+            Ok((agent_ok(output)?, true))
         }
     }
 }
@@ -2572,6 +2603,10 @@ fn open_env_secrets_with_grant(
     let mut opened = Vec::with_capacity(secrets.len());
     let mut seen = BTreeSet::new();
     for secret in secrets {
+        reject_agent_one_shot_secret_fields(
+            secret.dek_blindbox.as_ref(),
+            secret.approval.as_ref(),
+        )?;
         validate_shell_name(&secret.env, "env var name")?;
         if !seen.insert(secret.env.clone()) {
             bail!("duplicate env var name");
@@ -2594,6 +2629,10 @@ fn open_named_secrets_with_grant(
     let mut opened = Vec::with_capacity(secrets.len());
     let mut seen = BTreeSet::new();
     for secret in secrets {
+        reject_agent_one_shot_secret_fields(
+            secret.dek_blindbox.as_ref(),
+            secret.approval.as_ref(),
+        )?;
         let target_name = secret
             .key
             .or(secret.env)
@@ -2610,6 +2649,17 @@ fn open_named_secrets_with_grant(
         });
     }
     Ok(opened)
+}
+
+#[cfg(unix)]
+fn reject_agent_one_shot_secret_fields(
+    dek_blindbox: Option<&BlindBox>,
+    approval: Option<&ApprovalContextInput>,
+) -> anyhow::Result<()> {
+    if dek_blindbox.is_some() || approval.is_some() {
+        bail!("agent delivery uses cached grants and rejects one-shot DEK fields");
+    }
+    Ok(())
 }
 
 #[cfg(unix)]

@@ -445,6 +445,14 @@ mod tests {
             {
                 let operation_hash: [u8; KEY_BYTES] =
                     hex::decode(operation_hash_hex).unwrap().try_into().unwrap();
+                if let Some(fields) = case["operation_hash_fields_hex"].as_array() {
+                    let decoded_fields: Vec<Vec<u8>> = fields
+                        .iter()
+                        .map(|field| hex::decode(field.as_str().unwrap()).unwrap())
+                        .collect();
+                    let field_refs: Vec<&[u8]> = decoded_fields.iter().map(Vec::as_slice).collect();
+                    assert_eq!(operation_hash, BlindBoxContext::operation_hash(&field_refs));
+                }
                 if let Some(ttl_secs) = case["ttl_secs"].as_u64() {
                     let ttl_secs = ttl_secs.to_be_bytes();
                     let expected = match purpose {

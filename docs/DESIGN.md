@@ -549,7 +549,7 @@ their approval expiry. Current `purpose` and `operation_hash` values:
 | Operation | `purpose` | Required AAD context | `operation_hash` fields |
 |---|---|---|---|
 | `seal --blind-box` | `seal` | `name` | empty |
-| one-shot protected `deliver run` | `deliver` | `name`, approval | `"deliver-run"`, env var name, each UTF-8 command argv field |
+| one-shot protected `deliver run` | `deliver` | `name`, approval | `"deliver-run"`, env var name, current working directory, `PATH`, each UTF-8 command argv field |
 | one-shot protected `deliver fetch` | `deliver` | `name`, approval | `"deliver-fetch"`, method, url, canonical allowed hosts, canonical headers, body-or-empty, canonical inject |
 | one-shot protected `deliver inject` | `deliver` | `name`, approval | `"deliver-inject"`, rendered key/env name, lowercase format, UTF-8 path |
 | one-shot protected `sign` | `sign` | `name`, `sign_scheme`, `digest`, approval | `"sign"`, scheme, raw 32-byte digest |
@@ -557,10 +557,12 @@ their approval expiry. Current `purpose` and `operation_hash` values:
 | agent signing grant | `agent-sign` | `scope_type`, `scope_ref`, `name`, `sign_scheme`, `digest`, approval, `ttl_secs` | `"agent-sign"`, scheme, raw 32-byte digest, `ttl_secs_u64_be` |
 
 For fetch operation hashes, canonical allowed hosts are lowercased and joined by
-NUL. Canonical headers are sorted by JSON object key and encoded as
-`name NUL value` pairs joined by NUL. Canonical inject is one of `bearer`,
-`header:<name>`, or `query:<name>`. These values and example AAD bytes are pinned
-in `tests/vectors/p2_core_crypto.json`.
+NUL. Canonical headers are sorted by JSON object key and encoded as repeated
+`field(name) || field(value)` pairs, using the same `field` length prefix as the
+outer operation hash. Header values containing HTTP control bytes are rejected
+before hashing. Canonical inject is one of `bearer`, `header:<name>`, or
+`query:<name>`. These values and example AAD bytes are pinned in
+`tests/vectors/p2_core_crypto.json`.
 
 `pubkey` emits:
 

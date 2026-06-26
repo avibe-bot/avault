@@ -240,11 +240,25 @@ fn future_expiry() -> u64 {
 }
 
 fn run_operation_hash(env: &str, command: &[&str]) -> [u8; 32] {
-    let mut fields = Vec::with_capacity(2 + command.len());
+    let cwd = std::env::current_dir().unwrap();
+    let cwd = cwd.to_str().unwrap();
+    let path = std::env::var("PATH").unwrap_or_default();
+    run_operation_hash_with_context(env, command, cwd, &path)
+}
+
+fn run_operation_hash_with_context(env: &str, command: &[&str], cwd: &str, path: &str) -> [u8; 32] {
+    let mut fields = Vec::with_capacity(4 + command.len());
     fields.push(b"deliver-run".as_slice());
     fields.push(env.as_bytes());
+    fields.push(cwd.as_bytes());
+    fields.push(path.as_bytes());
     fields.extend(command.iter().map(|arg| arg.as_bytes()));
     operation_hash(&fields)
+}
+
+fn push_operation_field(out: &mut Vec<u8>, value: &[u8]) {
+    out.extend_from_slice(&(value.len() as u32).to_be_bytes());
+    out.extend_from_slice(value);
 }
 
 fn fetch_operation_hash(request: &serde_json::Value) -> [u8; 32] {
@@ -261,11 +275,12 @@ fn fetch_operation_hash(request: &serde_json::Value) -> [u8; 32] {
     let headers = request["headers"]
         .as_object()
         .map(|headers| {
-            headers
-                .iter()
-                .map(|(name, value)| format!("{name}\0{}", value.as_str().unwrap()))
-                .collect::<Vec<_>>()
-                .join("\0")
+            let mut out = Vec::new();
+            for (name, value) in headers {
+                push_operation_field(&mut out, name.as_bytes());
+                push_operation_field(&mut out, value.as_str().unwrap().as_bytes());
+            }
+            out
         })
         .unwrap_or_default();
     let body = request["body"].as_str().unwrap_or("");
@@ -283,7 +298,7 @@ fn fetch_operation_hash(request: &serde_json::Value) -> [u8; 32] {
         method.as_bytes(),
         url.as_bytes(),
         hosts.as_bytes(),
-        headers.as_bytes(),
+        headers.as_slice(),
         body.as_bytes(),
         inject.as_bytes(),
     ])
@@ -930,6 +945,72 @@ fn protected_deliver_rejects_replayed_blindbox_for_different_command() {
 }
 
 #[test]
+fn protected_deliver_rejects_replayed_blindbox_for_different_cwd() {
+    let home = tempfile::tempdir().unwrap();
+    let approved_cwd = tempfile::tempdir().unwrap();
+    let replay_cwd = tempfile::tempdir().unwrap();
+    write_p0_master(&home.path().join("vault"));
+    let dek = [0x7eu8; 32];
+    let envelope = envelope_encrypted_with_dek("PROTECTED_VALUE", &dek, b"protected-run");
+    let pubkey_output = avault()
+        .arg("pubkey")
+        .env("AVAULT_HOME", home.path().join("vault"))
+        .stdout(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(pubkey_output.status.success());
+    let pubkey: serde_json::Value = serde_json::from_slice(&pubkey_output.stdout).unwrap();
+    let approval_nonce = b"replayed-cwd-0001";
+    let approval_expires_at = future_expiry();
+    let command = ["/bin/sh", "-c", "printf replayed"];
+    let path = std::env::var("PATH").unwrap_or_default();
+    let dek_blindbox = fixed_blind_box(
+        pubkey["public_key"].as_str().unwrap(),
+        &dek,
+        &aad_deliver(
+            "PROTECTED_VALUE",
+            approval_nonce,
+            approval_expires_at,
+            &run_operation_hash_with_context(
+                "SECRET_VALUE",
+                &command,
+                approved_cwd.path().to_str().unwrap(),
+                &path,
+            ),
+        ),
+    );
+    let request = json!([
+        {
+            "name": "PROTECTED_VALUE",
+            "env": "SECRET_VALUE",
+            "envelope": envelope,
+            "dek_blindbox": dek_blindbox,
+            "approval": approval_json(approval_nonce, approval_expires_at)
+        }
+    ]);
+
+    let mut deliver = avault()
+        .arg("deliver")
+        .arg("run")
+        .arg("--")
+        .args(command)
+        .current_dir(replay_cwd.path())
+        .env("AVAULT_HOME", home.path().join("vault"))
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    deliver
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let output = deliver.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(70));
+}
+
+#[test]
 fn agent_grant_deliver_inject_release_roundtrip() {
     let tmp = tempfile::tempdir().unwrap();
     let socket = tmp.path().join("run").join("avault.sock");
@@ -1346,6 +1427,83 @@ fn agent_rejects_grant_ttl_escalation() {
 }
 
 #[test]
+fn agent_deliver_rejects_one_shot_dek_fields() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("run").join("avault.sock");
+    let mut agent = spawn_agent(&socket, 60);
+    let mut stream = connect_agent(&socket);
+    let pubkey = agent_request(&mut stream, json!({"type": "pubkey"}));
+    let public_key = pubkey["result"]["public_key"].as_str().unwrap();
+    let dek = [0x59u8; 32];
+    let approval_nonce = b"agent-mixed-0001";
+    let approval_expires_at = future_expiry();
+    let grant = agent_request(
+        &mut stream,
+        json!({
+            "type": "grant",
+            "scope_type": "session",
+            "scope_ref": "mixed-test",
+            "ttl_secs": 60,
+            "deks": [
+                {
+                    "name": "API_TOKEN",
+                    "dek_blindbox": fixed_blind_box(
+                        public_key,
+                        &dek,
+                        &aad_agent_deliver(
+                            "session",
+                            "mixed-test",
+                            "API_TOKEN",
+                            approval_nonce,
+                            approval_expires_at,
+                            60
+                        )
+                    ),
+                    "approval": approval_json(approval_nonce, approval_expires_at)
+                }
+            ]
+        }),
+    );
+    assert_eq!(grant["ok"], true);
+
+    let envelope = envelope_encrypted_with_dek("API_TOKEN", &dek, b"agent-secret");
+    let one_shot_nonce = b"agent-one-shot01";
+    let rejected = agent_request(
+        &mut stream,
+        json!({
+            "type": "deliver",
+            "scope_type": "session",
+            "scope_ref": "mixed-test",
+            "mode": "run",
+            "command": ["/bin/sh", "-c", "printf should-not-run"],
+            "secrets": [
+                {
+                    "name": "API_TOKEN",
+                    "env": "API_TOKEN",
+                    "envelope": envelope,
+                    "dek_blindbox": fixed_blind_box(
+                        public_key,
+                        &dek,
+                        &aad_deliver(
+                            "API_TOKEN",
+                            one_shot_nonce,
+                            approval_expires_at,
+                            &run_operation_hash("API_TOKEN", &["/bin/sh", "-c", "printf should-not-run"])
+                        )
+                    ),
+                    "approval": approval_json(one_shot_nonce, approval_expires_at)
+                }
+            ]
+        }),
+    );
+    assert_eq!(rejected["ok"], false);
+    assert!(rejected["error"].as_str().unwrap().contains("one-shot"));
+
+    let _ = agent.kill();
+    let _ = agent.wait();
+}
+
+#[test]
 fn agent_signs_with_cached_dek_grant() {
     let tmp = tempfile::tempdir().unwrap();
     let socket = tmp.path().join("run").join("avault.sock");
@@ -1480,6 +1638,72 @@ fn agent_idle_timeout_clears_grants() {
             "scope_ref": "idle-test",
             "mode": "inject",
             "path": tmp.path().join("idle.env"),
+            "format": "dotenv",
+            "secrets": [
+                {"name": "API_TOKEN", "key": "API_TOKEN", "envelope": envelope}
+            ]
+        }),
+    );
+    assert_eq!(denied["ok"], false);
+    assert!(denied["error"].as_str().unwrap().contains("grant"));
+
+    let _ = agent.kill();
+    let _ = agent.wait();
+}
+
+#[test]
+fn agent_pubkey_does_not_refresh_grant_idle_timeout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("run").join("avault.sock");
+    let mut agent = spawn_agent(&socket, 1);
+    let mut stream = connect_agent(&socket);
+    let pubkey = agent_request(&mut stream, json!({"type": "pubkey"}));
+    let public_key = pubkey["result"]["public_key"].as_str().unwrap();
+    let dek = [0x58u8; 32];
+    let approval_nonce = b"agent-idle-pubky";
+    let approval_expires_at = future_expiry();
+    let grant = agent_request(
+        &mut stream,
+        json!({
+            "type": "grant",
+            "scope_type": "session",
+            "scope_ref": "idle-pubkey",
+            "ttl_secs": 60,
+            "deks": [
+                {
+                    "name": "API_TOKEN",
+                    "dek_blindbox": fixed_blind_box(
+                        public_key,
+                        &dek,
+                        &aad_agent_deliver(
+                            "session",
+                            "idle-pubkey",
+                            "API_TOKEN",
+                            approval_nonce,
+                            approval_expires_at,
+                            60
+                        )
+                    ),
+                    "approval": approval_json(approval_nonce, approval_expires_at)
+                }
+            ]
+        }),
+    );
+    assert_eq!(grant["ok"], true);
+    thread::sleep(Duration::from_millis(600));
+    let pubkey_ping = agent_request(&mut stream, json!({"type": "pubkey"}));
+    assert_eq!(pubkey_ping["ok"], true);
+    thread::sleep(Duration::from_millis(700));
+
+    let envelope = envelope_encrypted_with_dek("API_TOKEN", &dek, b"idle-cleared");
+    let denied = agent_request(
+        &mut stream,
+        json!({
+            "type": "deliver",
+            "scope_type": "session",
+            "scope_ref": "idle-pubkey",
+            "mode": "inject",
+            "path": tmp.path().join("idle-pubkey.env"),
             "format": "dotenv",
             "secrets": [
                 {"name": "API_TOKEN", "key": "API_TOKEN", "envelope": envelope}
@@ -2267,6 +2491,46 @@ fn deliver_fetch_rejects_injected_header_conflict_before_opening() {
     assert_eq!(output.status.code(), Some(70));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("already contains injected header"));
+    assert!(!stderr.contains("open failed"));
+}
+
+#[test]
+fn deliver_fetch_rejects_nul_header_value_before_opening() {
+    let home = tempfile::tempdir().unwrap();
+    let request = json!({
+        "name": "API_TOKEN",
+        "envelope": {
+            "ciphertext": "not-base64",
+            "nonce": "not-base64",
+            "wrap_meta": "{}"
+        },
+        "request": {
+            "method": "GET",
+            "url": "https://api.example.com/resource",
+            "allowed_hosts": ["api.example.com"],
+            "headers": {"X-Test": "prefix\u{0000}suffix"},
+            "inject": {"type": "bearer"}
+        }
+    });
+
+    let mut fetch = avault()
+        .arg("deliver")
+        .arg("fetch")
+        .env("AVAULT_HOME", home.path().join("vault"))
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    fetch
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let output = fetch.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(70));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("invalid fetch header value"));
     assert!(!stderr.contains("open failed"));
 }
 
