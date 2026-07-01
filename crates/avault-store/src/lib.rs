@@ -1695,6 +1695,11 @@ fn system_page_size() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(target_os = "macos"))]
+    use std::sync::Mutex;
+
+    #[cfg(not(target_os = "macos"))]
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn nested_store(tmp: &tempfile::TempDir) -> FileStore {
         FileStore::new(tmp.path().join("vault").join("machine.key"))
@@ -1860,8 +1865,11 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn auto_store_uses_file_backend_on_non_macos() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        env::set_var("AVAULT_HOME", tmp.path());
+        let previous_home = env::var_os("AVAULT_HOME");
+        let vault_home = tmp.path().join("vault");
+        env::set_var("AVAULT_HOME", &vault_home);
 
         let key = load_or_create_master_key(Backend::Auto).unwrap();
         let path = default_master_key_path().unwrap();
@@ -1871,7 +1879,10 @@ mod tests {
             key.as_bytes()
         );
 
-        env::remove_var("AVAULT_HOME");
+        match previous_home {
+            Some(home) => env::set_var("AVAULT_HOME", home),
+            None => env::remove_var("AVAULT_HOME"),
+        }
     }
 
     #[test]
