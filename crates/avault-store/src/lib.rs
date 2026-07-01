@@ -1247,6 +1247,13 @@ fn write_tpm_blob(path: &Path, blob: &TpmMasterBlob, force: bool) -> anyhow::Res
 #[cfg(target_os = "linux")]
 fn is_tpm_unavailable(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
+        if cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|err| err.kind() == std::io::ErrorKind::PermissionDenied)
+        {
+            return true;
+        }
+
         let text = cause.to_string();
         text.contains("/dev/tpm")
             || text.contains("/dev/tpmrm")
@@ -1258,6 +1265,10 @@ fn is_tpm_unavailable(err: &anyhow::Error) -> bool {
             || text.contains("No TPM")
             || text.contains("No such device")
             || text.contains("No such file or directory")
+            || text.contains("Permission denied")
+            || text.contains("permission denied")
+            || text.contains("Access denied")
+            || text.contains("access denied")
             || text.contains("Unknown or unusable TCTI")
     })
 }
@@ -2671,6 +2682,18 @@ mod tests {
         assert!(err.to_string().contains("differs from TPM master key"));
 
         restore_env_var("AVAULT_HOME", previous_home);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tpm_permission_denied_is_unavailable_on_linux() {
+        let err = anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "permission denied opening /dev/tpmrm0",
+        ))
+        .context("failed to initialize TPM context");
+
+        assert!(is_tpm_unavailable(&err));
     }
 
     #[cfg(target_os = "linux")]
