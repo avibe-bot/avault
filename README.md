@@ -2,10 +2,11 @@
 
 A small, hardened **Rust key-custody core** for [Avibe](https://github.com/avibe-bot/avibe) Vaults — the one component that ever holds a key or performs cryptography, so the agent (and Python) never do.
 
-> **Status: P2 core.** The standard-tier Rust crypto core, cross-platform file
-> master-key store, opt-in passphrase-wrapped file store, one-shot delivery
-> surface, blind-box create path, secp256k1 signing verbs, and resident grant
-> agent are implemented. Hardware stores remain future work.
+> **Status: P2 core.** The standard-tier Rust crypto core, macOS Keychain
+> master-key store, cross-platform file fallback, opt-in passphrase-wrapped file
+> store, one-shot delivery surface, blind-box create path, secp256k1 signing
+> verbs, and resident grant agent are implemented. Secure Enclave / TPM stores
+> remain future work.
 
 ## Why
 
@@ -20,7 +21,7 @@ avault makes the split real:
 - **Python never holds keys, never decrypts, never keeps reusable secret state.** It relays only ciphertext or **blind boxes** (sealed to avault). avault is the sole opener, and **plaintext only flows in — never back out**.
 - **No `decrypt → plaintext` verb.** A value can only be *delivered* (into a child env / file / HTTP egress) or *signed*; it is never returned to the caller.
 - **Two trust roots, chosen per secret:**
-  - **Standard (machine-rooted):** master key in a hardware keystore (Keychain / Secure Enclave / TPM) or the cross-platform file store. Headless use OK. For API keys.
+  - **Standard (machine-rooted):** master key in macOS Keychain when available, otherwise a hardware keystore / TPM where implemented, or the cross-platform file store fallback. Headless use OK. For API keys.
   - **Protected (human-rooted):** the root (VMK) is wrapped by a passkey/password and only the browser can unlock it; the machine alone cannot decrypt. No headless use. For signing keys & crown jewels.
 - **Rust memory hygiene** Python structurally can't do: `zeroize` on `Drop`, constant-time compare (`subtle`), `mlock` / `VirtualLock` / no-coredump on key pages.
 
@@ -50,15 +51,32 @@ New P1 writes authenticate the value with AAD bytes
 `crates/avault-core/tests/fixtures/p1_aad_vector.json`. Legacy P0 no-AAD rows are
 read-compatible only.
 
-The P1 file store uses `$AVAULT_HOME/machine.key` when `AVAULT_HOME` is set, or
-`$HOME/.avibe/state/vault/machine.key` by default, matching the P0 Python basename.
-On Unix it requires a 0700 parent directory and a 0600 key file. On Windows it
-sets and validates a protected owner-only DACL for the key directory and key file
-(existing broad ACLs are rejected rather than silently rewritten).
+The default standard-tier store is `auto`: macOS prefers a Keychain
+generic-password item (`bot.avibe.avault` / `standard-master-key`), while other
+hosts use the file-store fallback until their hardware store is implemented. When
+upgrading an existing macOS install that already has `machine.key`, `auto` first
+loads that file key and mirrors it into Keychain instead of minting a replacement
+master key. If Keychain is unavailable, `auto` only uses the file fallback when an
+existing file key is already present; it will not mint a second root that could
+diverge from an inaccessible Keychain item. If both stores exist but disagree,
+`auto` refuses to choose silently.
 
-The default store is still the headless `file` store. For stronger at-rest
-protection on no-hardware hosts, select the opt-in passphrase-wrapped store with
-`avault --store file-passphrase ...` or `AVAULT_STORE=file-passphrase`. It stores
+The Keychain item intentionally has no user-presence / biometry access-control
+flag, so it stays suitable for headless standard-tier use after the OS session is
+unlocked. macOS may still ask once to allow a newly installed `avault` binary to
+access its Keychain item; that is the normal Keychain application-access prompt,
+not a per-use Touch ID / passcode policy. Select `--store file` (or
+`AVAULT_STORE=file`) to force the file store.
+
+The file store uses `$AVAULT_HOME/machine.key` when `AVAULT_HOME` is set, or
+`$HOME/.avibe/state/vault/machine.key` by default, matching the P0 Python
+basename. On Unix it requires a 0700 parent directory and a 0600 key file. On
+Windows it sets and validates a protected owner-only DACL for the key directory
+and key file (existing broad ACLs are rejected rather than silently rewritten).
+
+For stronger at-rest protection on no-hardware hosts, select the opt-in
+passphrase-wrapped store with `avault --store file-passphrase ...` or
+`AVAULT_STORE=file-passphrase`. It stores
 `$AVAULT_HOME/machine.passphrase.json` (or the default vault state path) containing
 only a scrypt + AES-GCM wrapped master key. One-shot commands read the store
 unlock passphrase from the first stdin line, then read the command's normal stdin
@@ -193,7 +211,7 @@ Like the `askill` dependency: ensured by `vibe runtime prepare`, resolved on `PA
 ```
 crates/
   avault-core/    pure crypto: AEAD+AAD, DEK wrap, blind-box open, sign — no I/O, zeroized
-  avault-store/   cross-platform master/VMK store: file+mlock, file+passphrase → keychain/SE/TPM/KMS
+  avault-store/   master/VMK store: macOS Keychain, file+mlock, file+passphrase → SE/TPM/KMS
   avault-cli/     the `avault` binary: one-shot CLI + resident agent
 docs/
   DESIGN.md       the full custody-core design (authoritative)

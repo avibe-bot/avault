@@ -23,8 +23,9 @@ A Cargo workspace, three crates, sharp boundaries:
 - `crates/avault-core` — **pure crypto**, no I/O, no platform deps, no logging of secrets.
   Envelope encryption (AES-256-GCM + AAD), per-record DEK wrap, HPKE blind-box open,
   secp256k1 signing; everything zeroized, constant-time where it matters.
-- `crates/avault-store` — the **master/VMK key store**. `file+mlock` baseline; Keychain /
-  Secure Enclave / TPM / KMS backends selected by host capability. The X25519 keypair is
+- `crates/avault-store` — the **master/VMK key store**. macOS Keychain when
+  available, then the `file+mlock` baseline; Secure Enclave / TPM / KMS backends
+  are selected by host capability once implemented. The X25519 keypair is
   ephemeral (in-memory), so only the master key needs durable storage.
 - `crates/avault-cli` — the **`avault` binary**: one-shot CLI (P1) + resident agent (P2).
 

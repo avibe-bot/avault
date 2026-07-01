@@ -9,7 +9,7 @@ use avault_core::{
     BlindBox, BlindBoxContext, ExportBlob, LocalSignerProvider, Sealed, SignatureScheme,
     SignerProvider,
 };
-use avault_store::{Backend, FileStore, MasterKey, PassphraseFileStore};
+use avault_store::{Backend, MasterKey, PassphraseFileStore};
 #[cfg(unix)]
 use base64::engine::general_purpose::STANDARD as B64;
 #[cfg(unix)]
@@ -74,7 +74,7 @@ const USAGE: &str = "\
 avault — Avibe Vaults custody core
 
 USAGE:
-    avault [--store file|file-passphrase] COMMAND ...
+    avault [--store auto|keychain|file|file-passphrase] COMMAND ...
     avault seal --name NAME
     avault seal --name NAME --blind-box
     avault deliver run --name NAME --env VAR [--envelope-file PATH] -- COMMAND [ARGS...]
@@ -85,11 +85,12 @@ USAGE:
     avault key import [--force]
     avault pubkey
     avault sign < sign-request.json
-    avault agent [--store file|file-passphrase] [--unlock] [--socket PATH] [--idle-timeout-secs SECS]
+    avault agent [--store auto|keychain|file|file-passphrase] [--unlock] [--socket PATH] [--idle-timeout-secs SECS]
     avault version
 
 P1 reads secret values, envelopes, and passphrases from stdin. Plaintext never belongs in argv.
 deliver fetch requires request.allowed_hosts before attaching a credential.
+auto uses macOS Keychain on macOS and the file store elsewhere.
 file-passphrase is opt-in. Its unlock passphrase is read from the first stdin line.
 ";
 
@@ -145,6 +146,8 @@ struct CliConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StoreSelection {
+    Auto,
+    Keychain,
     File,
     FilePassphrase,
 }
@@ -152,6 +155,8 @@ enum StoreSelection {
 impl StoreSelection {
     fn parse(value: &str) -> anyhow::Result<Self> {
         match value {
+            "auto" => Ok(Self::Auto),
+            "keychain" => Ok(Self::Keychain),
             "file" => Ok(Self::File),
             "file-passphrase" | "file+passphrase" | "passphrase" => Ok(Self::FilePassphrase),
             _ => bail!("unknown store backend"),
@@ -160,14 +165,14 @@ impl StoreSelection {
 }
 
 enum StoreUnlock {
-    File,
+    Standard(Backend),
     FilePassphrase(Zeroizing<Vec<u8>>),
 }
 
 fn parse_global_options(args: Vec<OsString>) -> anyhow::Result<(CliConfig, Vec<OsString>)> {
     let mut store = match env::var("AVAULT_STORE") {
         Ok(value) => StoreSelection::parse(&value)?,
-        Err(env::VarError::NotPresent) => StoreSelection::File,
+        Err(env::VarError::NotPresent) => StoreSelection::Auto,
         Err(env::VarError::NotUnicode(_)) => bail!("AVAULT_STORE must be valid UTF-8"),
     };
     let mut index = 0;
@@ -192,7 +197,9 @@ fn parse_global_options(args: Vec<OsString>) -> anyhow::Result<(CliConfig, Vec<O
 
 fn read_store_unlock(config: &CliConfig, input: &mut impl Read) -> anyhow::Result<StoreUnlock> {
     match config.store {
-        StoreSelection::File => Ok(StoreUnlock::File),
+        StoreSelection::Auto => Ok(StoreUnlock::Standard(Backend::Auto)),
+        StoreSelection::Keychain => Ok(StoreUnlock::Standard(Backend::Keychain)),
+        StoreSelection::File => Ok(StoreUnlock::Standard(Backend::File)),
         StoreSelection::FilePassphrase => Ok(StoreUnlock::FilePassphrase(
             read_passphrase_line(input).context("failed to read store passphrase from stdin")?,
         )),
@@ -201,7 +208,7 @@ fn read_store_unlock(config: &CliConfig, input: &mut impl Read) -> anyhow::Resul
 
 fn load_existing_master_from_unlock(unlock: &StoreUnlock) -> anyhow::Result<MasterKey> {
     match unlock {
-        StoreUnlock::File => avault_store::load_master_key(Backend::File),
+        StoreUnlock::Standard(backend) => avault_store::load_master_key(*backend),
         StoreUnlock::FilePassphrase(passphrase) => {
             avault_store::load_passphrase_master_key(passphrase.as_slice())
                 .context("failed to unlock passphrase master key")
@@ -211,7 +218,7 @@ fn load_existing_master_from_unlock(unlock: &StoreUnlock) -> anyhow::Result<Mast
 
 fn load_or_create_master_from_unlock(unlock: &StoreUnlock) -> anyhow::Result<MasterKey> {
     match unlock {
-        StoreUnlock::File => avault_store::load_or_create_master_key(Backend::File),
+        StoreUnlock::Standard(backend) => avault_store::load_or_create_master_key(*backend),
         StoreUnlock::FilePassphrase(passphrase) => {
             avault_store::load_or_create_passphrase_master_key(passphrase.as_slice())
                 .context("failed to unlock passphrase master key")
@@ -225,9 +232,7 @@ fn import_master_with_unlock(
     force: bool,
 ) -> anyhow::Result<()> {
     match unlock {
-        StoreUnlock::File => FileStore::new(avault_store::default_master_key_path()?)
-            .import(key, force)
-            .context("failed to store imported master key"),
+        StoreUnlock::Standard(backend) => avault_store::import_master_key(*backend, key, force),
         StoreUnlock::FilePassphrase(passphrase) => {
             PassphraseFileStore::new(avault_store::default_passphrase_master_key_path()?)
                 .import(key, passphrase.as_slice(), force)
@@ -2316,6 +2321,7 @@ fn run_agent(options: AgentOptions, input: &mut impl Read) -> anyhow::Result<u8>
         Some(master)
     } else {
         match options.store {
+            StoreSelection::Auto | StoreSelection::Keychain => None,
             StoreSelection::File => None,
             StoreSelection::FilePassphrase => {
                 bail!("file-passphrase agent requires --unlock")
