@@ -99,8 +99,8 @@ If a secret must be usable by an unattended agent, the machine must be able to d
 
 ### 4.1 Standard tier — machine-rooted
 
-- **Where the key lives:** the OS hardware keystore where available — macOS Keychain/Secure Enclave, Linux TPM — with the file-store floor as the headless fallback (0600 + `mlock` on Unix; protected owner-only DACL + `VirtualLock` on Windows).
-- **How it decrypts:** `avault` asks the keystore to release/use the master key. With a hardware element, the unwrap can happen inside the element and the raw key never leaves it.
+- **Where the key lives:** the strongest implemented OS store where available — macOS Keychain today, later Secure Enclave / Linux TPM — with the file-store floor as the headless fallback (0600 + `mlock` on Unix; protected owner-only DACL + `VirtualLock` on Windows).
+- **How it decrypts:** `avault` asks the selected store to release/use the master key. The current macOS Keychain backend stores a regular generic-password item without user-presence / biometry access control, so standard-tier use stays headless after normal OS/keychain access is available. macOS may still ask once to allow a newly installed `avault` binary to access the Keychain item; that is not a per-use Touch ID / passcode policy. Future Secure Enclave / TPM backends can make the wrapping key non-extractable while still avoiding per-use human authentication.
 - **Headless:** yes. This is the point of the tier.
 - **What it protects:** at-rest encryption (a stolen disk/backup is useless); other processes (with a hardware store + ACL); swap/coredump; and values never enter the LLM, transcript, or Python's persistent state.
 - **What it does _not_ protect:** a machine compromised under your own UID. An attacker running as you can, while you are present/unlocked, coerce a decryption. Hardware keystores make the key **non-extractable**, but **use can still be coerced while unlocked.** The real boundary here is the OS account + the hardware element, not cryptography.
@@ -373,7 +373,7 @@ Peer-cred gates *other users* and remote, not a same-uid process — which is co
 
 `avault-store` selects the strongest local store available. Order (strongest first):
 
-- **Hardware / cloud (strongest roots):** macOS **Keychain / Secure Enclave**, Linux **TPM 2.0** (seal/unseal, optional PCR/auth binding), cloud **KMS** KEK. Non-extractable keys; can also serve as protected-tier factors on the machine for the no-browser case. Best for servers that must **auto-restart unattended**.
+- **Hardware / OS / cloud (strongest roots):** macOS **Keychain** is implemented as the default `auto` backend. Secure Enclave wrapping, Linux **TPM 2.0** (seal/unseal, optional PCR/auth binding), and cloud **KMS** KEK remain backend extensions. Hardware wrapping keys can be non-extractable and still avoid per-use human authentication, which is what standard-tier auto-restart needs.
 - **`file + passphrase` (P2 — the cloud/no-hardware sweet spot):** wrap the master key under a KEK derived from an operator passphrase (`scrypt` today, matching `key export`); store only `wrapped_master`, so **the plaintext master never touches disk**. Select it explicitly with `--store file-passphrase` (or `AVAULT_STORE=file-passphrase`). One-shot CLI commands read the store unlock passphrase from the **first stdin line**, then read the command's existing stdin payload from the remaining bytes. The resident agent uses `avault agent --store file-passphrase --unlock`, reads the passphrase once at startup, unlocks into `mlock`'d memory, and holds that master for the agent lifetime. Same "wrap the root under a factor-KEK" idea as the protected-tier VMK, applied to the standard master. *Honest limits:* it defends **at-rest** (stolen disk / leaked backup / same-uid file read are useless without the passphrase) but **not the running machine** (after unlock the master is in memory); and it needs a human passphrase **per restart**, trading fully-unattended auto-restart for at-rest safety.
 - **File store + memory lock — P1 baseline / floor:** works headless on Linux, macOS, and Windows. Unix uses a 0700 parent directory, 0600 key file, `mlock`, and no-coredump hardening. Windows uses a protected owner-only DACL on the key directory/key file plus best-effort `VirtualLock` and crash-dump hardening. Existing broad modes/ACLs are rejected rather than silently tightened. At-rest the key file is **plaintext** (protected only by the OS account + page-lock/no-coredump hardening), so it is the floor, not a strong at-rest guarantee.
 
@@ -410,7 +410,7 @@ This is an internal store selection inside `avault`, not an Avibe-level plugin l
 | · **Phase B** | Resident agent: unix socket + `SO_PEERCRED` / `LOCAL_PEERCRED`, fresh in-memory receiver keypair, scope-typed grant DEK-cache (strict TTL + idle-zeroize), signing oracle; protected-tier `deliver` (browser-released DEK blind box). | in review |
 | · **Phase C** | `file + passphrase` master store (passphrase-wrapped master, unlock once at startup). | in review |
 | · **avibe + browser** | Same one-shot P2, separate tracks. Python: protected create/resolve, blind-box create relay, scope-typed grants, approval / secure-input cards, signing relay. Browser: HPKE seal, VMK/DEK with passkey-PRF + password, browser ETH/BTC signing. | in progress |
-| **Plugin seams** (not a phase) | Hardware stores (Keychain / Secure Enclave / TPM / KMS), external signers (hardware wallet / WalletConnect), MPC, and other curves (e.g. ed25519) — drop in behind the `KeyStore` / `SignerProvider` traits when the need or hardware is real. Adding one is a plugin, never a migration or a released transition. | as needed |
+| **Plugin seams** (not a phase) | Additional hardware stores (Secure Enclave / TPM / KMS), external signers (hardware wallet / WalletConnect), MPC, and other curves (e.g. ed25519) — drop in behind the `KeyStore` / `SignerProvider` traits when the need or hardware is real. Adding one is a plugin, never a migration or a released transition. | as needed |
 
 **P2 is the entire final Vaults trust model, built in one shot — there is no separate P3
 and no half-released transition state.** It lands as reviewable sub-phases (avault A/B/C
@@ -943,7 +943,8 @@ Response `result` is the normal signature output:
 ### Where avault's own keys live (esp. Linux without a Keychain)
 
 - **The X25519 receiver keypair is ephemeral and in-memory.** It is only used to open blind boxes, so it is generated at agent start (or per CLI invocation) and **never written to disk**. The public key is published on demand; the protected tier pins/attests the *current* public key (re-pin on agent restart). This leaves **only the master key** needing durable secure storage.
-- **Master-key store on Linux (strongest available wins):**
+- **Master-key store on macOS:** default `auto` uses Keychain generic-password storage for the standard-tier master key. It deliberately does not attach Touch ID / user-presence access-control flags because standard-tier secrets must be usable by unattended agents. A first-run Keychain application-access prompt may still appear for a newly installed binary.
+- **Master-key store on Linux (strongest available wins, once implemented):**
   - **TPM 2.0** (present on most Linux hosts) — seal the master key to the TPM; the wrapping key never leaves the chip, optionally bound to PCRs/policy. This is the Linux analog of Keychain/Secure Enclave.
   - **systemd-creds / kernel keyring** — unseal at service start (via TPM or a host key) into non-swappable kernel memory; good for headless services.
   - **`file (0600) + mlock` / Windows protected DACL + `VirtualLock`** (the no-hardware floor) — owned by the service user, kept out of swap and coredumps where the OS allows it.

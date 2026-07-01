@@ -1,9 +1,10 @@
 //! avault-store — where avault's own key material lives.
 //!
-//! P1 implements the standard-tier file-store floor: a 32-byte master key in an
-//! owner-only file (0600 on Unix, protected DACL on Windows), read into a zeroizing
-//! buffer, with best-effort no-core/no-swap hardening. Stronger stores (Keychain /
-//! Secure Enclave / TPM / KMS) are P2+.
+//! The standard-tier master key uses the strongest implemented local store:
+//! macOS Keychain when available, otherwise the file-store floor. The file store
+//! keeps a 32-byte master key in an owner-only file (0600 on Unix, protected DACL
+//! on Windows), read into a zeroizing buffer, with best-effort no-core/no-swap
+//! hardening. TPM / Secure Enclave wrapping backends remain future work.
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -24,6 +25,11 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use zeroize::{Zeroize, Zeroizing};
+
+#[cfg(target_os = "macos")]
+use security_framework::base::Error as KeychainError;
+#[cfg(target_os = "macos")]
+use security_framework::passwords::{get_generic_password, set_generic_password};
 
 #[cfg(windows)]
 use std::ffi::OsStr;
@@ -76,10 +82,17 @@ const PASSPHRASE_STORE_SCHEME: &str = "machine-key-passphrase-v1";
 const SCRYPT_N: u32 = 1 << 15;
 const SCRYPT_R: u32 = 8;
 const SCRYPT_P: u32 = 1;
+#[cfg(target_os = "macos")]
+const KEYCHAIN_SERVICE: &str = "bot.avibe.avault";
+#[cfg(target_os = "macos")]
+const KEYCHAIN_ACCOUNT: &str = "standard-master-key";
+#[cfg(target_os = "macos")]
+const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
 
 /// Selected master-key storage backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
+    Auto,
     Tpm,
     Keychain,
     File,
@@ -361,26 +374,59 @@ fn user_home_dir() -> anyhow::Result<PathBuf> {
 /// Load the 32-byte master key, or create it on first use.
 pub fn load_or_create_master_key(backend: Backend) -> anyhow::Result<MasterKey> {
     match backend {
+        Backend::Auto => load_or_create_master_key(default_backend()),
         Backend::File => FileStore::new(default_master_key_path()?).get_or_create(),
+        Backend::Keychain => KeychainStore::new().get_or_create(),
         Backend::FilePassphrase => {
             bail!("passphrase backend requires an explicit passphrase unlock")
         }
-        Backend::Tpm | Backend::Keychain => {
-            bail!("requested master-key backend is not implemented in P1")
-        }
+        Backend::Tpm => bail!("requested master-key backend is not implemented"),
     }
 }
 
 /// Load the existing 32-byte master key. This never creates a replacement key.
 pub fn load_master_key(backend: Backend) -> anyhow::Result<MasterKey> {
     match backend {
+        Backend::Auto => load_master_key(default_backend()),
         Backend::File => FileStore::new(default_master_key_path()?).get(),
+        Backend::Keychain => KeychainStore::new().get(),
         Backend::FilePassphrase => {
             bail!("passphrase backend requires an explicit passphrase unlock")
         }
-        Backend::Tpm | Backend::Keychain => {
-            bail!("requested master-key backend is not implemented in P1")
+        Backend::Tpm => bail!("requested master-key backend is not implemented"),
+    }
+}
+
+/// Store a master key in the selected backend, refusing to overwrite unless `force` is true.
+pub fn import_master_key(
+    backend: Backend,
+    key: &[u8; MASTER_KEY_BYTES],
+    force: bool,
+) -> anyhow::Result<()> {
+    match backend {
+        Backend::Auto => import_master_key(default_backend(), key, force),
+        Backend::File => FileStore::new(default_master_key_path()?)
+            .import(key, force)
+            .context("failed to store imported master key"),
+        Backend::Keychain => KeychainStore::new()
+            .import(key, force)
+            .context("failed to store imported master key in Keychain"),
+        Backend::FilePassphrase => {
+            bail!("passphrase backend requires an explicit passphrase unlock")
         }
+        Backend::Tpm => bail!("requested master-key backend is not implemented"),
+    }
+}
+
+/// Default standard-tier backend for this host.
+pub fn default_backend() -> Backend {
+    #[cfg(target_os = "macos")]
+    {
+        Backend::Keychain
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Backend::File
     }
 }
 
@@ -499,6 +545,102 @@ impl FileStore {
         validate_directory_mode(parent)?;
         Ok(())
     }
+}
+
+/// Standard-tier master-key store backed by macOS Keychain.
+#[derive(Debug, Clone, Copy)]
+pub struct KeychainStore;
+
+impl KeychainStore {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for KeychainStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl KeychainStore {
+    /// Return the master key, creating it in the user's default Keychain if missing.
+    ///
+    /// This uses a regular generic-password item and does not attach a
+    /// user-presence / biometry access-control policy. That keeps the standard
+    /// tier headless after the OS session is unlocked.
+    pub fn get_or_create(&self) -> anyhow::Result<MasterKey> {
+        match self.get() {
+            Ok(key) => Ok(key),
+            Err(err) if is_keychain_not_found(&err) => {
+                let key = MasterKey::generate_locked()?;
+                set_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, key.as_bytes())
+                    .context("failed to store master key in Keychain")?;
+                drop(key);
+                self.get()
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Return the existing Keychain master key.
+    pub fn get(&self) -> anyhow::Result<MasterKey> {
+        let mut bytes = Zeroizing::new(
+            get_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+                .context("master key not found in Keychain")?,
+        );
+        let mut key_bytes: [u8; MASTER_KEY_BYTES] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("master key has invalid length"))?;
+        bytes.zeroize();
+        let key = MasterKey::from_bytes(&key_bytes);
+        key_bytes.zeroize();
+        key
+    }
+
+    /// Import a master key into Keychain, refusing to overwrite unless `force` is true.
+    pub fn import(&self, key: &[u8; MASTER_KEY_BYTES], force: bool) -> anyhow::Result<()> {
+        if force {
+            return set_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, key)
+                .context("failed to store imported master key in Keychain");
+        }
+
+        match self.get() {
+            Ok(_) => bail!("master key already exists"),
+            Err(err) if is_keychain_not_found(&err) => {
+                set_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, key)
+                    .context("failed to store imported master key in Keychain")
+            }
+            Err(err) => Err(err),
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+impl KeychainStore {
+    pub fn get_or_create(&self) -> anyhow::Result<MasterKey> {
+        bail!("Keychain master-key backend is only available on macOS")
+    }
+
+    pub fn get(&self) -> anyhow::Result<MasterKey> {
+        bail!("Keychain master-key backend is only available on macOS")
+    }
+
+    pub fn import(&self, _key: &[u8; MASTER_KEY_BYTES], _force: bool) -> anyhow::Result<()> {
+        bail!("Keychain master-key backend is only available on macOS")
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn is_keychain_not_found(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<KeychainError>()
+            .map(|error| error.code() == ERR_SEC_ITEM_NOT_FOUND)
+            .unwrap_or(false)
+    })
 }
 
 /// Passphrase-wrapped file store for the standard-tier master key.
@@ -1537,6 +1679,15 @@ mod tests {
         let blob: PassphraseMasterBlob = serde_json::from_slice(&disk).unwrap();
         assert_eq!(blob.scheme, PASSPHRASE_STORE_SCHEME);
         assert!(!blob.wrapped_master.is_empty());
+    }
+
+    #[test]
+    fn auto_backend_selects_best_implemented_host_store() {
+        #[cfg(target_os = "macos")]
+        assert_eq!(default_backend(), Backend::Keychain);
+
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(default_backend(), Backend::File);
     }
 
     #[test]

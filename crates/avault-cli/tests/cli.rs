@@ -19,7 +19,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 fn avault() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_avault"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_avault"));
+    command.arg("--store").arg("file");
+    command
 }
 
 fn seal_secret(home: &std::path::Path, name: &str, value: &[u8]) -> serde_json::Value {
