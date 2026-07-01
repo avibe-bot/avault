@@ -1302,7 +1302,7 @@ fn is_unusable_tpm_error(err: &tss_esapi::Error) -> bool {
             code,
         ))) => matches!(
             code.error_number(),
-            TpmFormatOneError::AuthFail | TpmFormatOneError::BadAuth
+            TpmFormatOneError::AuthFail | TpmFormatOneError::BadAuth | TpmFormatOneError::Hierarchy
         ),
         tss_esapi::Error::TssError(ReturnCode::Tpm(TpmResponseCode::FormatZero(
             TpmFormatZeroResponseCode::Error(code),
@@ -2764,6 +2764,26 @@ mod tests {
         let err = anyhow::Error::new(tss_esapi::Error::TssError(ReturnCode::Tpm(
             TpmResponseCode::FormatOne(TpmFormatOneResponseCode::new(
                 TpmFormatOneError::BadAuth,
+                ArgumentNumber::Handle(1),
+            )),
+        )))
+        .context("failed to create TPM primary");
+
+        assert!(is_tpm_unavailable(&err));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tpm_disabled_hierarchy_is_unavailable_on_linux() {
+        use tss_esapi::{
+            constants::return_code::TpmFormatOneError,
+            error::{ArgumentNumber, TpmFormatOneResponseCode, TpmResponseCode},
+            ReturnCode,
+        };
+
+        let err = anyhow::Error::new(tss_esapi::Error::TssError(ReturnCode::Tpm(
+            TpmResponseCode::FormatOne(TpmFormatOneResponseCode::new(
+                TpmFormatOneError::Hierarchy,
                 ArgumentNumber::Handle(1),
             )),
         )))
