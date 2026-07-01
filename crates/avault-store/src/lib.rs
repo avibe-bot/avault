@@ -37,12 +37,13 @@ use tss_esapi::{
     handles::ObjectHandle,
     interface_types::{
         algorithm::{HashingAlgorithm, PublicAlgorithm},
+        key_bits::RsaKeyBits,
         reserved_handles::Hierarchy,
     },
     structures::{
         CreatePrimaryKeyResult, Digest, KeyedHashScheme, Private, Public, PublicBuilder,
-        PublicKeyedHashParameters, SensitiveData, SymmetricCipherParameters,
-        SymmetricDefinitionObject,
+        PublicKeyRsa, PublicKeyedHashParameters, PublicRsaParametersBuilder, RsaExponent,
+        SensitiveData, SymmetricDefinitionObject,
     },
     traits::{Marshall, UnMarshall},
     Context as TpmContext, TctiNameConf,
@@ -1186,13 +1187,19 @@ fn primary_public_template() -> anyhow::Result<Public> {
         .context("failed to build TPM primary attributes")?;
 
     PublicBuilder::new()
-        .with_public_algorithm(PublicAlgorithm::SymCipher)
+        .with_public_algorithm(PublicAlgorithm::Rsa)
         .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
         .with_object_attributes(attributes)
-        .with_symmetric_cipher_parameters(SymmetricCipherParameters::new(
-            SymmetricDefinitionObject::AES_128_CFB,
-        ))
-        .with_symmetric_cipher_unique_identifier(Digest::default())
+        .with_rsa_parameters(
+            PublicRsaParametersBuilder::new_restricted_decryption_key(
+                SymmetricDefinitionObject::AES_128_CFB,
+                RsaKeyBits::Rsa2048,
+                RsaExponent::default(),
+            )
+            .build()
+            .context("failed to build TPM primary RSA parameters")?,
+        )
+        .with_rsa_unique_identifier(PublicKeyRsa::new_empty_with_size(RsaKeyBits::Rsa2048))
         .build()
         .context("failed to build TPM primary template")
 }
@@ -2750,6 +2757,33 @@ mod tests {
         .context("failed to initialize TPM context");
 
         assert!(is_tpm_unavailable(&err));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tpm_primary_template_uses_storage_parent() {
+        let template = primary_public_template().unwrap();
+
+        let Public::Rsa {
+            object_attributes,
+            parameters,
+            ..
+        } = template
+        else {
+            panic!("TPM primary template is not an RSA storage key");
+        };
+
+        assert!(object_attributes.decrypt());
+        assert!(object_attributes.restricted());
+        assert!(!object_attributes.sign_encrypt());
+        assert_eq!(parameters.key_bits(), RsaKeyBits::Rsa2048);
+        assert_eq!(
+            parameters.symmetric_definition_object(),
+            SymmetricDefinitionObject::AES_128_CFB
+        );
+
+        let sealed_template = sealed_data_public_template().unwrap();
+        assert!(matches!(sealed_template, Public::KeyedHash { .. }));
     }
 
     #[cfg(target_os = "linux")]
