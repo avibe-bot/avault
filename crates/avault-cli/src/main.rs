@@ -74,7 +74,7 @@ const USAGE: &str = "\
 avault — Avibe Vaults custody core
 
 USAGE:
-    avault [--store auto|keychain|file|file-passphrase] COMMAND ...
+    avault [--store auto|keychain|tpm|file|file-passphrase] COMMAND ...
     avault seal --name NAME
     avault seal --name NAME --blind-box
     avault deliver run --name NAME --env VAR [--envelope-file PATH] -- COMMAND [ARGS...]
@@ -85,12 +85,12 @@ USAGE:
     avault key import [--force]
     avault pubkey
     avault sign < sign-request.json
-    avault agent [--store auto|keychain|file|file-passphrase] [--unlock] [--socket PATH] [--idle-timeout-secs SECS]
+    avault agent [--store auto|keychain|tpm|file|file-passphrase] [--unlock] [--socket PATH] [--idle-timeout-secs SECS]
     avault version
 
 P1 reads secret values, envelopes, and passphrases from stdin. Plaintext never belongs in argv.
 deliver fetch requires request.allowed_hosts before attaching a credential.
-auto uses macOS Keychain on macOS and the file store elsewhere.
+auto uses macOS Keychain on macOS, Linux TPM when available, and the file store elsewhere.
 file-passphrase is opt-in. Its unlock passphrase is read from the first stdin line.
 ";
 
@@ -148,6 +148,7 @@ struct CliConfig {
 enum StoreSelection {
     Auto,
     Keychain,
+    Tpm,
     File,
     FilePassphrase,
 }
@@ -157,6 +158,7 @@ impl StoreSelection {
         match value {
             "auto" => Ok(Self::Auto),
             "keychain" => Ok(Self::Keychain),
+            "tpm" | "tpm2" => Ok(Self::Tpm),
             "file" => Ok(Self::File),
             "file-passphrase" | "file+passphrase" | "passphrase" => Ok(Self::FilePassphrase),
             _ => bail!("unknown store backend"),
@@ -199,6 +201,7 @@ fn read_store_unlock(config: &CliConfig, input: &mut impl Read) -> anyhow::Resul
     match config.store {
         StoreSelection::Auto => Ok(StoreUnlock::Standard(Backend::Auto)),
         StoreSelection::Keychain => Ok(StoreUnlock::Standard(Backend::Keychain)),
+        StoreSelection::Tpm => Ok(StoreUnlock::Standard(Backend::Tpm)),
         StoreSelection::File => Ok(StoreUnlock::Standard(Backend::File)),
         StoreSelection::FilePassphrase => Ok(StoreUnlock::FilePassphrase(
             read_passphrase_line(input).context("failed to read store passphrase from stdin")?,
@@ -2321,7 +2324,7 @@ fn run_agent(options: AgentOptions, input: &mut impl Read) -> anyhow::Result<u8>
         Some(master)
     } else {
         match options.store {
-            StoreSelection::Auto | StoreSelection::Keychain => None,
+            StoreSelection::Auto | StoreSelection::Keychain | StoreSelection::Tpm => None,
             StoreSelection::File => None,
             StoreSelection::FilePassphrase => {
                 bail!("file-passphrase agent requires --unlock")
