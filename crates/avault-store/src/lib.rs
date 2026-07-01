@@ -1253,6 +1253,12 @@ fn is_tpm_unavailable(err: &anyhow::Error) -> bool {
         {
             return true;
         }
+        if cause
+            .downcast_ref::<tss_esapi::Error>()
+            .is_some_and(is_unusable_tpm_error)
+        {
+            return true;
+        }
 
         let text = cause.to_string();
         text.contains("/dev/tpm")
@@ -1269,8 +1275,58 @@ fn is_tpm_unavailable(err: &anyhow::Error) -> bool {
             || text.contains("permission denied")
             || text.contains("Access denied")
             || text.contains("access denied")
+            || text.contains("Authorization failure")
+            || text.contains("authorization failure")
+            || text.contains("Authorization failed")
+            || text.contains("authorization failed")
+            || text.contains("Authorization handle is not correct")
+            || text.contains("authorization handle is not correct")
+            || text.contains("authValue")
+            || text.contains("Operation not permitted")
+            || text.contains("operation not permitted")
             || text.contains("Unknown or unusable TCTI")
     })
+}
+
+#[cfg(target_os = "linux")]
+fn is_unusable_tpm_error(err: &tss_esapi::Error) -> bool {
+    use tss_esapi::{
+        constants::return_code::{BaseError, TpmFormatOneError, TpmFormatZeroError},
+        error::{TpmFormatZeroResponseCode, TpmResponseCode},
+        ReturnCode,
+    };
+
+    match err {
+        tss_esapi::Error::TssError(ReturnCode::Tpm(TpmResponseCode::FormatOne(code)))
+        | tss_esapi::Error::TssError(ReturnCode::TpmResourceManager(TpmResponseCode::FormatOne(
+            code,
+        ))) => matches!(
+            code.error_number(),
+            TpmFormatOneError::AuthFail | TpmFormatOneError::BadAuth
+        ),
+        tss_esapi::Error::TssError(ReturnCode::Tpm(TpmResponseCode::FormatZero(
+            TpmFormatZeroResponseCode::Error(code),
+        )))
+        | tss_esapi::Error::TssError(ReturnCode::TpmResourceManager(
+            TpmResponseCode::FormatZero(TpmFormatZeroResponseCode::Error(code)),
+        )) => matches!(
+            code.error_number(),
+            TpmFormatZeroError::AuthType
+                | TpmFormatZeroError::AuthMissing
+                | TpmFormatZeroError::AuthUnavailable
+                | TpmFormatZeroError::NvAuthorization
+        ),
+        tss_esapi::Error::TssError(ReturnCode::Tcti(code)) => matches!(
+            code.base_error(),
+            BaseError::NoConnection
+                | BaseError::IoError
+                | BaseError::NotPermitted
+                | BaseError::NotSupported
+                | BaseError::IncompatibleTcti
+                | BaseError::BadTctiStructure
+        ),
+        _ => false,
+    }
 }
 
 impl Default for KeychainStore {
@@ -2691,6 +2747,39 @@ mod tests {
             std::io::ErrorKind::PermissionDenied,
             "permission denied opening /dev/tpmrm0",
         ))
+        .context("failed to initialize TPM context");
+
+        assert!(is_tpm_unavailable(&err));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tpm_auth_failures_are_unavailable_on_linux() {
+        use tss_esapi::{
+            constants::return_code::TpmFormatOneError,
+            error::{ArgumentNumber, TpmFormatOneResponseCode, TpmResponseCode},
+            ReturnCode,
+        };
+
+        let err = anyhow::Error::new(tss_esapi::Error::TssError(ReturnCode::Tpm(
+            TpmResponseCode::FormatOne(TpmFormatOneResponseCode::new(
+                TpmFormatOneError::BadAuth,
+                ArgumentNumber::Handle(1),
+            )),
+        )))
+        .context("failed to create TPM primary");
+
+        assert!(is_tpm_unavailable(&err));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tpm_tcti_not_permitted_is_unavailable_on_linux() {
+        use tss_esapi::{constants::return_code::BaseError, error::TctiReturnCode, ReturnCode};
+
+        let err = anyhow::Error::new(tss_esapi::Error::TssError(ReturnCode::Tcti(
+            TctiReturnCode::try_from(BaseError::NotPermitted).unwrap(),
+        )))
         .context("failed to initialize TPM context");
 
         assert!(is_tpm_unavailable(&err));

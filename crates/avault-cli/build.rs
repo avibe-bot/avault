@@ -17,6 +17,7 @@ fn main() {
             "-ltss2-esys",
             "-ltss2-sys",
             "-ltss2-tctildr",
+            "-ltss2-tcti-device",
             "-ltss2-mu",
             "-lcrypto",
             "-latomic",
