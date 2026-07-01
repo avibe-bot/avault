@@ -3,10 +3,10 @@
 A small, hardened **Rust key-custody core** for [Avibe](https://github.com/avibe-bot/avibe) Vaults — the one component that ever holds a key or performs cryptography, so the agent (and Python) never do.
 
 > **Status: P2 core.** The standard-tier Rust crypto core, macOS Keychain
-> master-key store, cross-platform file fallback, opt-in passphrase-wrapped file
-> store, one-shot delivery surface, blind-box create path, secp256k1 signing
-> verbs, and resident grant agent are implemented. Secure Enclave / TPM stores
-> remain future work.
+> master-key store, Linux TPM2 sealed store, cross-platform file fallback,
+> opt-in passphrase-wrapped file store, one-shot delivery surface, blind-box
+> create path, secp256k1 signing verbs, and resident grant agent are
+> implemented. Secure Enclave remains future work.
 
 ## Why
 
@@ -52,14 +52,14 @@ New P1 writes authenticate the value with AAD bytes
 read-compatible only.
 
 The default standard-tier store is `auto`: macOS prefers a Keychain
-generic-password item (`bot.avibe.avault` / `standard-master-key`), while other
-hosts use the file-store fallback until their hardware store is implemented. When
-upgrading an existing macOS install that already has `machine.key`, `auto` first
-loads that file key and mirrors it into Keychain instead of minting a replacement
-master key. If Keychain is unavailable, `auto` only uses the file fallback when an
-existing file key is already present; it will not mint a second root that could
-diverge from an inaccessible Keychain item. If both stores exist but disagree,
-`auto` refuses to choose silently.
+generic-password item (`bot.avibe.avault` / `standard-master-key`), Linux uses a
+TPM2 sealed blob when TPM2 is available, and other hosts use the file-store
+fallback. When upgrading an existing macOS or Linux install that already has
+`machine.key`, `auto` first loads that file key and mirrors it into the stronger
+store instead of minting a replacement master key. If the stronger store is
+unavailable, `auto` only uses the file fallback when an existing file key is
+already present, or on first use when no stronger store exists. If both stores
+exist but disagree, `auto` refuses to choose silently.
 
 The Keychain item intentionally has no user-presence / biometry access-control
 flag, so it stays suitable for headless standard-tier use after the OS session is
@@ -67,6 +67,17 @@ unlocked. macOS may still ask once to allow a newly installed `avault` binary to
 access its Keychain item; that is the normal Keychain application-access prompt,
 not a per-use Touch ID / passcode policy. Select `--store file` (or
 `AVAULT_STORE=file`) to force the file store.
+
+On Linux, the TPM backend stores `$AVAULT_HOME/machine.tpm.json` (or
+`$HOME/.avibe/state/vault/machine.tpm.json`) containing only TPM2 public/private
+sealed-object blobs. The plaintext master key is sealed and unsealed in-process
+through TSS/ESAPI; it is not passed to `tpm2-tools` or another subprocess. This
+requires a TPM 2.0 device reachable through the system TCTI configuration
+(`TCTI` / `TPM2TOOLS_TCTI`, defaulting to `/dev/tpmrm0` then `/dev/tpm0`). It
+does not attach PCR, password, PIN, or user-presence policy, so standard-tier use
+remains headless while the OS user has TPM access. Select `--store tpm` (or
+`AVAULT_STORE=tpm`) to require this backend explicitly; `auto` falls back to the
+file store when TPM is unavailable.
 
 The file store uses `$AVAULT_HOME/machine.key` when `AVAULT_HOME` is set, or
 `$HOME/.avibe/state/vault/machine.key` by default, matching the P0 Python
@@ -231,7 +242,7 @@ cargo clippy --all-targets
 - **P1.1** — complete standard-tier delivery: multi-secret run, brokered fetch, and atomic dotenv/json inject.
 - **P2 Phase A** — blind-box create, secp256k1 digest signing, and pinned JSON contracts.
 - **P2 Phase B/C** — resident agent + `SO_PEERCRED` + scope-grant DEK cache, protected deliver/sign, and opt-in file+passphrase store.
-- **Future** — hardware stores and external signer providers behind the existing seams.
+- **Future** — Secure Enclave and external signer providers behind the existing seams.
 
 ## License
 

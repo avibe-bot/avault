@@ -32,17 +32,19 @@ jobs:
             strip: true
             required: true
           - target_name: linux-x64
-            rust_target: x86_64-unknown-linux-musl
+            rust_target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             binary: avault
             strip: true
             required: true
+            linux_container: rust:1.85-bullseye
           - target_name: linux-arm64
-            rust_target: aarch64-unknown-linux-musl
+            rust_target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
             binary: avault
             strip: true
             required: true
+            linux_container: rust:1.85-bullseye
           - target_name: windows-x64
             rust_target: x86_64-pc-windows-msvc
             os: windows-latest
@@ -86,13 +88,13 @@ jobs:
             ${{ runner.os }}-${{ matrix.rust_target }}-cargo-
             ${{ runner.os }}-cargo-
 
-      - name: Install musl toolchain
-        if: contains(matrix.rust_target, 'unknown-linux-musl')
+      - name: Install Linux TPM build dependencies
+        if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
+          docker pull "${{ matrix.linux_container }}"
 
       - name: Install Rust target
+        if: runner.os != 'Linux'
         run: rustup target add "${{ matrix.rust_target }}"
 
       - name: Verify release tag matches crate version
@@ -110,7 +112,45 @@ jobs:
             exit 1
           fi
 
+      - name: Build Linux release binary
+        if: runner.os == 'Linux'
+        env:
+          LINUX_CONTAINER: ${{ matrix.linux_container }}
+          RUST_TARGET: ${{ matrix.rust_target }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -e CARGO_TERM_COLOR=always \
+            -e RUST_TARGET \
+            -v "$PWD":/work \
+            -w /work \
+            "$LINUX_CONTAINER" \
+            bash -c '
+          set -euo pipefail
+          . /usr/local/cargo/env
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates \
+            autoconf \
+            autoconf-archive \
+            automake \
+            build-essential \
+            git \
+            libcurl4-openssl-dev \
+            libjson-c-dev \
+            libltdl-dev \
+            libusb-1.0-0-dev \
+            libssl-dev \
+            libtool \
+            pkg-config \
+            uuid-dev
+          rustup target add "$RUST_TARGET"
+          cargo build --locked --release --target "$RUST_TARGET" --bin avault
+          chown -R "$(stat -c %u /work):$(stat -c %g /work)" /work/target
+          '
+
       - name: Build release binary
+        if: runner.os != 'Linux'
         run: cargo build --locked --release --target "${{ matrix.rust_target }}" --bin avault
 
       - name: Strip binary

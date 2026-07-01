@@ -30,14 +30,14 @@ This matches the distribution decision in `docs/DESIGN.md` Section 16, decision
 | --- | --- | --- |
 | `macos-arm64` | `aarch64-apple-darwin` | `macos-14` |
 | `macos-x64` | `x86_64-apple-darwin` | `macos-15-intel` |
-| `linux-x64` | `x86_64-unknown-linux-musl` | `ubuntu-latest` |
-| `linux-arm64` | `aarch64-unknown-linux-musl` | `ubuntu-24.04-arm` |
+| `linux-x64` | `x86_64-unknown-linux-gnu` | `ubuntu-latest` + `rust:1.85-bullseye` |
+| `linux-arm64` | `aarch64-unknown-linux-gnu` | `ubuntu-24.04-arm` + `rust:1.85-bullseye` |
 | `windows-x64` | `x86_64-pc-windows-msvc` | `windows-latest` |
 | `windows-arm64` | `aarch64-pc-windows-msvc` | `windows-latest` |
 
-Linux artifacts are built with musl targets so Avibe can treat them as generic
-Linux artifacts without inheriting an Ubuntu glibc baseline. `windows-arm64` is
-best-effort; every other target is required for a release.
+Linux artifacts are GNU binaries built inside a Debian 11 / Rust 1.85 container
+so Avibe does not inherit the host runner's newer glibc baseline. `windows-arm64`
+is best-effort; every other target is required for a release.
 
 ## Artifact naming
 

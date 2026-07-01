@@ -7,6 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+build = "build.rs"
 
 [dependencies]
 zeroize.workspace = true
@@ -22,6 +23,9 @@ serde_json.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tss-esapi.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

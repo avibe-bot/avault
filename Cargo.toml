@@ -36,6 +36,7 @@ scrypt = "0.11"
 libc = "0.2"
 tempfile = "3"
 security-framework = "2.11"
+tss-esapi = { version = "=8.0.0-alpha.1", default-features = false, features = ["bundled"] }
 ureq = { version = "2", default-features = false, features = ["tls"] }
 url = "2"
 hpke = { version = "0.13", default-features = false, features = ["alloc", "x25519"] }

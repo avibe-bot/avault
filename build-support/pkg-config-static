@@ -1,0 +1,74 @@
+#!/bin/sh
+set -eu
+
+# Cargo builds only ship the avault binary in release tarballs. When a bundled
+# tpm2-tss pkg-config probe asks for static metadata, force OpenSSL to the exact
+# static archive as well; the pkg-config crate can otherwise downgrade /usr
+# libraries back to dynamic links.
+if command -v pkgconf >/dev/null 2>&1; then
+    real_pkg_config="$(command -v pkgconf)"
+else
+    real_pkg_config="$(command -v pkg-config)"
+fi
+
+static=0
+libs=0
+for arg in "$@"; do
+    case "$arg" in
+        --static)
+            static=1
+            ;;
+        --libs)
+            libs=1
+            ;;
+    esac
+done
+
+args_file="$(mktemp)"
+trap 'rm -f "$args_file"' EXIT
+
+for arg in "$@"; do
+    printf '%s\n' "$arg" >>"$args_file"
+done
+
+set --
+while IFS= read -r arg; do
+    skip=0
+    case "$arg" in
+        -* | *" "*)
+            ;;
+        *)
+            while IFS= read -r other; do
+                case "$other" in
+                    "$arg "*)
+                        skip=1
+                        break
+                        ;;
+                esac
+            done <"$args_file"
+            ;;
+    esac
+    if [ "$skip" -eq 0 ]; then
+        set -- "$@" "$arg"
+    fi
+done <"$args_file"
+
+output="$("$real_pkg_config" "$@")"
+
+if [ "$static" -eq 0 ] || [ "$libs" -eq 0 ]; then
+    printf '%s\n' "$output"
+    exit 0
+fi
+
+set -- $output
+sep=
+for flag in "$@"; do
+    case "$flag" in
+        -lcrypto)
+            flag="-l:libcrypto.a"
+            ;;
+    esac
+    printf '%s%s' "$sep" "$flag"
+    sep=' '
+done
+printf '\n'

@@ -1,0 +1,15 @@
+[env]
+# tss-esapi-sys bundled builds still probe the freshly built tpm2-tss libraries
+# with pkg-config. Force those probes to emit static link metadata so release
+# tarballs keep working on Linux hosts without distro tpm2-tss/OpenSSL packages.
+PKG_CONFIG_ALL_STATIC = { value = "1", force = true }
+PKG_CONFIG_ALLOW_SYSTEM_LIBS = { value = "1", force = true }
+PKG_CONFIG = { value = "build-support/pkg-config-static", relative = true, force = true }
+
+# tpm2-tss' loader normally dlopens TCTI modules such as libtss2-tcti-device.
+# For release tarballs that contain only the avault binary, build the bundled
+# loader in no-dl mode and keep only the physical TPM device TCTI linked in.
+enable_nodl = { value = "yes", force = true }
+enable_tcti_device = { value = "yes", force = true }
+enable_tcti_mssim = { value = "no", force = true }
+enable_tcti_swtpm = { value = "no", force = true }
