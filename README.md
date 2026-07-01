@@ -51,15 +51,21 @@ New P1 writes authenticate the value with AAD bytes
 `crates/avault-core/tests/fixtures/p1_aad_vector.json`. Legacy P0 no-AAD rows are
 read-compatible only.
 
-The default standard-tier store is `auto`: macOS stores the 32-byte master key as
-a Keychain generic-password item (`bot.avibe.avault` /
-`standard-master-key`), while other hosts use the file-store fallback until their
-hardware store is implemented. The Keychain item intentionally has no
-user-presence / biometry access-control flag, so it stays suitable for headless
-standard-tier use after the OS session is unlocked. macOS may still ask once to
-allow a newly installed `avault` binary to access its Keychain item; that is the
-normal Keychain application-access prompt, not a per-use Touch ID / passcode
-policy. Select `--store file` (or `AVAULT_STORE=file`) to force the file store.
+The default standard-tier store is `auto`: macOS prefers a Keychain
+generic-password item (`bot.avibe.avault` / `standard-master-key`), while other
+hosts use the file-store fallback until their hardware store is implemented. When
+upgrading an existing macOS install that already has `machine.key`, `auto` first
+loads that file key and mirrors it into Keychain instead of minting a replacement
+master key. If Keychain is unavailable in a headless session, `auto` continues to
+use the file-store fallback. If both stores exist but disagree, `auto` refuses to
+choose silently.
+
+The Keychain item intentionally has no user-presence / biometry access-control
+flag, so it stays suitable for headless standard-tier use after the OS session is
+unlocked. macOS may still ask once to allow a newly installed `avault` binary to
+access its Keychain item; that is the normal Keychain application-access prompt,
+not a per-use Touch ID / passcode policy. Select `--store file` (or
+`AVAULT_STORE=file`) to force the file store.
 
 The file store uses `$AVAULT_HOME/machine.key` when `AVAULT_HOME` is set, or
 `$HOME/.avibe/state/vault/machine.key` by default, matching the P0 Python
