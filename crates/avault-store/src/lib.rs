@@ -430,19 +430,21 @@ pub fn import_master_key(
 
 #[cfg(target_os = "macos")]
 fn load_or_create_auto_master_key() -> anyhow::Result<MasterKey> {
-    let file = FileStore::new(default_master_key_path()?);
     let keychain = KeychainStore::new();
+    let file = auto_file_store()?;
 
-    if let Some(file_key) = load_existing_file_master_key(&file)? {
+    if let Some(file_key) = load_existing_file_master_key(file.as_ref())? {
         return migrate_file_key_to_keychain(&keychain, file_key);
     }
 
     match keychain.get() {
         Ok(key) => Ok(key),
         Err(err) if is_keychain_not_found(&err) => {
-            create_keychain_key_or_fallback_file(&keychain, &file, MasterKey::generate_locked()?)
+            create_keychain_key(&keychain, MasterKey::generate_locked()?)
         }
-        Err(err) if is_keychain_unavailable(&err) => file.get_or_create(),
+        Err(err) if is_keychain_unavailable(&err) => {
+            Err(err).context("Keychain is unavailable and no existing file master key was found")
+        }
         Err(err) => Err(err),
     }
 }
@@ -454,16 +456,18 @@ fn load_or_create_auto_master_key() -> anyhow::Result<MasterKey> {
 
 #[cfg(target_os = "macos")]
 fn load_auto_master_key() -> anyhow::Result<MasterKey> {
-    let file = FileStore::new(default_master_key_path()?);
     let keychain = KeychainStore::new();
+    let file = auto_file_store()?;
 
-    if let Some(file_key) = load_existing_file_master_key(&file)? {
+    if let Some(file_key) = load_existing_file_master_key(file.as_ref())? {
         return migrate_file_key_to_keychain(&keychain, file_key);
     }
 
     match keychain.get() {
         Ok(key) => Ok(key),
-        Err(err) if is_keychain_unavailable(&err) => file.get(),
+        Err(err) if is_keychain_unavailable(&err) => {
+            Err(err).context("Keychain is unavailable and no existing file master key was found")
+        }
         Err(err) => Err(err),
     }
 }
@@ -475,24 +479,26 @@ fn load_auto_master_key() -> anyhow::Result<MasterKey> {
 
 #[cfg(target_os = "macos")]
 fn import_auto_master_key(key: &[u8; MASTER_KEY_BYTES], force: bool) -> anyhow::Result<()> {
-    let file = FileStore::new(default_master_key_path()?);
     let keychain = KeychainStore::new();
+    let file = auto_file_store()?;
 
-    if file.path().exists() {
-        file.import(key, force)
-            .context("failed to store imported master key in file store")?;
-        return match keychain.import(key, true) {
-            Ok(()) => Ok(()),
-            Err(err) if is_keychain_unavailable(&err) => Ok(()),
-            Err(err) => Err(err).context("failed to mirror imported master key to Keychain"),
-        };
+    if let Some(file) = file.as_ref().filter(|store| store.path().exists()) {
+        if !force {
+            bail!("master key already exists");
+        }
+
+        keychain
+            .import(key, true)
+            .context("failed to store imported master key in Keychain")?;
+        return file
+            .import(key, true)
+            .context("failed to store imported master key in file store");
     }
 
     match keychain.import(key, force) {
         Ok(()) => Ok(()),
-        Err(err) if is_keychain_unavailable(&err) => FileStore::new(default_master_key_path()?)
-            .import(key, force)
-            .context("failed to store imported master key in file store"),
+        Err(err) if is_keychain_unavailable(&err) => Err(err)
+            .context("Keychain is unavailable; use --store file to import into file storage"),
         Err(err) => Err(err),
     }
 }
@@ -503,9 +509,19 @@ fn import_auto_master_key(key: &[u8; MASTER_KEY_BYTES], force: bool) -> anyhow::
 }
 
 #[cfg(target_os = "macos")]
-fn load_existing_file_master_key(file: &FileStore) -> anyhow::Result<Option<MasterKey>> {
-    if file.path().exists() {
-        return file.get().map(Some);
+fn auto_file_store() -> anyhow::Result<Option<FileStore>> {
+    if env::var_os("AVAULT_HOME").is_some() || env::var_os("HOME").is_some() {
+        return default_master_key_path().map(FileStore::new).map(Some);
+    }
+    Ok(None)
+}
+
+#[cfg(target_os = "macos")]
+fn load_existing_file_master_key(file: Option<&FileStore>) -> anyhow::Result<Option<MasterKey>> {
+    if let Some(file) = file {
+        if file.path().exists() {
+            return file.get().map(Some);
+        }
     }
     Ok(None)
 }
@@ -548,15 +564,10 @@ fn migrate_file_key_to_keychain(
 }
 
 #[cfg(target_os = "macos")]
-fn create_keychain_key_or_fallback_file(
-    keychain: &KeychainStore,
-    file: &FileStore,
-    key: MasterKey,
-) -> anyhow::Result<MasterKey> {
+fn create_keychain_key(keychain: &KeychainStore, key: MasterKey) -> anyhow::Result<MasterKey> {
     match keychain.create_noclobber(key.as_bytes()) {
         Ok(()) => Ok(key),
         Err(err) if is_keychain_duplicate(&err) => keychain.get(),
-        Err(err) if is_keychain_unavailable(&err) => file.get_or_create(),
         Err(err) => Err(err).context("failed to create master key in Keychain"),
     }
 }
@@ -1695,10 +1706,8 @@ fn system_page_size() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(not(target_os = "macos"))]
     use std::sync::Mutex;
 
-    #[cfg(not(target_os = "macos"))]
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn nested_store(tmp: &tempfile::TempDir) -> FileStore {
@@ -1860,6 +1869,27 @@ mod tests {
 
         #[cfg(not(target_os = "macos"))]
         assert_eq!(default_backend(), Backend::File);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn auto_file_store_is_optional_without_home_on_macos() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous_avault_home = env::var_os("AVAULT_HOME");
+        let previous_home = env::var_os("HOME");
+        env::remove_var("AVAULT_HOME");
+        env::remove_var("HOME");
+
+        assert!(auto_file_store().unwrap().is_none());
+
+        match previous_avault_home {
+            Some(home) => env::set_var("AVAULT_HOME", home),
+            None => env::remove_var("AVAULT_HOME"),
+        }
+        match previous_home {
+            Some(home) => env::set_var("HOME", home),
+            None => env::remove_var("HOME"),
+        }
     }
 
     #[cfg(not(target_os = "macos"))]

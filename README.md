@@ -56,9 +56,10 @@ generic-password item (`bot.avibe.avault` / `standard-master-key`), while other
 hosts use the file-store fallback until their hardware store is implemented. When
 upgrading an existing macOS install that already has `machine.key`, `auto` first
 loads that file key and mirrors it into Keychain instead of minting a replacement
-master key. If Keychain is unavailable in a headless session, `auto` continues to
-use the file-store fallback. If both stores exist but disagree, `auto` refuses to
-choose silently.
+master key. If Keychain is unavailable, `auto` only uses the file fallback when an
+existing file key is already present; it will not mint a second root that could
+diverge from an inaccessible Keychain item. If both stores exist but disagree,
+`auto` refuses to choose silently.
 
 The Keychain item intentionally has no user-presence / biometry access-control
 flag, so it stays suitable for headless standard-tier use after the OS session is
