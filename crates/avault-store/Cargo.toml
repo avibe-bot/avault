@@ -23,6 +23,9 @@ serde_json.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+tss-esapi.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",

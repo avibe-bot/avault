@@ -70,13 +70,14 @@ not a per-use Touch ID / passcode policy. Select `--store file` (or
 
 On Linux, the TPM backend stores `$AVAULT_HOME/machine.tpm.json` (or
 `$HOME/.avibe/state/vault/machine.tpm.json`) containing only TPM2 public/private
-sealed-object blobs. The plaintext master key is fed to `tpm2_create` over stdin
-on creation/import and is recovered with `tpm2_load` + `tpm2_unseal` on use. This
-requires a TPM 2.0 device and `tpm2-tools` on PATH. It does not attach PCR,
-password, PIN, or user-presence policy, so standard-tier use remains headless
-while the OS user has TPM access. Select `--store tpm` (or `AVAULT_STORE=tpm`) to
-require this backend explicitly; `auto` falls back to the file store when TPM is
-unavailable.
+sealed-object blobs. The plaintext master key is sealed and unsealed in-process
+through TSS/ESAPI; it is not passed to `tpm2-tools` or another subprocess. This
+requires a TPM 2.0 device reachable through the system TCTI configuration
+(`TCTI` / `TPM2TOOLS_TCTI`, defaulting to `/dev/tpmrm0` then `/dev/tpm0`). It
+does not attach PCR, password, PIN, or user-presence policy, so standard-tier use
+remains headless while the OS user has TPM access. Select `--store tpm` (or
+`AVAULT_STORE=tpm`) to require this backend explicitly; `auto` falls back to the
+file store when TPM is unavailable.
 
 The file store uses `$AVAULT_HOME/machine.key` when `AVAULT_HOME` is set, or
 `$HOME/.avibe/state/vault/machine.key` by default, matching the P0 Python

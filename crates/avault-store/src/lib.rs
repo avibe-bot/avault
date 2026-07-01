@@ -17,8 +17,6 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::env;
-#[cfg(target_os = "linux")]
-use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 #[cfg(unix)]
@@ -26,10 +24,29 @@ use std::os::fd::{AsFd, AsRawFd};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-#[cfg(target_os = "linux")]
-use std::process::{Command, Output, Stdio};
 use std::ptr::NonNull;
 use zeroize::{Zeroize, Zeroizing};
+
+#[cfg(target_os = "linux")]
+use std::convert::TryFrom;
+#[cfg(target_os = "linux")]
+use std::str::FromStr;
+#[cfg(target_os = "linux")]
+use tss_esapi::{
+    attributes::ObjectAttributesBuilder,
+    handles::ObjectHandle,
+    interface_types::{
+        algorithm::{HashingAlgorithm, PublicAlgorithm},
+        reserved_handles::Hierarchy,
+    },
+    structures::{
+        CreatePrimaryKeyResult, Digest, KeyedHashScheme, Private, Public, PublicBuilder,
+        PublicKeyedHashParameters, SensitiveData, SymmetricCipherParameters,
+        SymmetricDefinitionObject,
+    },
+    traits::{Marshall, UnMarshall},
+    Context as TpmContext, TctiNameConf,
+};
 
 #[cfg(target_os = "macos")]
 use security_framework::base::Error as KeychainError;
@@ -546,19 +563,26 @@ fn import_auto_master_key(key: &[u8; MASTER_KEY_BYTES], force: bool) -> anyhow::
 
 #[cfg(target_os = "linux")]
 fn load_or_create_linux_auto_master_key() -> anyhow::Result<MasterKey> {
+    load_or_create_linux_auto_master_key_with_tpm_backend(&EsapiTpmBackend)
+}
+
+#[cfg(target_os = "linux")]
+fn load_or_create_linux_auto_master_key_with_tpm_backend(
+    backend: &impl TpmBackend,
+) -> anyhow::Result<MasterKey> {
     let tpm = TpmStore::new(default_tpm_master_key_path()?);
     let file = FileStore::new(default_master_key_path()?);
 
     if file.path().exists() {
         let file_key = file.get()?;
-        return migrate_file_key_to_tpm(&tpm, file_key);
+        return migrate_file_key_to_tpm_with_backend(&tpm, backend, file_key);
     }
 
     if tpm.path().exists() {
-        return tpm.get();
+        return tpm.get_with(backend);
     }
 
-    match tpm.get_or_create() {
+    match tpm.get_or_create_with(backend) {
         Ok(key) => Ok(key),
         Err(err) if is_tpm_unavailable(&err) => file.get_or_create(),
         Err(err) => Err(err),
@@ -567,19 +591,35 @@ fn load_or_create_linux_auto_master_key() -> anyhow::Result<MasterKey> {
 
 #[cfg(target_os = "linux")]
 fn load_linux_auto_master_key() -> anyhow::Result<MasterKey> {
+    load_linux_auto_master_key_with_tpm_backend(&EsapiTpmBackend)
+}
+
+#[cfg(target_os = "linux")]
+fn load_linux_auto_master_key_with_tpm_backend(
+    backend: &impl TpmBackend,
+) -> anyhow::Result<MasterKey> {
     let tpm = TpmStore::new(default_tpm_master_key_path()?);
     let file = FileStore::new(default_master_key_path()?);
 
     if file.path().exists() {
         let file_key = file.get()?;
-        return migrate_file_key_to_tpm(&tpm, file_key);
+        return migrate_file_key_to_tpm_with_backend(&tpm, backend, file_key);
     }
 
-    tpm.get()
+    tpm.get_with(backend)
 }
 
 #[cfg(target_os = "linux")]
 fn import_linux_auto_master_key(key: &[u8; MASTER_KEY_BYTES], force: bool) -> anyhow::Result<()> {
+    import_linux_auto_master_key_with_tpm_backend(&EsapiTpmBackend, key, force)
+}
+
+#[cfg(target_os = "linux")]
+fn import_linux_auto_master_key_with_tpm_backend(
+    backend: &impl TpmBackend,
+    key: &[u8; MASTER_KEY_BYTES],
+    force: bool,
+) -> anyhow::Result<()> {
     let tpm = TpmStore::new(default_tpm_master_key_path()?);
     let file = FileStore::new(default_master_key_path()?);
 
@@ -588,7 +628,7 @@ fn import_linux_auto_master_key(key: &[u8; MASTER_KEY_BYTES], force: bool) -> an
             bail!("master key already exists");
         }
 
-        match tpm.import(key, true) {
+        match tpm.import_with(backend, key, true) {
             Ok(()) => {}
             Err(err) if is_tpm_unavailable(&err) && !tpm.path().exists() => {}
             Err(err) => return Err(err).context("failed to store imported master key with TPM"),
@@ -598,9 +638,9 @@ fn import_linux_auto_master_key(key: &[u8; MASTER_KEY_BYTES], force: bool) -> an
             .context("failed to store imported master key in file store");
     }
 
-    match tpm.import(key, force) {
+    match tpm.import_with(backend, key, force) {
         Ok(()) => Ok(()),
-        Err(err) if is_tpm_unavailable(&err) => file
+        Err(err) if is_tpm_unavailable(&err) && !tpm.path().exists() => file
             .import(key, force)
             .context("TPM is unavailable; failed to import into file storage"),
         Err(err) => Err(err),
@@ -608,8 +648,12 @@ fn import_linux_auto_master_key(key: &[u8; MASTER_KEY_BYTES], force: bool) -> an
 }
 
 #[cfg(target_os = "linux")]
-fn migrate_file_key_to_tpm(tpm: &TpmStore, file_key: MasterKey) -> anyhow::Result<MasterKey> {
-    match tpm.get() {
+fn migrate_file_key_to_tpm_with_backend(
+    tpm: &TpmStore,
+    backend: &impl TpmBackend,
+    file_key: MasterKey,
+) -> anyhow::Result<MasterKey> {
+    match tpm.get_with(backend) {
         Ok(tpm_key) => {
             if tpm_key.as_bytes() == file_key.as_bytes() {
                 Ok(tpm_key)
@@ -619,19 +663,21 @@ fn migrate_file_key_to_tpm(tpm: &TpmStore, file_key: MasterKey) -> anyhow::Resul
                 )
             }
         }
-        Err(err) if is_not_found_error(&err) => match tpm.create_noclobber(file_key.as_bytes()) {
-            Ok(()) => Ok(file_key),
-            Err(err) if is_already_exists_error(&err) => {
-                let tpm_key = tpm.get()?;
-                if tpm_key.as_bytes() == file_key.as_bytes() {
-                    Ok(tpm_key)
-                } else {
-                    bail!("file master key differs from concurrently created TPM master key")
+        Err(err) if is_not_found_error(&err) => {
+            match tpm.create_noclobber_with(backend, file_key.as_bytes()) {
+                Ok(()) => Ok(file_key),
+                Err(err) if is_already_exists_error(&err) => {
+                    let tpm_key = tpm.get_with(backend)?;
+                    if tpm_key.as_bytes() == file_key.as_bytes() {
+                        Ok(tpm_key)
+                    } else {
+                        bail!("file master key differs from concurrently created TPM master key")
+                    }
                 }
+                Err(err) if is_tpm_unavailable(&err) => Ok(file_key),
+                Err(err) => Err(err).context("failed to migrate file master key to TPM"),
             }
-            Err(err) if is_tpm_unavailable(&err) => Ok(file_key),
-            Err(err) => Err(err).context("failed to migrate file master key to TPM"),
-        },
+        }
         Err(err) if is_tpm_unavailable(&err) => Ok(file_key),
         Err(err) => Err(err),
     }
@@ -864,13 +910,17 @@ impl TpmStore {
 impl TpmStore {
     /// Return the master key, creating a TPM-sealed blob if missing.
     pub fn get_or_create(&self) -> anyhow::Result<MasterKey> {
-        match self.get() {
+        self.get_or_create_with(&EsapiTpmBackend)
+    }
+
+    fn get_or_create_with(&self, backend: &impl TpmBackend) -> anyhow::Result<MasterKey> {
+        match self.get_with(backend) {
             Ok(key) => Ok(key),
             Err(err) if is_not_found_error(&err) => {
                 let key = MasterKey::generate_locked()?;
-                match self.create_noclobber(key.as_bytes()) {
+                match self.create_noclobber_with(backend, key.as_bytes()) {
                     Ok(()) => Ok(key),
-                    Err(err) if is_already_exists_error(&err) => self.get(),
+                    Err(err) if is_already_exists_error(&err) => self.get_with(backend),
                     Err(err) => Err(err).context("failed to store master key with TPM"),
                 }
             }
@@ -880,13 +930,17 @@ impl TpmStore {
 
     /// Return the existing TPM-sealed master key.
     pub fn get(&self) -> anyhow::Result<MasterKey> {
+        self.get_with(&EsapiTpmBackend)
+    }
+
+    fn get_with(&self, backend: &impl TpmBackend) -> anyhow::Result<MasterKey> {
         harden_process_memory();
         validate_parent_directory_mode(&self.path)?;
         validate_file_mode(&self.path)?;
         let bytes = fs::read(&self.path).context("TPM master key not found")?;
         let blob: TpmMasterBlob =
             serde_json::from_slice(&bytes).context("TPM master key JSON is invalid")?;
-        let mut key = unseal_tpm_master(&blob)?;
+        let mut key = backend.unseal_master_key(&blob)?;
         let locked = MasterKey::from_bytes(&key).context("failed to lock TPM master key")?;
         key.zeroize();
         Ok(locked)
@@ -894,26 +948,43 @@ impl TpmStore {
 
     /// Import a master key into TPM storage, refusing to overwrite unless `force` is true.
     pub fn import(&self, key: &[u8; MASTER_KEY_BYTES], force: bool) -> anyhow::Result<()> {
+        self.import_with(&EsapiTpmBackend, key, force)
+    }
+
+    fn import_with(
+        &self,
+        backend: &impl TpmBackend,
+        key: &[u8; MASTER_KEY_BYTES],
+        force: bool,
+    ) -> anyhow::Result<()> {
         self.ensure_parent()?;
         if self.path.exists() && !force {
             bail!("master key already exists");
         }
         if force {
-            self.create_force(key)
+            self.create_force_with(backend, key)
         } else {
-            self.create_noclobber(key)
+            self.create_noclobber_with(backend, key)
         }
     }
 
-    fn create_noclobber(&self, key: &[u8; MASTER_KEY_BYTES]) -> anyhow::Result<()> {
+    fn create_noclobber_with(
+        &self,
+        backend: &impl TpmBackend,
+        key: &[u8; MASTER_KEY_BYTES],
+    ) -> anyhow::Result<()> {
         self.ensure_parent()?;
-        let blob = seal_tpm_master(key)?;
+        let blob = backend.seal_master_key(key)?;
         write_tpm_blob(&self.path, &blob, false)
     }
 
-    fn create_force(&self, key: &[u8; MASTER_KEY_BYTES]) -> anyhow::Result<()> {
+    fn create_force_with(
+        &self,
+        backend: &impl TpmBackend,
+        key: &[u8; MASTER_KEY_BYTES],
+    ) -> anyhow::Result<()> {
         self.ensure_parent()?;
-        let blob = seal_tpm_master(key)?;
+        let blob = backend.seal_master_key(key)?;
         write_tpm_blob(&self.path, &blob, true)
     }
 
@@ -949,116 +1020,201 @@ pub struct TpmMasterBlob {
 }
 
 #[cfg(target_os = "linux")]
-fn seal_tpm_master(master_key: &[u8; MASTER_KEY_BYTES]) -> anyhow::Result<TpmMasterBlob> {
-    with_tpm_tempdir(|dir| {
-        let primary = dir.join("primary.ctx");
-        let sealed_public = dir.join("sealed.pub");
-        let sealed_private = dir.join("sealed.priv");
+trait TpmBackend {
+    fn seal_master_key(&self, master_key: &[u8; MASTER_KEY_BYTES])
+        -> anyhow::Result<TpmMasterBlob>;
 
-        run_tpm_command(
-            "tpm2_createprimary",
-            &[
-                str_arg("-C"),
-                str_arg("o"),
-                str_arg("-c"),
-                path_arg(&primary),
-            ],
-            None,
-        )
-        .context("failed to create TPM primary context")?;
-        let result =
-            run_tpm_command(
-                "tpm2_create",
-                &[
-                    str_arg("-C"),
-                    path_arg(&primary),
-                    str_arg("-i"),
-                    str_arg("-"),
-                    str_arg("-u"),
-                    path_arg(&sealed_public),
-                    str_arg("-r"),
-                    path_arg(&sealed_private),
-                ],
-                Some(master_key),
-            )
-            .context("failed to seal master key with TPM")
-            .and_then(|_| {
-                Ok(TpmMasterBlob {
-                    scheme: TPM_STORE_SCHEME.to_string(),
-                    hierarchy: "owner".to_string(),
-                    public: b64(
-                        &fs::read(&sealed_public).context("failed to read TPM public blob")?
-                    ),
-                    private: b64(
-                        &fs::read(&sealed_private).context("failed to read TPM private blob")?
-                    ),
-                })
-            });
-        flush_tpm_context(&primary);
-        result
-    })
+    fn unseal_master_key(
+        &self,
+        blob: &TpmMasterBlob,
+    ) -> anyhow::Result<Zeroizing<[u8; MASTER_KEY_BYTES]>>;
 }
 
 #[cfg(target_os = "linux")]
-fn unseal_tpm_master(blob: &TpmMasterBlob) -> anyhow::Result<Zeroizing<[u8; MASTER_KEY_BYTES]>> {
+struct EsapiTpmBackend;
+
+#[cfg(target_os = "linux")]
+impl TpmBackend for EsapiTpmBackend {
+    fn seal_master_key(
+        &self,
+        master_key: &[u8; MASTER_KEY_BYTES],
+    ) -> anyhow::Result<TpmMasterBlob> {
+        let mut context = open_tpm_context()?;
+        context.execute_with_nullauth_session(|ctx| {
+            with_tpm_primary(ctx, |ctx, primary| {
+                let sensitive_data =
+                    SensitiveData::try_from(master_key.to_vec()).context("invalid TPM secret")?;
+                let created = ctx
+                    .create(
+                        primary.key_handle,
+                        sealed_data_public_template()?,
+                        None,
+                        Some(sensitive_data),
+                        None,
+                        None,
+                    )
+                    .context("failed to seal master key with TPM")?;
+
+                Ok(TpmMasterBlob {
+                    scheme: TPM_STORE_SCHEME.to_string(),
+                    hierarchy: "owner".to_string(),
+                    public: b64(&created
+                        .out_public
+                        .marshall()
+                        .context("failed to marshal TPM public blob")?),
+                    private: b64(&created
+                        .out_private
+                        .marshall()
+                        .context("failed to marshal TPM private blob")?),
+                })
+            })
+        })
+    }
+
+    fn unseal_master_key(
+        &self,
+        blob: &TpmMasterBlob,
+    ) -> anyhow::Result<Zeroizing<[u8; MASTER_KEY_BYTES]>> {
+        validate_tpm_blob(blob)?;
+        let mut public_blob = Zeroizing::new(unb64(&blob.public, "public")?);
+        let mut private_blob = Zeroizing::new(unb64(&blob.private, "private")?);
+        let public = Public::unmarshall(public_blob.as_slice())
+            .context("failed to unmarshal TPM public blob")?;
+        let private = Private::unmarshall(private_blob.as_slice())
+            .context("failed to unmarshal TPM private blob")?;
+        public_blob.zeroize();
+        private_blob.zeroize();
+
+        let mut context = open_tpm_context()?;
+        context.execute_with_nullauth_session(|ctx| {
+            with_tpm_primary(ctx, |ctx, primary| {
+                let sealed = ctx
+                    .load(primary.key_handle, private, public)
+                    .context("failed to load TPM master key blob")?;
+                let sealed_handle: ObjectHandle = sealed.into();
+                let result = ctx
+                    .unseal(sealed_handle)
+                    .context("failed to unseal TPM master key")
+                    .and_then(|unsealed| {
+                        let bytes = unsealed.as_bytes();
+                        if bytes.len() != MASTER_KEY_BYTES {
+                            bail!("unsealed TPM master key has invalid length");
+                        }
+                        let mut out = Zeroizing::new([0u8; MASTER_KEY_BYTES]);
+                        out.as_mut().copy_from_slice(bytes);
+                        Ok(out)
+                    });
+                flush_tpm_object(ctx, sealed_handle)
+                    .context("failed to flush TPM sealed object")?;
+                result
+            })
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn validate_tpm_blob(blob: &TpmMasterBlob) -> anyhow::Result<()> {
     if blob.scheme != TPM_STORE_SCHEME || blob.hierarchy != "owner" {
         bail!("unrecognized TPM master key");
     }
-    with_tpm_tempdir(|dir| {
-        let primary = dir.join("primary.ctx");
-        let sealed = dir.join("sealed.ctx");
-        let sealed_public = dir.join("sealed.pub");
-        let sealed_private = dir.join("sealed.priv");
-        let public = unb64(&blob.public, "public")?;
-        let private = unb64(&blob.private, "private")?;
-        fs::write(&sealed_public, public).context("failed to stage TPM public blob")?;
-        fs::write(&sealed_private, private).context("failed to stage TPM private blob")?;
-        secure_created_file(&sealed_public, CreatedFileOwner::SetCurrentUser)
-            .context("failed to secure TPM public blob")?;
-        secure_created_file(&sealed_private, CreatedFileOwner::SetCurrentUser)
-            .context("failed to secure TPM private blob")?;
+    Ok(())
+}
 
-        run_tpm_command(
-            "tpm2_createprimary",
-            &[
-                str_arg("-C"),
-                str_arg("o"),
-                str_arg("-c"),
-                path_arg(&primary),
-            ],
+#[cfg(target_os = "linux")]
+fn open_tpm_context() -> anyhow::Result<TpmContext> {
+    let tcti = if env::var_os("TPM2TOOLS_TCTI").is_some()
+        || env::var_os("TCTI").is_some()
+        || env::var_os("TEST_TCTI").is_some()
+    {
+        TctiNameConf::from_environment_variable().context("invalid TPM TCTI configuration")?
+    } else if Path::new("/dev/tpmrm0").exists() {
+        TctiNameConf::from_str("device:/dev/tpmrm0").context("invalid TPM device path")?
+    } else {
+        TctiNameConf::from_str("device:/dev/tpm0").context("invalid TPM device path")?
+    };
+
+    TpmContext::new(tcti).context("failed to initialize TPM context")
+}
+
+#[cfg(target_os = "linux")]
+fn with_tpm_primary<T>(
+    context: &mut TpmContext,
+    f: impl FnOnce(&mut TpmContext, CreatePrimaryKeyResult) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let primary = create_tpm_primary(context)?;
+    let primary_handle: ObjectHandle = primary.key_handle.into();
+    let result = f(context, primary);
+    let flush_result =
+        flush_tpm_object(context, primary_handle).context("failed to flush TPM primary context");
+
+    match (result, flush_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(err), _) => Err(err),
+        (Ok(_), Err(err)) => Err(err),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn flush_tpm_object(context: &mut TpmContext, handle: ObjectHandle) -> anyhow::Result<()> {
+    context.flush_context(handle).map_err(Into::into)
+}
+
+#[cfg(target_os = "linux")]
+fn create_tpm_primary(context: &mut TpmContext) -> anyhow::Result<CreatePrimaryKeyResult> {
+    context
+        .create_primary(
+            Hierarchy::Owner,
+            primary_public_template()?,
+            None,
+            None,
+            None,
             None,
         )
-        .context("failed to create TPM primary context")?;
-        let result = run_tpm_command(
-            "tpm2_load",
-            &[
-                str_arg("-C"),
-                path_arg(&primary),
-                str_arg("-u"),
-                path_arg(&sealed_public),
-                str_arg("-r"),
-                path_arg(&sealed_private),
-                str_arg("-c"),
-                path_arg(&sealed),
-            ],
-            None,
-        )
-        .context("failed to load TPM master key blob");
-        let result = result.and_then(|_| {
-            let bytes = run_tpm_command("tpm2_unseal", &[str_arg("-c"), path_arg(&sealed)], None)
-                .context("failed to unseal TPM master key")?
-                .stdout;
-            if bytes.len() != MASTER_KEY_BYTES {
-                bail!("unsealed TPM master key has invalid length");
-            }
-            let mut out = Zeroizing::new([0u8; MASTER_KEY_BYTES]);
-            out.as_mut().copy_from_slice(&bytes);
-            Ok(out)
-        });
-        flush_tpm_context(&sealed);
-        flush_tpm_context(&primary);
-        result
-    })
+        .context("failed to create TPM primary context")
+}
+
+#[cfg(target_os = "linux")]
+fn primary_public_template() -> anyhow::Result<Public> {
+    let attributes = ObjectAttributesBuilder::new()
+        .with_fixed_tpm(true)
+        .with_fixed_parent(true)
+        .with_sensitive_data_origin(true)
+        .with_user_with_auth(true)
+        .with_decrypt(true)
+        .with_restricted(true)
+        .build()
+        .context("failed to build TPM primary attributes")?;
+
+    PublicBuilder::new()
+        .with_public_algorithm(PublicAlgorithm::SymCipher)
+        .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
+        .with_object_attributes(attributes)
+        .with_symmetric_cipher_parameters(SymmetricCipherParameters::new(
+            SymmetricDefinitionObject::AES_128_CFB,
+        ))
+        .with_symmetric_cipher_unique_identifier(Digest::default())
+        .build()
+        .context("failed to build TPM primary template")
+}
+
+#[cfg(target_os = "linux")]
+fn sealed_data_public_template() -> anyhow::Result<Public> {
+    let attributes = ObjectAttributesBuilder::new()
+        .with_fixed_tpm(true)
+        .with_fixed_parent(true)
+        .with_user_with_auth(true)
+        .build()
+        .context("failed to build TPM sealed-object attributes")?;
+
+    PublicBuilder::new()
+        .with_public_algorithm(PublicAlgorithm::KeyedHash)
+        .with_name_hashing_algorithm(HashingAlgorithm::Sha256)
+        .with_object_attributes(attributes)
+        .with_auth_policy(Digest::default())
+        .with_keyed_hash_parameters(PublicKeyedHashParameters::new(KeyedHashScheme::Null))
+        .with_keyed_hash_unique_identifier(Digest::default())
+        .build()
+        .context("failed to build TPM sealed-object template")
 }
 
 #[cfg(target_os = "linux")]
@@ -1089,103 +1245,20 @@ fn write_tpm_blob(path: &Path, blob: &TpmMasterBlob, force: bool) -> anyhow::Res
 }
 
 #[cfg(target_os = "linux")]
-fn with_tpm_tempdir<T>(f: impl FnOnce(&Path) -> anyhow::Result<T>) -> anyhow::Result<T> {
-    let tmp = tempfile::Builder::new()
-        .prefix(".avault-tpm.")
-        .tempdir()
-        .context("failed to create TPM temporary directory")?;
-    secure_created_directory(tmp.path()).context("failed to secure TPM temporary directory")?;
-    f(tmp.path())
-}
-
-#[cfg(target_os = "linux")]
-fn run_tpm_command(
-    program: &str,
-    args: &[OsString],
-    stdin_bytes: Option<&[u8]>,
-) -> anyhow::Result<Output> {
-    let mut command = Command::new(tpm_program(program));
-    command.args(args);
-    command.stdin(if stdin_bytes.is_some() {
-        Stdio::piped()
-    } else {
-        Stdio::null()
-    });
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::piped());
-
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("failed to start {program}"))?;
-    if let Some(bytes) = stdin_bytes {
-        let mut stdin = child
-            .stdin
-            .take()
-            .context("failed to open TPM command stdin")?;
-        stdin
-            .write_all(bytes)
-            .context("failed to write TPM command stdin")?;
-    }
-    let output = child
-        .wait_with_output()
-        .with_context(|| format!("failed to wait for {program}"))?;
-    if !output.status.success() {
-        return Err(tpm_command_error(program, &output));
-    }
-    Ok(output)
-}
-
-#[cfg(target_os = "linux")]
-fn tpm_program(program: &str) -> OsString {
-    match env::var_os("AVAULT_TPM2_TOOLS_DIR") {
-        Some(dir) => PathBuf::from(dir).join(program).into_os_string(),
-        None => OsString::from(program),
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn str_arg(value: &str) -> OsString {
-    OsString::from(value)
-}
-
-#[cfg(target_os = "linux")]
-fn path_arg(path: &Path) -> OsString {
-    path.as_os_str().to_os_string()
-}
-
-#[cfg(target_os = "linux")]
-fn tpm_command_error(program: &str, output: &Output) -> anyhow::Error {
-    let status = output
-        .status
-        .code()
-        .map(|code| code.to_string())
-        .unwrap_or_else(|| "signal".to_string());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stderr = stderr.trim();
-    if stderr.is_empty() {
-        anyhow!("{program} failed with status {status}")
-    } else {
-        anyhow!("{program} failed with status {status}: {stderr}")
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn flush_tpm_context(path: &Path) {
-    let _ = run_tpm_command("tpm2_flushcontext", &[path_arg(path)], None);
-}
-
-#[cfg(target_os = "linux")]
 fn is_tpm_unavailable(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         let text = cause.to_string();
-        text.contains("failed to start tpm2_")
-            || text.contains("/dev/tpm")
+        text.contains("/dev/tpm")
             || text.contains("/dev/tpmrm")
             || text.contains("TCTI")
             || text.contains("tcti")
+            || text.contains("TPM context")
             || text.contains("TPM device")
             || text.contains("TPM not found")
             || text.contains("No TPM")
+            || text.contains("No such device")
+            || text.contains("No such file or directory")
+            || text.contains("Unknown or unusable TCTI")
     })
 }
 
@@ -2415,70 +2488,6 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn install_fake_tpm2_tools(dir: &Path) {
-        fs::create_dir_all(dir).unwrap();
-        write_fake_tpm2_tool(
-            dir,
-            "tpm2_createprimary",
-            r#"#!/usr/bin/env python3
-import pathlib, sys
-args = sys.argv[1:]
-path = pathlib.Path(args[args.index("-c") + 1])
-path.write_bytes(b"primary")
-"#,
-        );
-        write_fake_tpm2_tool(
-            dir,
-            "tpm2_create",
-            r#"#!/usr/bin/env python3
-import pathlib, sys
-args = sys.argv[1:]
-input_arg = args[args.index("-i") + 1]
-data = sys.stdin.buffer.read() if input_arg == "-" else pathlib.Path(input_arg).read_bytes()
-pub = pathlib.Path(args[args.index("-u") + 1])
-priv = pathlib.Path(args[args.index("-r") + 1])
-pub.write_bytes(b"fake-tpm-public-v1")
-priv.write_bytes(bytes(byte ^ 0xA5 for byte in data))
-"#,
-        );
-        write_fake_tpm2_tool(
-            dir,
-            "tpm2_load",
-            r#"#!/usr/bin/env python3
-import pathlib, sys
-args = sys.argv[1:]
-priv = pathlib.Path(args[args.index("-r") + 1])
-ctx = pathlib.Path(args[args.index("-c") + 1])
-ctx.write_bytes(priv.read_bytes())
-"#,
-        );
-        write_fake_tpm2_tool(
-            dir,
-            "tpm2_unseal",
-            r#"#!/usr/bin/env python3
-import pathlib, sys
-args = sys.argv[1:]
-ctx = pathlib.Path(args[args.index("-c") + 1])
-sealed = ctx.read_bytes()
-sys.stdout.buffer.write(bytes(byte ^ 0xA5 for byte in sealed))
-"#,
-        );
-        write_fake_tpm2_tool(
-            dir,
-            "tpm2_flushcontext",
-            r#"#!/usr/bin/env python3
-"#,
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    fn write_fake_tpm2_tool(dir: &Path, name: &str, script: &str) {
-        let path = dir.join(name);
-        fs::write(&path, script).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
-    }
-
-    #[cfg(target_os = "linux")]
     fn restore_env_var(name: &str, previous: Option<std::ffi::OsString>) {
         match previous {
             Some(value) => env::set_var(name, value),
@@ -2487,19 +2496,73 @@ sys.stdout.buffer.write(bytes(byte ^ 0xA5 for byte in sealed))
     }
 
     #[cfg(target_os = "linux")]
+    struct FakeTpmBackend {
+        unavailable: bool,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl FakeTpmBackend {
+        fn available() -> Self {
+            Self { unavailable: false }
+        }
+
+        fn unavailable() -> Self {
+            Self { unavailable: true }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl TpmBackend for FakeTpmBackend {
+        fn seal_master_key(
+            &self,
+            master_key: &[u8; MASTER_KEY_BYTES],
+        ) -> anyhow::Result<TpmMasterBlob> {
+            if self.unavailable {
+                bail!("TPM device unavailable");
+            }
+            Ok(TpmMasterBlob {
+                scheme: TPM_STORE_SCHEME.to_string(),
+                hierarchy: "owner".to_string(),
+                public: b64(b"fake-esapi-public-v1"),
+                private: b64(&master_key
+                    .iter()
+                    .map(|byte| byte ^ 0xA5)
+                    .collect::<Vec<u8>>()),
+            })
+        }
+
+        fn unseal_master_key(
+            &self,
+            blob: &TpmMasterBlob,
+        ) -> anyhow::Result<Zeroizing<[u8; MASTER_KEY_BYTES]>> {
+            if self.unavailable {
+                bail!("TPM device unavailable");
+            }
+            validate_tpm_blob(blob)?;
+            let mut sealed = Zeroizing::new(unb64(&blob.private, "private")?);
+            if sealed.len() != MASTER_KEY_BYTES {
+                bail!("unsealed TPM master key has invalid length");
+            }
+            let mut out = Zeroizing::new([0u8; MASTER_KEY_BYTES]);
+            for (dest, source) in out.iter_mut().zip(sealed.iter()) {
+                *dest = source ^ 0xA5;
+            }
+            sealed.zeroize();
+            Ok(out)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn tpm_store_seals_and_unseals_master_key() {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        let tools = tmp.path().join("tools");
-        install_fake_tpm2_tools(&tools);
-        let previous_tools = env::var_os("AVAULT_TPM2_TOOLS_DIR");
-        env::set_var("AVAULT_TPM2_TOOLS_DIR", &tools);
+        let backend = FakeTpmBackend::available();
 
         let store = TpmStore::new(tmp.path().join("vault").join("machine.tpm.json"));
         let key = [0x4Au8; MASTER_KEY_BYTES];
-        store.import(&key, false).unwrap();
-        let loaded = store.get().unwrap();
+        store.import_with(&backend, &key, false).unwrap();
+        let loaded = store.get_with(&backend).unwrap();
 
         assert_eq!(loaded.as_bytes(), &key);
         let disk = fs::read(store.path()).unwrap();
@@ -2509,8 +2572,6 @@ sys.stdout.buffer.write(bytes(byte ^ 0xA5 for byte in sealed))
         assert_eq!(blob.hierarchy, "owner");
         assert!(!blob.public.is_empty());
         assert!(!blob.private.is_empty());
-
-        restore_env_var("AVAULT_TPM2_TOOLS_DIR", previous_tools);
     }
 
     #[cfg(target_os = "linux")]
@@ -2518,27 +2579,25 @@ sys.stdout.buffer.write(bytes(byte ^ 0xA5 for byte in sealed))
     fn auto_store_uses_tpm_on_linux_when_available() {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        let tools = tmp.path().join("tools");
-        install_fake_tpm2_tools(&tools);
+        let backend = FakeTpmBackend::available();
         let previous_home = env::var_os("AVAULT_HOME");
-        let previous_tools = env::var_os("AVAULT_TPM2_TOOLS_DIR");
         let vault_home = tmp.path().join("vault");
         env::set_var("AVAULT_HOME", &vault_home);
-        env::set_var("AVAULT_TPM2_TOOLS_DIR", &tools);
 
-        let key = load_or_create_master_key(Backend::Auto).unwrap();
+        let key = load_or_create_linux_auto_master_key_with_tpm_backend(&backend).unwrap();
         let tpm_path = default_tpm_master_key_path().unwrap();
         let file_path = default_master_key_path().unwrap();
 
         assert!(tpm_path.exists());
         assert!(!file_path.exists());
         assert_eq!(
-            load_master_key(Backend::Auto).unwrap().as_bytes(),
+            load_linux_auto_master_key_with_tpm_backend(&backend)
+                .unwrap()
+                .as_bytes(),
             key.as_bytes()
         );
 
         restore_env_var("AVAULT_HOME", previous_home);
-        restore_env_var("AVAULT_TPM2_TOOLS_DIR", previous_tools);
     }
 
     #[cfg(target_os = "linux")]
@@ -2546,13 +2605,12 @@ sys.stdout.buffer.write(bytes(byte ^ 0xA5 for byte in sealed))
     fn auto_store_falls_back_to_file_on_linux_when_tpm_is_unavailable() {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
+        let backend = FakeTpmBackend::unavailable();
         let previous_home = env::var_os("AVAULT_HOME");
-        let previous_tools = env::var_os("AVAULT_TPM2_TOOLS_DIR");
         let vault_home = tmp.path().join("vault");
         env::set_var("AVAULT_HOME", &vault_home);
-        env::set_var("AVAULT_TPM2_TOOLS_DIR", tmp.path().join("missing-tools"));
 
-        let key = load_or_create_master_key(Backend::Auto).unwrap();
+        let key = load_or_create_linux_auto_master_key_with_tpm_backend(&backend).unwrap();
         let tpm_path = default_tpm_master_key_path().unwrap();
         let file_path = default_master_key_path().unwrap();
 
@@ -2564,7 +2622,6 @@ sys.stdout.buffer.write(bytes(byte ^ 0xA5 for byte in sealed))
         );
 
         restore_env_var("AVAULT_HOME", previous_home);
-        restore_env_var("AVAULT_TPM2_TOOLS_DIR", previous_tools);
     }
 
     #[cfg(target_os = "linux")]
@@ -2572,26 +2629,22 @@ sys.stdout.buffer.write(bytes(byte ^ 0xA5 for byte in sealed))
     fn auto_store_migrates_existing_file_key_to_tpm_on_linux() {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        let tools = tmp.path().join("tools");
-        install_fake_tpm2_tools(&tools);
+        let backend = FakeTpmBackend::available();
         let previous_home = env::var_os("AVAULT_HOME");
-        let previous_tools = env::var_os("AVAULT_TPM2_TOOLS_DIR");
         let vault_home = tmp.path().join("vault");
         env::set_var("AVAULT_HOME", &vault_home);
-        env::set_var("AVAULT_TPM2_TOOLS_DIR", &tools);
 
         let file_key = [0x33u8; MASTER_KEY_BYTES];
         FileStore::new(default_master_key_path().unwrap())
             .import(&file_key, false)
             .unwrap();
-        let loaded = load_or_create_master_key(Backend::Auto).unwrap();
+        let loaded = load_or_create_linux_auto_master_key_with_tpm_backend(&backend).unwrap();
 
         assert_eq!(loaded.as_bytes(), &file_key);
         assert!(default_master_key_path().unwrap().exists());
         assert!(default_tpm_master_key_path().unwrap().exists());
 
         restore_env_var("AVAULT_HOME", previous_home);
-        restore_env_var("AVAULT_TPM2_TOOLS_DIR", previous_tools);
     }
 
     #[cfg(target_os = "linux")]
@@ -2599,29 +2652,57 @@ sys.stdout.buffer.write(bytes(byte ^ 0xA5 for byte in sealed))
     fn auto_store_rejects_file_and_tpm_mismatch_on_linux() {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        let tools = tmp.path().join("tools");
-        install_fake_tpm2_tools(&tools);
+        let backend = FakeTpmBackend::available();
         let previous_home = env::var_os("AVAULT_HOME");
-        let previous_tools = env::var_os("AVAULT_TPM2_TOOLS_DIR");
         let vault_home = tmp.path().join("vault");
         env::set_var("AVAULT_HOME", &vault_home);
-        env::set_var("AVAULT_TPM2_TOOLS_DIR", &tools);
 
         FileStore::new(default_master_key_path().unwrap())
             .import(&[0x11u8; MASTER_KEY_BYTES], false)
             .unwrap();
         TpmStore::new(default_tpm_master_key_path().unwrap())
-            .import(&[0x22u8; MASTER_KEY_BYTES], false)
+            .import_with(&backend, &[0x22u8; MASTER_KEY_BYTES], false)
             .unwrap();
 
-        let err = match load_or_create_master_key(Backend::Auto) {
+        let err = match load_or_create_linux_auto_master_key_with_tpm_backend(&backend) {
             Ok(_) => panic!("auto store accepted mismatched file and TPM keys"),
             Err(err) => err,
         };
         assert!(err.to_string().contains("differs from TPM master key"));
 
         restore_env_var("AVAULT_HOME", previous_home);
-        restore_env_var("AVAULT_TPM2_TOOLS_DIR", previous_tools);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn auto_import_refuses_file_fallback_when_tpm_blob_exists() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let available = FakeTpmBackend::available();
+        let unavailable = FakeTpmBackend::unavailable();
+        let previous_home = env::var_os("AVAULT_HOME");
+        let vault_home = tmp.path().join("vault");
+        env::set_var("AVAULT_HOME", &vault_home);
+
+        let tpm_key = [0x11u8; MASTER_KEY_BYTES];
+        let import_key = [0x22u8; MASTER_KEY_BYTES];
+        TpmStore::new(default_tpm_master_key_path().unwrap())
+            .import_with(&available, &tpm_key, false)
+            .unwrap();
+
+        let err = import_linux_auto_master_key_with_tpm_backend(&unavailable, &import_key, true)
+            .unwrap_err();
+        assert!(is_tpm_unavailable(&err));
+        assert!(!default_master_key_path().unwrap().exists());
+        assert_eq!(
+            TpmStore::new(default_tpm_master_key_path().unwrap())
+                .get_with(&available)
+                .unwrap()
+                .as_bytes(),
+            &tpm_key
+        );
+
+        restore_env_var("AVAULT_HOME", previous_home);
     }
 
     #[test]

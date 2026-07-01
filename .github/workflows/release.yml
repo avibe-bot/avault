@@ -32,13 +32,13 @@ jobs:
             strip: true
             required: true
           - target_name: linux-x64
-            rust_target: x86_64-unknown-linux-musl
+            rust_target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             binary: avault
             strip: true
             required: true
           - target_name: linux-arm64
-            rust_target: aarch64-unknown-linux-musl
+            rust_target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
             binary: avault
             strip: true
@@ -86,11 +86,24 @@ jobs:
             ${{ runner.os }}-${{ matrix.rust_target }}-cargo-
             ${{ runner.os }}-cargo-
 
-      - name: Install musl toolchain
-        if: contains(matrix.rust_target, 'unknown-linux-musl')
+      - name: Install Linux TPM build dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools
+          sudo apt-get install -y \
+            autoconf \
+            autoconf-archive \
+            automake \
+            build-essential \
+            git \
+            libcurl4-openssl-dev \
+            libjson-c-dev \
+            libltdl-dev \
+            libusb-1.0-0-dev \
+            libssl-dev \
+            libtool \
+            pkg-config \
+            uuid-dev
 
       - name: Install Rust target
         run: rustup target add "${{ matrix.rust_target }}"
