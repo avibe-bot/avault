@@ -37,14 +37,14 @@ jobs:
             binary: avault
             strip: true
             required: true
-            linux_container: rust:1.85-bullseye
+            linux_container: rust:1.86-bullseye
           - target_name: linux-arm64
             rust_target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
             binary: avault
             strip: true
             required: true
-            linux_container: rust:1.85-bullseye
+            linux_container: rust:1.86-bullseye
           - target_name: windows-x64
             rust_target: x86_64-pc-windows-msvc
             os: windows-latest
