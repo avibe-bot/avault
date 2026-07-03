@@ -49,8 +49,7 @@ pub struct BlindBox {
 pub struct BlindBoxContext {
     purpose: &'static str,
     name: String,
-    scope_type: Option<String>,
-    scope_ref: Option<String>,
+    grant_id: Option<String>,
     sign_scheme: Option<String>,
     digest: Option<[u8; KEY_BYTES]>,
     approval_nonce: Option<Vec<u8>>,
@@ -64,21 +63,20 @@ impl BlindBoxContext {
         Self::new(BLIND_BOX_PURPOSE_SEAL, name)
     }
 
-    /// Context for an agent grant that caches a delivery DEK under a scope.
-    pub fn agent_deliver(scope_type: &str, scope_ref: &str, name: &str) -> Self {
-        Self::new(BLIND_BOX_PURPOSE_AGENT_DELIVER, name).with_scope(scope_type, scope_ref)
+    /// Context for an agent grant that caches a delivery DEK under a grant id.
+    pub fn agent_deliver(grant_id: &str, name: &str) -> Self {
+        Self::new(BLIND_BOX_PURPOSE_AGENT_DELIVER, name).with_grant_id(grant_id)
     }
 
     /// Context for an agent grant that caches a signing DEK for one approved digest.
     pub fn agent_sign(
-        scope_type: &str,
-        scope_ref: &str,
+        grant_id: &str,
         name: &str,
         sign_scheme: &str,
         digest: &[u8; KEY_BYTES],
     ) -> Self {
         Self::new(BLIND_BOX_PURPOSE_AGENT_SIGN, name)
-            .with_scope(scope_type, scope_ref)
+            .with_grant_id(grant_id)
             .with_signing(sign_scheme, digest)
     }
 
@@ -86,8 +84,7 @@ impl BlindBoxContext {
         Self {
             purpose,
             name: name.to_string(),
-            scope_type: None,
-            scope_ref: None,
+            grant_id: None,
             sign_scheme: None,
             digest: None,
             approval_nonce: None,
@@ -96,9 +93,8 @@ impl BlindBoxContext {
         }
     }
 
-    fn with_scope(mut self, scope_type: &str, scope_ref: &str) -> Self {
-        self.scope_type = Some(scope_type.to_string());
-        self.scope_ref = Some(scope_ref.to_string());
+    fn with_grant_id(mut self, grant_id: &str) -> Self {
+        self.grant_id = Some(grant_id.to_string());
         self
     }
 
@@ -136,8 +132,8 @@ impl BlindBoxContext {
     ///
     /// Encoding:
     /// `BLIND_BOX_AAD_DOMAIN || field(purpose) || field(name) ||
-    /// field(WRAP_SCHEME) || field([WRAP_META_VERSION]) || field(scope_type or "")
-    /// || field(scope_ref or "") || field(sign_scheme or "") || field(digest or "")
+    /// field(WRAP_SCHEME) || field([WRAP_META_VERSION]) || field(grant_id or "")
+    /// || field("") || field(sign_scheme or "") || field(digest or "")
     /// || field(approval_nonce or "") || field(approval_expires_at_unix_be or "")
     /// || field(operation_hash or "")`,
     /// where `field(x) = uint32_be(len(x)) || x`.
@@ -148,11 +144,9 @@ impl BlindBoxContext {
         push_aad_field(&mut out, self.name.as_bytes());
         push_aad_field(&mut out, WRAP_SCHEME.as_bytes());
         push_aad_field(&mut out, &[WRAP_META_VERSION]);
-        push_aad_field(
-            &mut out,
-            self.scope_type.as_deref().unwrap_or("").as_bytes(),
-        );
-        push_aad_field(&mut out, self.scope_ref.as_deref().unwrap_or("").as_bytes());
+        push_aad_field(&mut out, self.grant_id.as_deref().unwrap_or("").as_bytes());
+        // Reserved empty field keeps the v1 AAD layout stable while grant_id is the only scope.
+        push_aad_field(&mut out, &[]);
         push_aad_field(
             &mut out,
             self.sign_scheme.as_deref().unwrap_or("").as_bytes(),
@@ -399,17 +393,16 @@ mod tests {
         for case in cases {
             let purpose = case["purpose"].as_str().unwrap();
             let name = case["name"].as_str().unwrap();
-            let scope_type = case["scope_type"].as_str().unwrap();
-            let scope_ref = case["scope_ref"].as_str().unwrap();
+            let grant_id = case["grant_id"].as_str().unwrap_or("");
             let sign_scheme = case["sign_scheme"].as_str().unwrap();
             let digest_hex = case["digest_hex"].as_str().unwrap();
             let mut context = match purpose {
                 "seal" => BlindBoxContext::seal(name),
-                "agent-deliver" => BlindBoxContext::agent_deliver(scope_type, scope_ref, name),
+                "agent-deliver" => BlindBoxContext::agent_deliver(grant_id, name),
                 "agent-sign" => {
                     let digest: [u8; KEY_BYTES] =
                         hex::decode(digest_hex).unwrap().try_into().unwrap();
-                    BlindBoxContext::agent_sign(scope_type, scope_ref, name, sign_scheme, &digest)
+                    BlindBoxContext::agent_sign(grant_id, name, sign_scheme, &digest)
                 }
                 _ => panic!("unexpected blind-box AAD vector purpose"),
             };
@@ -463,8 +456,7 @@ mod tests {
     fn rejects_wrong_blind_box_context() {
         let keypair = derive_blind_box_keypair_from_master(&MASTER_KEY);
         let context = BlindBoxContext::agent_sign(
-            "session",
-            "scope-a",
+            "gr_scope_a",
             "SIGNING_KEY",
             "ecdsa-secp256k1-recoverable",
             &[0x11u8; KEY_BYTES],
@@ -478,8 +470,7 @@ mod tests {
         )
         .unwrap();
         let wrong_digest = BlindBoxContext::agent_sign(
-            "session",
-            "scope-a",
+            "gr_scope_a",
             "SIGNING_KEY",
             "ecdsa-secp256k1-recoverable",
             &[0x22u8; KEY_BYTES],
@@ -489,7 +480,7 @@ mod tests {
         assert!(keypair
             .open(
                 &blind_box,
-                &BlindBoxContext::agent_deliver("session", "scope-a", "SIGNING_KEY")
+                &BlindBoxContext::agent_deliver("gr_scope_a", "SIGNING_KEY")
                     .with_approval(b"0123456789abcdef", 4_102_444_800),
             )
             .is_err());

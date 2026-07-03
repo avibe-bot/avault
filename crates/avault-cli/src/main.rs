@@ -533,6 +533,7 @@ fn deliver_run_cmd(
         let secrets = vec![EnvSecretInput {
             name: run_options.name,
             env: run_options.env_name,
+            tier: SecretTier::Standard,
             envelope: sealed,
             dek_blindbox: None,
             approval: None,
@@ -547,6 +548,8 @@ fn deliver_run_cmd(
 struct EnvSecretInput {
     name: String,
     env: String,
+    #[serde(default = "default_secret_tier")]
+    tier: SecretTier,
     envelope: Sealed,
     #[serde(default)]
     dek_blindbox: Option<BlindBox>,
@@ -557,6 +560,8 @@ struct EnvSecretInput {
 #[derive(Debug, Deserialize)]
 struct NamedSecretInput {
     name: String,
+    #[serde(default = "default_secret_tier")]
+    tier: SecretTier,
     #[serde(default)]
     env: Option<String>,
     #[serde(default)]
@@ -571,12 +576,25 @@ struct NamedSecretInput {
 #[derive(Debug, Deserialize)]
 struct FetchInput {
     name: String,
+    #[serde(default = "default_secret_tier")]
+    tier: SecretTier,
     envelope: Sealed,
     #[serde(default)]
     dek_blindbox: Option<BlindBox>,
     #[serde(default)]
     approval: Option<serde_json::Value>,
     request: FetchRequest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SecretTier {
+    Standard,
+    Protected,
+}
+
+fn default_secret_tier() -> SecretTier {
+    SecretTier::Standard
 }
 
 #[cfg(unix)]
@@ -888,6 +906,7 @@ fn open_env_secrets(
     let mut seen = BTreeSet::new();
     let master = load_existing_master_from_unlock(unlock)?;
     for secret in secrets {
+        ensure_one_shot_standard_tier(secret.tier)?;
         validate_shell_name(&secret.env, "env var name")?;
         if !seen.insert(secret.env.clone()) {
             bail!("duplicate env var name");
@@ -941,6 +960,13 @@ fn reject_one_shot_protected_fields(
     Ok(())
 }
 
+fn ensure_one_shot_standard_tier(tier: SecretTier) -> anyhow::Result<()> {
+    if tier != SecretTier::Standard {
+        bail!("one-shot delivery is standard-tier only");
+    }
+    Ok(())
+}
+
 impl Zeroize for OpenedSecret {
     fn zeroize(&mut self) {
         self.plaintext.zeroize();
@@ -960,6 +986,7 @@ fn deliver_fetch_cmd(
     let input = read_json_input(input, "failed to read deliver fetch JSON from stdin")?;
     let fetch: FetchInput =
         serde_json::from_slice(input.as_slice()).context("deliver fetch JSON is invalid")?;
+    ensure_one_shot_standard_tier(fetch.tier)?;
     let (_url, is_loopback) = validate_fetch_input(&fetch)?;
 
     let mut secret = open_one_shot_secret(
@@ -1303,6 +1330,7 @@ fn open_named_secrets(
     let mut seen = BTreeSet::new();
     let master = load_existing_master_from_unlock(unlock)?;
     for secret in secrets {
+        ensure_one_shot_standard_tier(secret.tier)?;
         let target_name = secret
             .key
             .or(secret.env)
@@ -2079,8 +2107,7 @@ fn user_home_dir() -> anyhow::Result<PathBuf> {
 #[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct GrantKey {
-    scope_type: String,
-    scope_ref: String,
+    grant_id: String,
 }
 
 #[cfg(unix)]
@@ -2122,18 +2149,24 @@ struct AgentState {
     used_grant_nonces: HashMap<Vec<u8>, Instant>,
     last_activity: Instant,
     idle_timeout: Duration,
-    _master: Option<MasterKey>,
+    standard_backend: Option<Backend>,
+    master: Option<MasterKey>,
 }
 
 #[cfg(unix)]
 impl AgentState {
-    fn new(idle_timeout: Duration, master: Option<MasterKey>) -> Self {
+    fn new(
+        idle_timeout: Duration,
+        standard_backend: Option<Backend>,
+        master: Option<MasterKey>,
+    ) -> Self {
         Self {
             grants: HashMap::new(),
             used_grant_nonces: HashMap::new(),
             last_activity: Instant::now(),
             idle_timeout,
-            _master: master,
+            standard_backend,
+            master,
         }
     }
 
@@ -2169,9 +2202,27 @@ impl AgentState {
 
     fn get_grant(&mut self, scope: &GrantKey) -> anyhow::Result<&GrantEntry> {
         self.purge();
-        self.grants
+        self.get_live_grant(scope)
+    }
+
+    fn get_live_grant(&self, scope: &GrantKey) -> anyhow::Result<&GrantEntry> {
+        let now = Instant::now();
+        if now.duration_since(self.last_activity) >= self.idle_timeout {
+            bail!("grant is missing or expired");
+        }
+        let grant = self
+            .grants
             .get(scope)
-            .context("grant is missing or expired")
+            .context("grant is missing or expired")?;
+        if grant.expires_at <= now {
+            bail!("grant is missing or expired");
+        }
+        Ok(grant)
+    }
+
+    fn require_live_grant(&self, scope: &GrantKey) -> anyhow::Result<()> {
+        self.get_live_grant(scope)?;
+        Ok(())
     }
 
     fn ensure_grant_nonce_unused(&mut self, nonce: &[u8]) -> anyhow::Result<()> {
@@ -2185,6 +2236,37 @@ impl AgentState {
     fn remember_grant_nonce(&mut self, nonce: Vec<u8>, expires_at: Instant) {
         self.used_grant_nonces.insert(nonce, expires_at);
     }
+
+    fn standard_master(&self, needed: bool) -> anyhow::Result<Option<AgentStandardMaster<'_>>> {
+        if !needed {
+            return Ok(None);
+        }
+        if let Some(master) = &self.master {
+            return Ok(Some(AgentStandardMaster::Borrowed(master)));
+        }
+        let backend = self
+            .standard_backend
+            .context("agent cannot open standard-tier envelopes with this store")?;
+        Ok(Some(AgentStandardMaster::Owned(
+            avault_store::load_master_key(backend).context("failed to load standard master key")?,
+        )))
+    }
+}
+
+#[cfg(unix)]
+enum AgentStandardMaster<'a> {
+    Borrowed(&'a MasterKey),
+    Owned(MasterKey),
+}
+
+#[cfg(unix)]
+impl AgentStandardMaster<'_> {
+    fn as_bytes(&self) -> &[u8; avault_store::MASTER_KEY_BYTES] {
+        match self {
+            Self::Borrowed(master) => master.as_bytes(),
+            Self::Owned(master) => master.as_bytes(),
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -2193,26 +2275,31 @@ impl AgentState {
 enum AgentRequest {
     Pubkey,
     Grant(AgentGrantRequest),
-    Release(AgentScopeRequest),
-    Revoke(AgentScopeRequest),
-    Deliver(AgentDeliverRequest),
+    Release(AgentGrantScopeRequest),
+    Revoke(AgentGrantScopeRequest),
+    #[serde(rename = "deliver.run")]
+    DeliverRun(AgentRunDeliverRequest),
+    #[serde(rename = "deliver.fetch")]
+    DeliverFetch(AgentFetchDeliverRequest),
+    #[serde(rename = "deliver.inject")]
+    DeliverInject(AgentInjectDeliverRequest),
     Sign(AgentSignRequest),
 }
 
 #[cfg(unix)]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AgentScopeRequest {
-    scope_type: String,
-    scope_ref: String,
+struct AgentGrantScopeRequest {
+    grant_id: String,
 }
 
 #[cfg(unix)]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AgentGrantRequest {
-    scope_type: String,
-    scope_ref: String,
+    grant_id: String,
+    #[serde(default)]
+    purpose: Option<String>,
     ttl_secs: Option<u64>,
     deks: Vec<AgentDekInput>,
 }
@@ -2225,8 +2312,6 @@ struct AgentDekInput {
     dek_blindbox: BlindBox,
     approval: ApprovalContextInput,
     #[serde(default)]
-    purpose: Option<String>,
-    #[serde(default)]
     scheme: Option<String>,
     #[serde(default)]
     digest: Option<String>,
@@ -2234,49 +2319,54 @@ struct AgentDekInput {
 
 #[cfg(unix)]
 #[derive(Debug, Deserialize)]
-struct AgentDeliverRequest {
-    scope_type: String,
-    scope_ref: String,
-    #[serde(default)]
-    dek_blindbox: Option<serde_json::Value>,
-    #[serde(default)]
-    approval: Option<serde_json::Value>,
-    #[serde(flatten)]
-    mode: AgentDeliverMode,
-}
-
-#[cfg(unix)]
-#[derive(Debug, Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case")]
-enum AgentDeliverMode {
-    Run(AgentRunDeliverInput),
-    Fetch(AgentFetchDeliverInput),
-    Inject(InjectInput),
-}
-
-#[cfg(unix)]
-#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AgentRunDeliverInput {
+struct AgentRunDeliverRequest {
+    grant_id: String,
     command: Vec<String>,
     secrets: Vec<EnvSecretInput>,
+    #[serde(default, rename = "context")]
+    _context: Option<serde_json::Value>,
 }
 
 #[cfg(unix)]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct AgentFetchDeliverInput {
-    name: String,
-    envelope: Sealed,
+struct AgentFetchDeliverRequest {
+    grant_id: String,
+    auth: AgentAuthSecretInput,
     request: FetchRequest,
+    #[serde(default, rename = "context")]
+    _context: Option<serde_json::Value>,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentAuthSecretInput {
+    name: String,
+    #[serde(default = "default_secret_tier")]
+    tier: SecretTier,
+    envelope: Sealed,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentInjectDeliverRequest {
+    grant_id: String,
+    path: PathBuf,
+    #[serde(default = "default_inject_format")]
+    format: String,
+    secrets: Vec<NamedSecretInput>,
+    #[serde(default, rename = "context")]
+    _context: Option<serde_json::Value>,
 }
 
 #[cfg(unix)]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AgentSignRequest {
-    scope_type: String,
-    scope_ref: String,
+    grant_id: String,
     name: String,
     key_envelope: Sealed,
     digest: String,
@@ -2315,28 +2405,31 @@ struct AgentRunOutput {
 #[cfg(unix)]
 fn run_agent(options: AgentOptions, input: &mut impl Read) -> anyhow::Result<u8> {
     avault_store::harden_process_memory();
-    let master = if options.unlock {
+    let (standard_backend, master) = if options.unlock {
         let mut passphrase =
             read_passphrase_line(input).context("failed to read store passphrase from stdin")?;
         let master = avault_store::load_or_create_passphrase_master_key(passphrase.as_slice())
             .context("failed to unlock passphrase master key")?;
         passphrase.zeroize();
-        Some(master)
+        (None, Some(master))
     } else {
-        match options.store {
-            StoreSelection::Auto | StoreSelection::Keychain | StoreSelection::Tpm => None,
-            StoreSelection::File => None,
+        let backend = match options.store {
+            StoreSelection::Auto => Backend::Auto,
+            StoreSelection::Keychain => Backend::Keychain,
+            StoreSelection::Tpm => Backend::Tpm,
+            StoreSelection::File => Backend::File,
             StoreSelection::FilePassphrase => {
                 bail!("file-passphrase agent requires --unlock")
             }
-        }
+        };
+        (Some(backend), None)
     };
     let keypair = avault_core::generate_blind_box_keypair();
     let listener = bind_agent_socket(&options.socket_path)?;
     listener
         .set_nonblocking(true)
         .context("failed to configure agent socket")?;
-    let mut state = AgentState::new(options.idle_timeout, master);
+    let mut state = AgentState::new(options.idle_timeout, standard_backend, master);
 
     loop {
         state.purge();
@@ -2510,7 +2603,7 @@ fn handle_agent_frame_inner(
             if request.deks.is_empty() {
                 bail!("grant requires at least one DEK");
             }
-            let key = grant_key_from_parts(request.scope_type, request.scope_ref)?;
+            let key = grant_key_from_id(request.grant_id)?;
             let ttl_secs = request.ttl_secs.unwrap_or(DEFAULT_AGENT_GRANT_TTL_SECS);
             if ttl_secs == 0 {
                 bail!("grant ttl_secs must be positive");
@@ -2522,10 +2615,10 @@ fn handle_agent_frame_inner(
                 .checked_add(Duration::from_secs(ttl_secs))
                 .context("grant expiration is invalid")?;
             let mut deks = HashMap::with_capacity(request.deks.len());
-            let scope_type = key.scope_type.clone();
-            let scope_ref = key.scope_ref.clone();
+            let grant_id = key.grant_id.clone();
             let mut used_nonces = Vec::with_capacity(request.deks.len());
             let mut grant_expires_at = requested_expires_at;
+            let purpose = AgentDekPurpose::parse(request.purpose.as_deref())?;
             for dek in request.deks {
                 let approval = parse_approval_context(&dek.approval)?;
                 validate_approval_not_expired(approval.expires_at_unix)?;
@@ -2537,14 +2630,13 @@ fn handle_agent_frame_inner(
                 }) {
                     bail!("duplicate grant approval nonce");
                 }
-                let purpose = AgentDekPurpose::parse(dek.purpose.as_deref())?;
                 let (context, key) = match purpose {
                     AgentDekPurpose::Deliver => {
                         if dek.scheme.is_some() || dek.digest.is_some() {
                             bail!("deliver grant DEK must not include signing fields");
                         }
                         (
-                            BlindBoxContext::agent_deliver(&scope_type, &scope_ref, &dek.name)
+                            BlindBoxContext::agent_deliver(&grant_id, &dek.name)
                                 .with_approval(&approval.nonce, approval.expires_at_unix)
                                 .with_operation_hash(agent_deliver_operation_hash(
                                     &dek.name, ttl_secs,
@@ -2563,17 +2655,11 @@ fn handle_agent_frame_inner(
                         let digest = decode_hex_32(&digest_hex, "digest")?;
                         let digest_key_hex = hex::encode(digest);
                         (
-                            BlindBoxContext::agent_sign(
-                                &scope_type,
-                                &scope_ref,
-                                &dek.name,
-                                &scheme,
-                                &digest,
-                            )
-                            .with_approval(&approval.nonce, approval.expires_at_unix)
-                            .with_operation_hash(
-                                agent_sign_operation_hash(&scheme, &digest, ttl_secs),
-                            ),
+                            BlindBoxContext::agent_sign(&grant_id, &dek.name, &scheme, &digest)
+                                .with_approval(&approval.nonce, approval.expires_at_unix)
+                                .with_operation_hash(agent_sign_operation_hash(
+                                    &scheme, &digest, ttl_secs,
+                                )),
                             AgentDekKey {
                                 purpose,
                                 name: dek.name.clone(),
@@ -2614,55 +2700,99 @@ fn handle_agent_frame_inner(
             let released = state.grants.remove(&key).is_some();
             Ok((agent_ok(AgentReleaseOutput { released })?, released))
         }
-        AgentRequest::Deliver(request) => {
-            reject_agent_one_shot_request_fields(
-                request.dek_blindbox.as_ref(),
-                request.approval.as_ref(),
-            )?;
-            let scope = grant_key_from_parts(request.scope_type, request.scope_ref)?;
-            let grant = state.get_grant(&scope)?;
-            match request.mode {
-                AgentDeliverMode::Run(AgentRunDeliverInput { command, secrets }) => {
-                    if command.is_empty() {
-                        bail!("deliver run requires a command");
-                    }
-                    if secrets.is_empty() {
-                        bail!("deliver run requires at least one secret");
-                    }
-                    let command: Vec<OsString> = command.into_iter().map(OsString::from).collect();
-                    let opened = open_env_secrets_with_grant(secrets, grant)?;
-                    let exit_code = run_agent_child_with_opened_env(&command, opened, true, state)?;
-                    Ok((agent_ok(AgentRunOutput { exit_code })?, true))
-                }
-                AgentDeliverMode::Fetch(AgentFetchDeliverInput {
-                    name,
-                    envelope,
-                    request,
-                }) => {
-                    let fetch = FetchInput {
-                        name,
-                        envelope,
-                        dek_blindbox: None,
-                        approval: None,
-                        request,
-                    };
-                    let (_url, is_loopback) = validate_fetch_input(&fetch)?;
-                    let mut secret = open_secret_with_grant(&fetch.name, &fetch.envelope, grant)
-                        .context("open failed")?;
-                    state.purge_before_blocking(Duration::from_secs(FETCH_TOTAL_TIMEOUT_SECS));
-                    let output = execute_fetch_request(fetch.request, &mut secret, is_loopback)
-                        .context("fetch request failed")?;
-                    secret.zeroize();
-                    Ok((agent_ok(output)?, true))
-                }
-                AgentDeliverMode::Inject(inject) => {
-                    write_inject_from_opened(inject, open_named_secrets_with_grant, grant)?;
-                    Ok((agent_ok(serde_json::json!({ "ok": true }))?, true))
-                }
+        AgentRequest::DeliverRun(request) => {
+            let AgentRunDeliverRequest {
+                grant_id,
+                command,
+                secrets,
+                _context: _,
+            } = request;
+            if command.is_empty() {
+                bail!("deliver run requires a command");
             }
+            if secrets.is_empty() {
+                bail!("deliver run requires at least one secret");
+            }
+            reject_agent_env_one_shot_fields(&secrets)?;
+            let scope = grant_key_from_id(grant_id)?;
+            let opened = {
+                state.purge();
+                state.require_live_grant(&scope)?;
+                let standard_master = state
+                    .standard_master(secrets.iter().any(|s| s.tier == SecretTier::Standard))?;
+                let grant = state.get_live_grant(&scope)?;
+                open_env_secrets_for_agent(secrets, grant, standard_master.as_ref())?
+            };
+            let command: Vec<OsString> = command.into_iter().map(OsString::from).collect();
+            let exit_code = run_agent_child_with_opened_env(&command, opened, true, state)?;
+            Ok((agent_ok(AgentRunOutput { exit_code })?, true))
+        }
+        AgentRequest::DeliverFetch(request) => {
+            let AgentFetchDeliverRequest {
+                grant_id,
+                auth,
+                request,
+                _context: _,
+            } = request;
+            let fetch = FetchInput {
+                name: auth.name,
+                tier: auth.tier,
+                envelope: auth.envelope,
+                dek_blindbox: None,
+                approval: None,
+                request,
+            };
+            let (_url, is_loopback) = validate_fetch_input(&fetch)?;
+            let scope = grant_key_from_id(grant_id)?;
+            let mut secret = {
+                state.purge();
+                state.require_live_grant(&scope)?;
+                let standard_master = state.standard_master(fetch.tier == SecretTier::Standard)?;
+                let grant = state.get_live_grant(&scope)?;
+                open_agent_secret(
+                    &fetch.name,
+                    fetch.tier,
+                    &fetch.envelope,
+                    grant,
+                    standard_master.as_ref(),
+                )
+                .context("open failed")?
+            };
+            state.purge_before_blocking(Duration::from_secs(FETCH_TOTAL_TIMEOUT_SECS));
+            let output = execute_fetch_request(fetch.request, &mut secret, is_loopback)
+                .context("fetch request failed")?;
+            secret.zeroize();
+            Ok((agent_ok(output)?, true))
+        }
+        AgentRequest::DeliverInject(request) => {
+            let AgentInjectDeliverRequest {
+                grant_id,
+                path,
+                format,
+                secrets,
+                _context: _,
+            } = request;
+            let scope = grant_key_from_id(grant_id)?;
+            let inject = InjectInput {
+                path,
+                format,
+                secrets,
+            };
+            reject_agent_named_one_shot_fields(&inject.secrets)?;
+            state.purge();
+            state.require_live_grant(&scope)?;
+            let standard_master = state.standard_master(
+                inject
+                    .secrets
+                    .iter()
+                    .any(|s| s.tier == SecretTier::Standard),
+            )?;
+            let grant = state.get_live_grant(&scope)?;
+            write_inject_from_opened(inject, grant, standard_master.as_ref())?;
+            Ok((agent_ok(serde_json::json!({ "ok": true }))?, true))
         }
         AgentRequest::Sign(request) => {
-            let scope = grant_key_from_parts(request.scope_type, request.scope_ref)?;
+            let scope = grant_key_from_id(request.grant_id)?;
             let grant = state.get_grant(&scope)?;
             let digest = decode_hex_32(&request.digest, "digest")?;
             let scheme = SignatureScheme::from_str(&request.scheme)?;
@@ -2690,25 +2820,23 @@ fn agent_ok<T: Serialize>(result: T) -> anyhow::Result<serde_json::Value> {
 }
 
 #[cfg(unix)]
-fn grant_key_from_scope(scope: AgentScopeRequest) -> anyhow::Result<GrantKey> {
-    grant_key_from_parts(scope.scope_type, scope.scope_ref)
+fn grant_key_from_scope(scope: AgentGrantScopeRequest) -> anyhow::Result<GrantKey> {
+    grant_key_from_id(scope.grant_id)
 }
 
 #[cfg(unix)]
-fn grant_key_from_parts(scope_type: String, scope_ref: String) -> anyhow::Result<GrantKey> {
-    if scope_type.is_empty() || scope_ref.is_empty() {
-        bail!("scope_type and scope_ref are required");
+fn grant_key_from_id(grant_id: String) -> anyhow::Result<GrantKey> {
+    if grant_id.is_empty() {
+        bail!("grant_id is required");
     }
-    Ok(GrantKey {
-        scope_type,
-        scope_ref,
-    })
+    Ok(GrantKey { grant_id })
 }
 
 #[cfg(unix)]
-fn open_env_secrets_with_grant(
+fn open_env_secrets_for_agent(
     secrets: Vec<EnvSecretInput>,
     grant: &GrantEntry,
+    standard_master: Option<&AgentStandardMaster<'_>>,
 ) -> anyhow::Result<Vec<OpenedSecret>> {
     let mut opened = Vec::with_capacity(secrets.len());
     let mut seen = BTreeSet::new();
@@ -2721,8 +2849,14 @@ fn open_env_secrets_with_grant(
         if !seen.insert(secret.env.clone()) {
             bail!("duplicate env var name");
         }
-        let plaintext = open_secret_with_grant(&secret.name, &secret.envelope, grant)
-            .with_context(|| format!("open failed for {}", secret.name))?;
+        let plaintext = open_agent_secret(
+            &secret.name,
+            secret.tier,
+            &secret.envelope,
+            grant,
+            standard_master,
+        )
+        .with_context(|| format!("open failed for {}", secret.name))?;
         opened.push(OpenedSecret {
             name: secret.env,
             plaintext,
@@ -2732,9 +2866,10 @@ fn open_env_secrets_with_grant(
 }
 
 #[cfg(unix)]
-fn open_named_secrets_with_grant(
+fn open_named_secrets_for_agent(
     secrets: Vec<NamedSecretInput>,
     grant: &GrantEntry,
+    standard_master: Option<&AgentStandardMaster<'_>>,
 ) -> anyhow::Result<Vec<OpenedSecret>> {
     let mut opened = Vec::with_capacity(secrets.len());
     let mut seen = BTreeSet::new();
@@ -2751,14 +2886,37 @@ fn open_named_secrets_with_grant(
         if !seen.insert(target_name.clone()) {
             bail!("duplicate secret target name");
         }
-        let plaintext = open_secret_with_grant(&secret.name, &secret.envelope, grant)
-            .with_context(|| format!("open failed for {}", secret.name))?;
+        let plaintext = open_agent_secret(
+            &secret.name,
+            secret.tier,
+            &secret.envelope,
+            grant,
+            standard_master,
+        )
+        .with_context(|| format!("open failed for {}", secret.name))?;
         opened.push(OpenedSecret {
             name: target_name,
             plaintext,
         });
     }
     Ok(opened)
+}
+
+#[cfg(unix)]
+fn open_agent_secret(
+    name: &str,
+    tier: SecretTier,
+    envelope: &Sealed,
+    grant: &GrantEntry,
+    standard_master: Option<&AgentStandardMaster<'_>>,
+) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+    match tier {
+        SecretTier::Standard => {
+            let master = standard_master.context("standard-tier secret requires a master key")?;
+            avault_core::open(master.as_bytes(), name, envelope).context("envelope open failed")
+        }
+        SecretTier::Protected => open_secret_with_grant(name, envelope, grant),
+    }
 }
 
 #[cfg(unix)]
@@ -2773,12 +2931,23 @@ fn reject_agent_one_shot_secret_fields(
 }
 
 #[cfg(unix)]
-fn reject_agent_one_shot_request_fields(
-    dek_blindbox: Option<&serde_json::Value>,
-    approval: Option<&serde_json::Value>,
-) -> anyhow::Result<()> {
-    if dek_blindbox.is_some() || approval.is_some() {
-        bail!("agent delivery uses cached grants and rejects one-shot DEK fields");
+fn reject_agent_env_one_shot_fields(secrets: &[EnvSecretInput]) -> anyhow::Result<()> {
+    for secret in secrets {
+        reject_agent_one_shot_secret_fields(
+            secret.dek_blindbox.as_ref(),
+            secret.approval.as_ref(),
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn reject_agent_named_one_shot_fields(secrets: &[NamedSecretInput]) -> anyhow::Result<()> {
+    for secret in secrets {
+        reject_agent_one_shot_secret_fields(
+            secret.dek_blindbox.as_ref(),
+            secret.approval.as_ref(),
+        )?;
     }
     Ok(())
 }
@@ -2824,8 +2993,8 @@ fn open_signing_key_with_grant(
 #[cfg(unix)]
 fn write_inject_from_opened(
     inject: InjectInput,
-    opener: fn(Vec<NamedSecretInput>, &GrantEntry) -> anyhow::Result<Vec<OpenedSecret>>,
     grant: &GrantEntry,
+    standard_master: Option<&AgentStandardMaster<'_>>,
 ) -> anyhow::Result<()> {
     if inject.secrets.is_empty() {
         bail!("deliver inject requires at least one secret");
@@ -2834,7 +3003,7 @@ fn write_inject_from_opened(
     if format != "dotenv" && format != "json" {
         bail!("deliver inject format is not implemented in P1.1");
     }
-    let mut opened = opener(inject.secrets, grant)?;
+    let mut opened = open_named_secrets_for_agent(inject.secrets, grant, standard_master)?;
     let mut rendered = render_inject_file(&opened, &format)?;
     opened.zeroize();
     drop(opened);
@@ -3092,5 +3261,52 @@ mod tests {
         let needles = [Zeroizing::new(b"a".to_vec())];
 
         assert!(redact_fetch_body(&mut body, &needles).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_grant_rejects_expired_entry_without_purge() {
+        let mut state = AgentState::new(Duration::from_secs(60), None, None);
+        let scope = GrantKey {
+            grant_id: "expired-grant".to_string(),
+        };
+        state.grants.insert(
+            scope.clone(),
+            GrantEntry {
+                expires_at: Instant::now() - Duration::from_millis(1),
+                deks: HashMap::new(),
+            },
+        );
+
+        let err = match state.get_live_grant(&scope) {
+            Ok(_) => panic!("expired grant should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("grant is missing or expired"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_grant_rejects_idle_expired_entry_without_purge() {
+        let mut state = AgentState::new(Duration::from_secs(1), None, None);
+        let scope = GrantKey {
+            grant_id: "idle-grant".to_string(),
+        };
+        state.last_activity = Instant::now() - Duration::from_secs(2);
+        state.grants.insert(
+            scope.clone(),
+            GrantEntry {
+                expires_at: Instant::now() + Duration::from_secs(60),
+                deks: HashMap::new(),
+            },
+        );
+
+        let err = match state.get_live_grant(&scope) {
+            Ok(_) => panic!("idle-expired grant should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("grant is missing or expired"));
     }
 }
