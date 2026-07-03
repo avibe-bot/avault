@@ -71,8 +71,7 @@ fn p0_no_aad_envelope() -> serde_json::Value {
 struct TestBlindBoxAad<'a> {
     purpose: &'a str,
     name: &'a str,
-    scope_type: &'a str,
-    scope_ref: &'a str,
+    grant_id: &'a str,
     scheme: &'a str,
     digest: &'a [u8],
     approval_nonce: &'a [u8],
@@ -91,8 +90,8 @@ fn blind_box_aad(context: TestBlindBoxAad<'_>) -> Vec<u8> {
     push_field(&mut out, context.name.as_bytes());
     push_field(&mut out, b"machine-aesgcm-v1");
     push_field(&mut out, &[1]);
-    push_field(&mut out, context.scope_type.as_bytes());
-    push_field(&mut out, context.scope_ref.as_bytes());
+    push_field(&mut out, context.grant_id.as_bytes());
+    push_field(&mut out, &[]);
     push_field(&mut out, context.scheme.as_bytes());
     push_field(&mut out, context.digest);
     push_field(&mut out, context.approval_nonce);
@@ -108,8 +107,7 @@ fn aad_seal(name: &str) -> Vec<u8> {
     blind_box_aad(TestBlindBoxAad {
         purpose: "seal",
         name,
-        scope_type: "",
-        scope_ref: "",
+        grant_id: "",
         scheme: "",
         digest: &[],
         approval_nonce: &[],
@@ -127,8 +125,7 @@ fn aad_deliver(
     blind_box_aad(TestBlindBoxAad {
         purpose: "deliver",
         name,
-        scope_type: "",
-        scope_ref: "",
+        grant_id: "",
         scheme: "",
         digest: &[],
         approval_nonce,
@@ -138,8 +135,7 @@ fn aad_deliver(
 }
 
 fn aad_agent_deliver(
-    scope_type: &str,
-    scope_ref: &str,
+    grant_id: &str,
     name: &str,
     approval_nonce: &[u8],
     expires_at: u64,
@@ -150,8 +146,7 @@ fn aad_agent_deliver(
     blind_box_aad(TestBlindBoxAad {
         purpose: "agent-deliver",
         name,
-        scope_type,
-        scope_ref,
+        grant_id,
         scheme: "",
         digest: &[],
         approval_nonce,
@@ -172,8 +167,7 @@ fn aad_sign(
     blind_box_aad(TestBlindBoxAad {
         purpose: "sign",
         name,
-        scope_type: "",
-        scope_ref: "",
+        grant_id: "",
         scheme,
         digest: &digest,
         approval_nonce,
@@ -189,8 +183,7 @@ struct TestGrantApproval<'a> {
 }
 
 fn aad_agent_sign(
-    scope_type: &str,
-    scope_ref: &str,
+    grant_id: &str,
     name: &str,
     scheme: &str,
     digest: &[u8],
@@ -206,8 +199,7 @@ fn aad_agent_sign(
     blind_box_aad(TestBlindBoxAad {
         purpose: "agent-sign",
         name,
-        scope_type,
-        scope_ref,
+        grant_id,
         scheme,
         digest,
         approval_nonce: approval.nonce,
@@ -907,8 +899,7 @@ fn agent_grant_deliver_inject_release_roundtrip() {
         &mut stream,
         json!({
             "type": "grant",
-            "scope_type": "session",
-            "scope_ref": "agent-test",
+            "grant_id": "agent-test",
             "ttl_secs": 60,
             "deks": [
                 {
@@ -916,7 +907,7 @@ fn agent_grant_deliver_inject_release_roundtrip() {
                     "dek_blindbox": fixed_blind_box(
                         public_key,
                         &dek,
-                        &aad_agent_deliver("session", "agent-test", "API_TOKEN", approval_nonce, approval_expires_at, 60)
+                        &aad_agent_deliver("agent-test", "API_TOKEN", approval_nonce, approval_expires_at, 60)
                     ),
                     "approval": approval_json(approval_nonce, approval_expires_at)
                 }
@@ -930,14 +921,13 @@ fn agent_grant_deliver_inject_release_roundtrip() {
     let delivered = agent_request(
         &mut stream,
         json!({
-            "type": "deliver",
-            "scope_type": "session",
-            "scope_ref": "agent-test",
-            "mode": "inject",
+            "type": "deliver.inject",
+            "grant_id": "agent-test",
+
             "path": inject_path,
             "format": "dotenv",
             "secrets": [
-                {"name": "API_TOKEN", "key": "API_TOKEN", "envelope": envelope}
+                {"name": "API_TOKEN", "tier": "protected", "key": "API_TOKEN", "envelope": envelope}
             ]
         }),
     );
@@ -949,7 +939,7 @@ fn agent_grant_deliver_inject_release_roundtrip() {
 
     let released = agent_request(
         &mut stream,
-        json!({"type": "release", "scope_type": "session", "scope_ref": "agent-test"}),
+        json!({"type": "release", "grant_id": "agent-test"}),
     );
     assert_eq!(released["ok"], true);
     assert_eq!(released["result"]["released"], true);
@@ -958,8 +948,7 @@ fn agent_grant_deliver_inject_release_roundtrip() {
         &mut stream,
         json!({
             "type": "grant",
-            "scope_type": "session",
-            "scope_ref": "agent-test",
+            "grant_id": "agent-test",
             "ttl_secs": 60,
             "deks": [
                 {
@@ -968,7 +957,6 @@ fn agent_grant_deliver_inject_release_roundtrip() {
                         public_key,
                         &dek,
                         &aad_agent_deliver(
-                            "session",
                             "agent-test",
                             "API_TOKEN",
                             approval_nonce,
@@ -990,14 +978,13 @@ fn agent_grant_deliver_inject_release_roundtrip() {
     let denied = agent_request(
         &mut stream,
         json!({
-            "type": "deliver",
-            "scope_type": "session",
-            "scope_ref": "agent-test",
-            "mode": "inject",
+            "type": "deliver.inject",
+            "grant_id": "agent-test",
+
             "path": tmp.path().join("denied.env"),
             "format": "dotenv",
             "secrets": [
-                {"name": "API_TOKEN", "key": "API_TOKEN", "envelope": envelope}
+                {"name": "API_TOKEN", "tier": "protected", "key": "API_TOKEN", "envelope": envelope}
             ]
         }),
     );
@@ -1009,7 +996,7 @@ fn agent_grant_deliver_inject_release_roundtrip() {
 }
 
 #[test]
-fn agent_rejects_empty_scope_and_excessive_ttl() {
+fn agent_rejects_empty_grant_id_and_excessive_ttl() {
     let tmp = tempfile::tempdir().unwrap();
     let socket = tmp.path().join("run").join("avault.sock");
     let mut agent = spawn_agent(&socket, 60);
@@ -1024,7 +1011,7 @@ fn agent_rejects_empty_scope_and_excessive_ttl() {
         "dek_blindbox": fixed_blind_box(
             public_key,
             &dek,
-            &aad_agent_deliver("session", "bad-test", "API_TOKEN", approval_nonce, approval_expires_at, 60)
+            &aad_agent_deliver("bad-test", "API_TOKEN", approval_nonce, approval_expires_at, 60)
         ),
         "approval": approval_json(approval_nonce, approval_expires_at)
     });
@@ -1033,24 +1020,19 @@ fn agent_rejects_empty_scope_and_excessive_ttl() {
         &mut stream,
         json!({
             "type": "grant",
-            "scope_type": "",
-            "scope_ref": "bad-test",
+            "grant_id": "",
             "ttl_secs": 60,
             "deks": [dek_input.clone()]
         }),
     );
     assert_eq!(empty_scope["ok"], false);
-    assert!(empty_scope["error"]
-        .as_str()
-        .unwrap()
-        .contains("scope_type"));
+    assert!(empty_scope["error"].as_str().unwrap().contains("grant_id"));
 
     let excessive_ttl = agent_request(
         &mut stream,
         json!({
             "type": "grant",
-            "scope_type": "session",
-            "scope_ref": "bad-test",
+            "grant_id": "bad-test",
             "ttl_secs": u64::MAX,
             "deks": [dek_input]
         }),
@@ -1146,8 +1128,7 @@ fn agent_expires_grants_by_ttl() {
         &mut stream,
         json!({
             "type": "grant",
-            "scope_type": "session",
-            "scope_ref": "ttl-test",
+            "grant_id": "ttl-test",
             "ttl_secs": 1,
             "deks": [
                 {
@@ -1155,7 +1136,7 @@ fn agent_expires_grants_by_ttl() {
                     "dek_blindbox": fixed_blind_box(
                         public_key,
                         &dek,
-                        &aad_agent_deliver("session", "ttl-test", "API_TOKEN", approval_nonce, approval_expires_at, 1)
+                        &aad_agent_deliver("ttl-test", "API_TOKEN", approval_nonce, approval_expires_at, 1)
                     ),
                     "approval": approval_json(approval_nonce, approval_expires_at)
                 }
@@ -1169,14 +1150,13 @@ fn agent_expires_grants_by_ttl() {
     let denied = agent_request(
         &mut stream,
         json!({
-            "type": "deliver",
-            "scope_type": "session",
-            "scope_ref": "ttl-test",
-            "mode": "inject",
+            "type": "deliver.inject",
+            "grant_id": "ttl-test",
+
             "path": tmp.path().join("expired.env"),
             "format": "dotenv",
             "secrets": [
-                {"name": "API_TOKEN", "key": "API_TOKEN", "envelope": envelope}
+                {"name": "API_TOKEN", "tier": "protected", "key": "API_TOKEN", "envelope": envelope}
             ]
         }),
     );
@@ -1202,8 +1182,7 @@ fn agent_purges_grants_while_deliver_run_child_is_running() {
         &mut stream,
         json!({
             "type": "grant",
-            "scope_type": "session",
-            "scope_ref": "run-purge",
+            "grant_id": "run-purge",
             "ttl_secs": 1,
             "deks": [
                 {
@@ -1211,7 +1190,7 @@ fn agent_purges_grants_while_deliver_run_child_is_running() {
                     "dek_blindbox": fixed_blind_box(
                         public_key,
                         &dek,
-                        &aad_agent_deliver("session", "run-purge", "API_TOKEN", approval_nonce, approval_expires_at, 1)
+                        &aad_agent_deliver("run-purge", "API_TOKEN", approval_nonce, approval_expires_at, 1)
                     ),
                     "approval": approval_json(approval_nonce, approval_expires_at)
                 }
@@ -1224,13 +1203,12 @@ fn agent_purges_grants_while_deliver_run_child_is_running() {
     let delivered = agent_request(
         &mut stream,
         json!({
-            "type": "deliver",
-            "scope_type": "session",
-            "scope_ref": "run-purge",
-            "mode": "run",
+            "type": "deliver.run",
+            "grant_id": "run-purge",
+
             "command": ["/bin/sh", "-c", "sleep 2"],
             "secrets": [
-                {"name": "API_TOKEN", "env": "API_TOKEN", "envelope": envelope.clone()}
+                {"name": "API_TOKEN", "tier": "protected", "env": "API_TOKEN", "envelope": envelope.clone()}
             ]
         }),
     );
@@ -1240,14 +1218,13 @@ fn agent_purges_grants_while_deliver_run_child_is_running() {
     let denied = agent_request(
         &mut stream,
         json!({
-            "type": "deliver",
-            "scope_type": "session",
-            "scope_ref": "run-purge",
-            "mode": "inject",
+            "type": "deliver.inject",
+            "grant_id": "run-purge",
+
             "path": tmp.path().join("purged.env"),
             "format": "dotenv",
             "secrets": [
-                {"name": "API_TOKEN", "key": "API_TOKEN", "envelope": envelope}
+                {"name": "API_TOKEN", "tier": "protected", "key": "API_TOKEN", "envelope": envelope}
             ]
         }),
     );
@@ -1279,8 +1256,7 @@ fn agent_deliver_run_clears_inherited_env_and_delivers_secret() {
         &mut stream,
         json!({
             "type": "grant",
-            "scope_type": "session",
-            "scope_ref": "run-env",
+            "grant_id": "run-env",
             "ttl_secs": 60,
             "deks": [
                 {
@@ -1288,7 +1264,7 @@ fn agent_deliver_run_clears_inherited_env_and_delivers_secret() {
                     "dek_blindbox": fixed_blind_box(
                         public_key,
                         &dek,
-                        &aad_agent_deliver("session", "run-env", "API_TOKEN", approval_nonce, approval_expires_at, 60)
+                        &aad_agent_deliver("run-env", "API_TOKEN", approval_nonce, approval_expires_at, 60)
                     ),
                     "approval": approval_json(approval_nonce, approval_expires_at)
                 }
@@ -1301,17 +1277,97 @@ fn agent_deliver_run_clears_inherited_env_and_delivers_secret() {
     let delivered = agent_request(
         &mut stream,
         json!({
-            "type": "deliver",
-            "scope_type": "session",
-            "scope_ref": "run-env",
-            "mode": "run",
+            "type": "deliver.run",
+            "grant_id": "run-env",
+
             "command": [
                 "/bin/sh",
                 "-c",
                 r#"test "$API_TOKEN" = "agent-secret" && test -z "${AVAULT_PARENT_ONLY+x}""#
             ],
             "secrets": [
-                {"name": "API_TOKEN", "env": "API_TOKEN", "envelope": envelope}
+                {"name": "API_TOKEN", "tier": "protected", "env": "API_TOKEN", "envelope": envelope}
+            ]
+        }),
+    );
+    assert_eq!(delivered["ok"], true);
+    assert_eq!(delivered["result"]["exit_code"], 0);
+
+    let _ = agent.kill();
+    let _ = agent.wait();
+}
+
+#[test]
+fn agent_deliver_run_mixes_standard_and_protected_in_one_child() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("run").join("avault.sock");
+    let vault_home = tmp.path().join("vault");
+    let standard_envelope = seal_secret(&vault_home, "STANDARD_TOKEN", b"standard-secret");
+    let mut agent = spawn_agent_command(&socket, 60)
+        .env("AVAULT_HOME", &vault_home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stream = connect_agent(&socket);
+    let pubkey = agent_request(&mut stream, json!({"type": "pubkey"}));
+    let public_key = pubkey["result"]["public_key"].as_str().unwrap();
+    let protected_dek = [0x5cu8; 32];
+    let approval_nonce = b"agent-mixed-run1";
+    let approval_expires_at = future_expiry();
+    let grant = agent_request(
+        &mut stream,
+        json!({
+            "type": "grant",
+            "grant_id": "mixed-run",
+            "ttl_secs": 60,
+            "deks": [
+                {
+                    "name": "PROTECTED_TOKEN",
+                    "dek_blindbox": fixed_blind_box(
+                        public_key,
+                        &protected_dek,
+                        &aad_agent_deliver(
+                            "mixed-run",
+                            "PROTECTED_TOKEN",
+                            approval_nonce,
+                            approval_expires_at,
+                            60
+                        )
+                    ),
+                    "approval": approval_json(approval_nonce, approval_expires_at)
+                }
+            ]
+        }),
+    );
+    assert_eq!(grant["ok"], true);
+
+    let protected_envelope =
+        envelope_encrypted_with_dek("PROTECTED_TOKEN", &protected_dek, b"protected-secret");
+    let delivered = agent_request(
+        &mut stream,
+        json!({
+            "type": "deliver.run",
+            "grant_id": "mixed-run",
+            "command": [
+                "/bin/sh",
+                "-c",
+                r#"test "$STANDARD_TOKEN" = "standard-secret" && test "$PROTECTED_TOKEN" = "protected-secret""#
+            ],
+            "secrets": [
+                {
+                    "name": "STANDARD_TOKEN",
+                    "tier": "standard",
+                    "env": "STANDARD_TOKEN",
+                    "envelope": standard_envelope
+                },
+                {
+                    "name": "PROTECTED_TOKEN",
+                    "tier": "protected",
+                    "env": "PROTECTED_TOKEN",
+                    "envelope": protected_envelope
+                }
             ]
         }),
     );
@@ -1339,8 +1395,7 @@ fn agent_rejects_grant_ttl_escalation() {
         &mut stream,
         json!({
             "type": "grant",
-            "scope_type": "session",
-            "scope_ref": "ttl-bind",
+            "grant_id": "ttl-bind",
             "ttl_secs": 60,
             "deks": [
                 {
@@ -1349,7 +1404,6 @@ fn agent_rejects_grant_ttl_escalation() {
                         public_key,
                         &dek,
                         &aad_agent_deliver(
-                            "session",
                             "ttl-bind",
                             "API_TOKEN",
                             approval_nonce,
@@ -1384,8 +1438,7 @@ fn agent_deliver_rejects_one_shot_dek_fields() {
         &mut stream,
         json!({
             "type": "grant",
-            "scope_type": "session",
-            "scope_ref": "mixed-test",
+            "grant_id": "mixed-test",
             "ttl_secs": 60,
             "deks": [
                 {
@@ -1394,7 +1447,6 @@ fn agent_deliver_rejects_one_shot_dek_fields() {
                         public_key,
                         &dek,
                         &aad_agent_deliver(
-                            "session",
                             "mixed-test",
                             "API_TOKEN",
                             approval_nonce,
@@ -1414,10 +1466,9 @@ fn agent_deliver_rejects_one_shot_dek_fields() {
     let rejected = agent_request(
         &mut stream,
         json!({
-            "type": "deliver",
-            "scope_type": "session",
-            "scope_ref": "mixed-test",
-            "mode": "run",
+            "type": "deliver.run",
+            "grant_id": "mixed-test",
+
             "command": ["/bin/sh", "-c", "printf should-not-run"],
             "secrets": [
                 {
@@ -1461,8 +1512,7 @@ fn agent_deliver_fetch_rejects_one_shot_dek_fields() {
         &mut stream,
         json!({
             "type": "grant",
-            "scope_type": "session",
-            "scope_ref": "mixed-fetch",
+            "grant_id": "mixed-fetch",
             "ttl_secs": 60,
             "deks": [
                 {
@@ -1471,7 +1521,6 @@ fn agent_deliver_fetch_rejects_one_shot_dek_fields() {
                         public_key,
                         &dek,
                         &aad_agent_deliver(
-                            "session",
                             "mixed-fetch",
                             "API_TOKEN",
                             approval_nonce,
@@ -1497,28 +1546,113 @@ fn agent_deliver_fetch_rejects_one_shot_dek_fields() {
     let rejected = agent_request(
         &mut stream,
         json!({
-            "type": "deliver",
-            "scope_type": "session",
-            "scope_ref": "mixed-fetch",
-            "mode": "fetch",
-            "name": "API_TOKEN",
-            "envelope": envelope,
+            "type": "deliver.fetch",
+            "grant_id": "mixed-fetch",
+            "auth": {
+                "name": "API_TOKEN",
+                "tier": "protected",
+                "envelope": envelope,
+                "dek_blindbox": fixed_blind_box(
+                    public_key,
+                    &dek,
+                    &aad_deliver(
+                        "API_TOKEN",
+                        one_shot_nonce,
+                        approval_expires_at,
+                        &fetch_operation_hash(&request_spec)
+                    )
+                ),
+                "approval": approval_json(one_shot_nonce, approval_expires_at)
+            },
             "request": request_spec,
-            "dek_blindbox": fixed_blind_box(
-                public_key,
-                &dek,
-                &aad_deliver(
-                    "API_TOKEN",
-                    one_shot_nonce,
-                    approval_expires_at,
-                    &fetch_operation_hash(&request_spec)
-                )
-            ),
-            "approval": approval_json(one_shot_nonce, approval_expires_at)
         }),
     );
     assert_eq!(rejected["ok"], false);
     assert!(!rejected["error"].as_str().unwrap().is_empty());
+
+    let _ = agent.kill();
+    let _ = agent.wait();
+}
+
+#[test]
+fn agent_deliver_fetch_uses_grant_id_auth_secret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("run").join("avault.sock");
+    let mut agent = spawn_agent(&socket, 60);
+    let mut stream = connect_agent(&socket);
+    let pubkey = agent_request(&mut stream, json!({"type": "pubkey"}));
+    let public_key = pubkey["result"]["public_key"].as_str().unwrap();
+    let dek = [0x5du8; 32];
+    let approval_nonce = b"agent-fetch-use1";
+    let approval_expires_at = future_expiry();
+    let grant = agent_request(
+        &mut stream,
+        json!({
+            "type": "grant",
+            "grant_id": "fetch-grant",
+            "ttl_secs": 60,
+            "deks": [
+                {
+                    "name": "API_TOKEN",
+                    "dek_blindbox": fixed_blind_box(
+                        public_key,
+                        &dek,
+                        &aad_agent_deliver(
+                            "fetch-grant",
+                            "API_TOKEN",
+                            approval_nonce,
+                            approval_expires_at,
+                            60
+                        )
+                    ),
+                    "approval": approval_json(approval_nonce, approval_expires_at)
+                }
+            ]
+        }),
+    );
+    assert_eq!(grant["ok"], true);
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).unwrap();
+        let request = String::from_utf8_lossy(&buf[..n]);
+        assert!(request.contains("Authorization: Bearer agent-fetch-token"));
+        let body = b"ok";
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        stream.write_all(body).unwrap();
+    });
+
+    let envelope = envelope_encrypted_with_dek("API_TOKEN", &dek, b"agent-fetch-token\n");
+    let response = agent_request(
+        &mut stream,
+        json!({
+            "type": "deliver.fetch",
+            "grant_id": "fetch-grant",
+            "auth": {
+                "name": "API_TOKEN",
+                "tier": "protected",
+                "envelope": envelope
+            },
+            "request": {
+                "method": "GET",
+                "url": format!("http://127.0.0.1:{}/resource", addr.port()),
+                "allowed_hosts": ["127.0.0.1"],
+                "inject": {"type": "bearer"}
+            }
+        }),
+    );
+    server.join().unwrap();
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["result"]["status"], 200);
+    assert_eq!(response["result"]["body"], "ok");
 
     let _ = agent.kill();
     let _ = agent.wait();
@@ -1542,20 +1676,18 @@ fn agent_signs_with_cached_dek_grant() {
         &mut stream,
         json!({
             "type": "grant",
-            "scope_type": "session",
-            "scope_ref": "sign-test",
+            "grant_id": "sign-test",
+            "purpose": "sign",
             "ttl_secs": 60,
             "deks": [
                 {
                     "name": "AGENT_SIGNING_KEY",
-                    "purpose": "sign",
                     "scheme": "ecdsa-secp256k1-der",
                     "digest": signing["digest_hex"],
                     "dek_blindbox": fixed_blind_box(
                         public_key,
                         &dek,
                         &aad_agent_sign(
-                            "session",
                             "sign-test",
                             "AGENT_SIGNING_KEY",
                             "ecdsa-secp256k1-der",
@@ -1585,8 +1717,7 @@ fn agent_signs_with_cached_dek_grant() {
         &mut stream,
         json!({
             "type": "sign",
-            "scope_type": "session",
-            "scope_ref": "sign-test",
+            "grant_id": "sign-test",
             "name": "AGENT_SIGNING_KEY",
             "key_envelope": key_envelope,
             "digest": signing["digest_hex"],
@@ -1601,8 +1732,7 @@ fn agent_signs_with_cached_dek_grant() {
         &mut stream,
         json!({
             "type": "sign",
-            "scope_type": "session",
-            "scope_ref": "sign-test",
+            "grant_id": "sign-test",
             "name": "AGENT_SIGNING_KEY",
             "key_envelope": key_envelope,
             "digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
@@ -1631,8 +1761,7 @@ fn agent_idle_timeout_clears_grants() {
         &mut stream,
         json!({
             "type": "grant",
-            "scope_type": "session",
-            "scope_ref": "idle-test",
+            "grant_id": "idle-test",
             "ttl_secs": 60,
             "deks": [
                 {
@@ -1640,7 +1769,7 @@ fn agent_idle_timeout_clears_grants() {
                     "dek_blindbox": fixed_blind_box(
                         public_key,
                         &dek,
-                        &aad_agent_deliver("session", "idle-test", "API_TOKEN", approval_nonce, approval_expires_at, 60)
+                        &aad_agent_deliver("idle-test", "API_TOKEN", approval_nonce, approval_expires_at, 60)
                     ),
                     "approval": approval_json(approval_nonce, approval_expires_at)
                 }
@@ -1654,14 +1783,13 @@ fn agent_idle_timeout_clears_grants() {
     let denied = agent_request(
         &mut stream,
         json!({
-            "type": "deliver",
-            "scope_type": "session",
-            "scope_ref": "idle-test",
-            "mode": "inject",
+            "type": "deliver.inject",
+            "grant_id": "idle-test",
+
             "path": tmp.path().join("idle.env"),
             "format": "dotenv",
             "secrets": [
-                {"name": "API_TOKEN", "key": "API_TOKEN", "envelope": envelope}
+                {"name": "API_TOKEN", "tier": "protected", "key": "API_TOKEN", "envelope": envelope}
             ]
         }),
     );
@@ -1687,8 +1815,7 @@ fn agent_pubkey_does_not_refresh_grant_idle_timeout() {
         &mut stream,
         json!({
             "type": "grant",
-            "scope_type": "session",
-            "scope_ref": "idle-pubkey",
+            "grant_id": "idle-pubkey",
             "ttl_secs": 60,
             "deks": [
                 {
@@ -1697,7 +1824,6 @@ fn agent_pubkey_does_not_refresh_grant_idle_timeout() {
                         public_key,
                         &dek,
                         &aad_agent_deliver(
-                            "session",
                             "idle-pubkey",
                             "API_TOKEN",
                             approval_nonce,
@@ -1720,14 +1846,13 @@ fn agent_pubkey_does_not_refresh_grant_idle_timeout() {
     let denied = agent_request(
         &mut stream,
         json!({
-            "type": "deliver",
-            "scope_type": "session",
-            "scope_ref": "idle-pubkey",
-            "mode": "inject",
+            "type": "deliver.inject",
+            "grant_id": "idle-pubkey",
+
             "path": tmp.path().join("idle-pubkey.env"),
             "format": "dotenv",
             "secrets": [
-                {"name": "API_TOKEN", "key": "API_TOKEN", "envelope": envelope}
+                {"name": "API_TOKEN", "tier": "protected", "key": "API_TOKEN", "envelope": envelope}
             ]
         }),
     );
@@ -1753,8 +1878,7 @@ fn agent_missing_release_does_not_refresh_grant_idle_timeout() {
         &mut stream,
         json!({
             "type": "grant",
-            "scope_type": "session",
-            "scope_ref": "idle-release",
+            "grant_id": "idle-release",
             "ttl_secs": 60,
             "deks": [
                 {
@@ -1763,7 +1887,6 @@ fn agent_missing_release_does_not_refresh_grant_idle_timeout() {
                         public_key,
                         &dek,
                         &aad_agent_deliver(
-                            "session",
                             "idle-release",
                             "API_TOKEN",
                             approval_nonce,
@@ -1780,7 +1903,7 @@ fn agent_missing_release_does_not_refresh_grant_idle_timeout() {
     thread::sleep(Duration::from_millis(600));
     let missing_release = agent_request(
         &mut stream,
-        json!({"type": "release", "scope_type": "session", "scope_ref": "missing-release"}),
+        json!({"type": "release", "grant_id": "missing-release"}),
     );
     assert_eq!(missing_release["ok"], true);
     assert_eq!(missing_release["result"]["released"], false);
@@ -1790,14 +1913,13 @@ fn agent_missing_release_does_not_refresh_grant_idle_timeout() {
     let denied = agent_request(
         &mut stream,
         json!({
-            "type": "deliver",
-            "scope_type": "session",
-            "scope_ref": "idle-release",
-            "mode": "inject",
+            "type": "deliver.inject",
+            "grant_id": "idle-release",
+
             "path": tmp.path().join("idle-release.env"),
             "format": "dotenv",
             "secrets": [
-                {"name": "API_TOKEN", "key": "API_TOKEN", "envelope": envelope}
+                {"name": "API_TOKEN", "tier": "protected", "key": "API_TOKEN", "envelope": envelope}
             ]
         }),
     );

@@ -178,7 +178,7 @@ In every row Python holds only ciphertext or a blind box. (The standard-create r
 | Key material | machine key / VMK / DEKs / its own keypair | **never holds any** |
 | Crypto | seal, open, sign, release-DEK | **never performs any** |
 | Storage | cross-platform master/VMK store | `vault_secrets` DB: ciphertext columns + all metadata |
-| Metadata / orchestration | none | groups, tags, links, audit, requests, REST/UI, `$<NAME>`, IM approval cards, scope-grant bookkeeping |
+| Metadata / orchestration | none | tags, links, audit, requests, REST/UI, `$<NAME>`, IM approval cards, grant bookkeeping |
 | Delivery | run (child env) / fetch (HTTP egress) / inject (file) | initiates only; never touches plaintext |
 
 The DB (`vault_secrets` and friends) stays Python-owned and is the source of truth for **metadata**. `avault` never touches SQLite; Python passes it ciphertext blobs and gets back ciphertext or results.
@@ -218,10 +218,10 @@ The agent (a child process of the daemon) knows it needs the **name** `OPENAI_AP
      Secret:  OPENAI_API_KEY        ← name only, never the value
      For:     python sync.py        ← the exact command
      Egress:  local child process (no network)
-     [✅ Approve once] [⏱️ 15 min · this session] [📦 group · 15 min] [🚫 Deny]
+     [✅ Approve once] [⏱️ 15 min · this session] [🚫 Deny]
      ```
 3. **Only the user, in the browser/IM, can approve.** Neither the agent nor the daemon can self-grant.
-4. On approval the daemon records a **grant** `{scope_type, scope_ref, session_id, expires_at}`. Within the TTL the same session reusing the same scope is not re-prompted; a different session / secret / expiry re-prompts.
+4. On approval the daemon records a **grant** with a first-class `grant_id`, a fixed approved protected-secret snapshot, the session binding, and `expires_at`. Within the TTL the same session reusing the same grant is not re-prompted; a different session / secret set / expiry re-prompts.
 
 Honest boundary: this protects the value from entering the LLM context / transcript / Python, and lets the user **see the exact command** the agent will run. It is not a defense against a fully compromised agent the user blindly approves; the human-reviewed command is that line of defense.
 
@@ -258,7 +258,7 @@ On a protected unlock the browser releases the **per-record DEK** (scoped to the
 
 ### 8.2 Delivering a protected value
 
-Browser seals the DEK to `avault`'s pubkey → 📦 → daemon relays → `avault` opens, decrypts the DB ciphertext with the DEK, and delivers. For a scope grant, the browser releases the scope's DEK-set; `avault` caches it for the TTL (resident agent, §12). The value materializes only inside `avault`.
+Browser seals the DEK to `avault`'s pubkey → 📦 → daemon relays → `avault` opens, decrypts the DB ciphertext with the DEK, and delivers. For a grant, the browser releases the grant's protected DEK-set; `avault` caches it under `grant_id` for the TTL (resident agent, §12). The value materializes only inside `avault`.
 
 ### 8.3 secp256k1 signing — sign a digest, not a transaction
 
@@ -306,10 +306,10 @@ Unifying principle:
 ## 9. Authorization & grants
 
 - **ApprovalCard** (§7.2) is rendered on the current session's surface (Web chat / IM). It shows the agent/session, the secret **name**, the exact command/host, the requested scope, and TTL options. It never shows the value.
-- **Scope-typed grants:** `{scope_type ∈ {secret, group, …}, scope_ref, session_id, expires_at}`. Recorded by the daemon; suppress re-prompts within the TTL.
-- **DEK cache (resident agent, P2):** after the first release, `avault` caches the unwrapped DEK-set for the grant TTL. Repeated uses in the window don't re-hit the store or re-prompt. The daemon proves it is the authorized caller via `SO_PEERCRED` (peer credential on the socket) — not a shared token. On expiry the cache is cleared and zeroized.
+- **Grant-id grants:** `grant_id` identifies one user-approved, session-bound, time-limited protected-secret set. Recorded by the daemon; suppresses re-prompts within the TTL.
+- **DEK cache (resident agent, P2):** after the first release, `avault` caches protected delivery DEKs by `{grant_id, name}` for the grant TTL. Repeated uses in the window don't re-hit the browser unlock flow or re-prompt. The daemon proves it is the authorized caller via `SO_PEERCRED` (peer credential on the socket) — not a shared token. On expiry the cache is cleared and zeroized.
 
-Generalized from `vt`'s `AuthCache` rigor: strict TTL with **no** sliding refresh, idempotent grants, PID-reuse defense, lock-clears-the-cache — but re-keyed from `{TTY/app}` to `{scope_type, scope_ref, session_id}` and fed by the UI/IM approval path alongside (or instead of) a biometric one.
+Generalized from `vt`'s `AuthCache` rigor: strict TTL with **no** sliding refresh, idempotent grants, PID-reuse defense, lock-clears-the-cache — but re-keyed from `{TTY/app}` to `grant_id` and fed by the UI/IM approval path alongside (or instead of) a biometric one.
 
 ---
 
@@ -407,9 +407,9 @@ This is an internal store selection inside `avault`, not an Avibe-level plugin l
 | **P1 / P1.1** | `avault-core` + CLI + cross-platform file store; Rust takes standard-tier seal/open + `deliver run`/`fetch`/`inject`; `vibe runtime prepare` ensure + Dependencies card. Closes the memory-hygiene gap. | done |
 | **P2 — the final trust model, in one shot (no P3)** | Delivered as one reviewed avault re-submission after the unreviewed Phase A/B merges were reverted; nothing ships as a half-released transition state. | in review |
 | · **Phase A** | HPKE blind-box `open` / `open_with_dek`, `pubkey`, `seal --blind-box`, secp256k1 digest signing (`ecdsa-secp256k1-recoverable` = ETH, `ecdsa-secp256k1-der` = BTC legacy/SegWit, `schnorr-secp256k1-bip340` = BTC Taproot), `SignerProvider` seam, pinned JSON contracts (Appendix C). | in review |
-| · **Phase B** | Resident agent: unix socket + `SO_PEERCRED` / `LOCAL_PEERCRED`, fresh in-memory receiver keypair, scope-typed grant DEK-cache (strict TTL + idle-zeroize), signing oracle; protected-tier `deliver` (browser-released DEK blind box). | in review |
+| · **Phase B** | Resident agent: unix socket + `SO_PEERCRED` / `LOCAL_PEERCRED`, fresh in-memory receiver keypair, grant-id DEK-cache (strict TTL + idle-zeroize), signing oracle; protected-tier `deliver` (browser-released DEK blind box). | in review |
 | · **Phase C** | `file + passphrase` master store (passphrase-wrapped master, unlock once at startup). | in review |
-| · **avibe + browser** | Same one-shot P2, separate tracks. Python: protected create/resolve, blind-box create relay, scope-typed grants, approval / secure-input cards, signing relay. Browser: HPKE seal, VMK/DEK with passkey-PRF + password, browser ETH/BTC signing. | in progress |
+| · **avibe + browser** | Same one-shot P2, separate tracks. Python: protected create/resolve, blind-box create relay, grant-id approvals, approval / secure-input cards, signing relay. Browser: HPKE seal, VMK/DEK with passkey-PRF + password, browser ETH/BTC signing. | in progress |
 | **Plugin seams** (not a phase) | Additional hardware stores (Secure Enclave / TPM / KMS), external signers (hardware wallet / WalletConnect), MPC, and other curves (e.g. ed25519) — drop in behind the `KeyStore` / `SignerProvider` traits when the need or hardware is real. Adding one is a plugin, never a migration or a released transition. | as needed |
 
 **P2 is the entire final Vaults trust model, built in one shot — there is no separate P3
@@ -428,7 +428,7 @@ fresh in-memory receiver keypair that the browser pins/attests (§11.4).
 1. **Name → `avault`.** Short, ownable; already the repo / binary / crate prefix. Not published to crates.io, so no registry-name collision concern.
 2. **Envelope → wrapped_dek (Scheme A).** Random per-record DEK, wrapped under the root (master / VMK); store `wrapped_dek`. Cheap rotation (re-wrap, never re-encrypt), no DB break, and it unifies the standard + protected envelopes. The protected tier extends it with **N `wrapped_vmk` factor-copies** (password via `scrypt`, passkey via WebAuthn-PRF, second device, recovery code) — **any one factor unlocks the same random VMK**, and add / remove / change-password is a re-wrap of the VMK, not a re-encrypt of data. The only "derive" is *factor → KEK*; the DEK and VMK are random and wrapped. (Rejected: `vt`'s pure-derive — forces full re-encrypt on rotation and a second envelope format.)
 3. **Distribution → a real manifest-pinned release pipeline**, version-locked to the avibe release (Show-Runtime model); build the full path **stub-first**; current required targets are `macos-arm64`, `macos-x64`, `linux-x64`, `linux-arm64`, and `windows-x64`, with `windows-arm64` best-effort. macOS signing/notarization is an explicit sub-task. (Rejected: `curl | sh` and any throwaway dev installer.)
-4. **P1 scope → standard-tier CLI core.** In: `avault-core` seal/open (AES-256-GCM + wrapped_dek + AAD), `avault-store` cross-platform file store, `avault-cli` (`seal` via stdin, `deliver run`, `key export/import`), the stub-first delivery pipeline, and the avibe-side wiring (route `vault_crypto.py`'s standard value path through avault; `vault_secrets` stays the metadata source of truth). P1.1 pulls the remaining standard-tier delivery modes (`deliver fetch`, `deliver inject`) forward so Avibe can remove the Python open path all at once. Out → P2: resident agent, scope grants + approval-card UX, signing, the protected tier, hardware/passphrase stores. The standard-create transient-plaintext-in-Python residual stays in P1 (§11.3); the blind box eliminates it in P2.
+4. **P1 scope → standard-tier CLI core.** In: `avault-core` seal/open (AES-256-GCM + wrapped_dek + AAD), `avault-store` cross-platform file store, `avault-cli` (`seal` via stdin, `deliver run`, `key export/import`), the stub-first delivery pipeline, and the avibe-side wiring (route `vault_crypto.py`'s standard value path through avault; `vault_secrets` stays the metadata source of truth). P1.1 pulls the remaining standard-tier delivery modes (`deliver fetch`, `deliver inject`) forward so Avibe can remove the Python open path all at once. Out → P2: resident agent, grant-id approvals + approval-card UX, signing, the protected tier, hardware/passphrase stores. The standard-create transient-plaintext-in-Python residual stays in P1 (§11.3); the blind box eliminates it in P2.
 5. **Protected-tier pubkey trust → deferred to P2** (the protected tier itself is P2). Lean **attest** (sign the ephemeral X25519 pubkey with an identity key the browser already trusts) — it pairs with the ephemeral-keypair choice and defeats first-use MITM; interim **pin** (TOFU) is acceptable. Not on the P1 path.
 6. **Transport safety → CLI is the conservative default (P1); the resident agent (P2) is a deliberate, hardened tradeoff.** CLI has no listening surface and a tiny key-in-memory window. The agent (for grant-cache + signing only) is more exposed → idle-timeout zeroize, cache DEKs not the master 24/7, `mlock` + no-coredump, peer-cred auth. See §12.
 7. **Master-key store on no-hardware hosts → add `file + passphrase`** (passphrase-wrapped master, unlock once at startup; plaintext never on disk). The cloud/no-TPM sweet spot; defends at-rest, not the running machine; P2, pairs with the agent or the Linux kernel keyring. See §13.
@@ -453,7 +453,7 @@ fresh in-memory receiver keypair that the browser pins/attests (§11.4).
 
 **Don't inherit (the ≈3.6k-LOC macOS shell):** the Keychain-only store, the SSH-agent user surface, FIDO2 enrollment, TOTP, the remote-sudo PAM path, the `VT_AUTH` shared-token channel, and the legacy `vt://mac` format.
 
-**Build fresh for us:** cross-platform store (file-store floor → keychain/SE/TPM/KMS), per-record standard/protected policy, `SO_PEERCRED` daemon authorization, scope-typed grants fed by UI/IM approval, the `name+scheme+version` AAD aligned to our columns, a secp256k1 signer, and the `SignerProvider` seam for later external signers.
+**Build fresh for us:** cross-platform store (file-store floor → keychain/SE/TPM/KMS), per-record standard/protected policy, `SO_PEERCRED` daemon authorization, grant-id DEK caches fed by UI/IM approval, the `name+scheme+version` AAD aligned to our columns, a secp256k1 signer, and the `SignerProvider` seam for later external signers.
 
 Net: `vt` proves the model and donates the crypto shapes; `avault` is the clean, cross-platform, agent-shaped custody core those shapes belong in.
 
@@ -499,7 +499,7 @@ These are starting recommendations, not frozen choices — items #2 (envelope) a
 
 Phase A implements the core blind-box opener and secp256k1 signer plus one-shot CLI
 verbs. Phase B adds the resident agent transport plus `grant` / `release`: cache a
-scope's DEK-set for a TTL so repeated uses in-window skip re-unlock. Signing is
+grant's DEK-set for a TTL so repeated uses in-window skip re-unlock. Signing is
 chain-agnostic: callers provide the exact 32-byte digest/sighash and select the
 signature encoding.
 
@@ -521,8 +521,8 @@ AAD is:
   || field(name)
   || field("machine-aesgcm-v1")
   || field(0x01)
-  || field(scope_type or "")
-  || field(scope_ref or "")
+  || field(grant_id or "")
+  || field("")  // reserved v1 field
   || field(sign_scheme or "")
   || field(digest or "")
   || field(approval_nonce or "")
@@ -553,8 +553,8 @@ master-derived and therefore not ephemeral. Current `purpose` and
 | Operation | `purpose` | Required AAD context | `operation_hash` fields |
 |---|---|---|---|
 | `seal --blind-box` | `seal` | `name` | empty |
-| agent delivery grant | `agent-deliver` | `scope_type`, `scope_ref`, `name`, approval, `ttl_secs` | `"agent-deliver"`, name, `ttl_secs_u64_be` |
-| agent signing grant | `agent-sign` | `scope_type`, `scope_ref`, `name`, `sign_scheme`, `digest`, approval, `ttl_secs` | `"agent-sign"`, scheme, raw 32-byte digest, `ttl_secs_u64_be` |
+| agent delivery grant | `agent-deliver` | `grant_id`, `name`, approval, `ttl_secs` | `"agent-deliver"`, name, `ttl_secs_u64_be` |
+| agent signing grant | `agent-sign` | `grant_id`, `name`, `sign_scheme`, `digest`, approval, `ttl_secs` | `"agent-sign"`, scheme, raw 32-byte digest, `ttl_secs_u64_be` |
 
 These values and example AAD bytes are pinned in
 `tests/vectors/p2_core_crypto.json`.
@@ -764,38 +764,22 @@ restart. Protected-tier callers must re-pin / re-attest it per agent lifetime
 (§11.4).
 
 `grant` opens browser-sealed DEKs to the agent's current pubkey and caches them by
-scope until the fixed TTL expires. The TTL is strict and does not slide; idle
+`grant_id` until the fixed TTL expires. The TTL is strict and does not slide; idle
 timeout or process restart also clears the cache. DEKs are stored in the same
 dedicated locked 32-byte pages as master keys. Delivery DEKs are keyed by
-`{scope_type, scope_ref, name}`. Signing DEKs are keyed by
-`{scope_type, scope_ref, name, scheme, digest}` so one approved signing blind box
-cannot be replayed for a new digest.
+`{grant_id, name}`. Signing DEKs are keyed by
+`{grant_id, name, scheme, digest}` so one approved signing blind box cannot be
+replayed for a new digest.
 
 ```json
 {
   "type": "grant",
-  "scope_type": "session",
-  "scope_ref": "ses_123",
+  "grant_id": "gr_123",
+  "purpose": "deliver",
   "ttl_secs": 300,
   "deks": [
     {
       "name": "OPENAI_API_KEY",
-      "purpose": "deliver",
-      "dek_blindbox": {
-        "scheme": "hpke-x25519-hkdfsha256-aes256gcm-v1",
-        "enc": "...",
-        "ct": "..."
-      },
-      "approval": {
-        "nonce": "<base64 16..128 random bytes>",
-        "expires_at_unix": 4102444800
-      }
-    },
-    {
-      "name": "ETH_SIGNING_KEY",
-      "purpose": "sign",
-      "scheme": "ecdsa-secp256k1-recoverable",
-      "digest": "<hex 32-byte digest>",
       "dek_blindbox": {
         "scheme": "hpke-x25519-hkdfsha256-aes256gcm-v1",
         "enc": "...",
@@ -813,13 +797,13 @@ cannot be replayed for a new digest.
 Response:
 
 ```json
-{ "ok": true, "result": { "granted": 2, "ttl_secs": 300 } }
+{ "ok": true, "result": { "granted": 1, "ttl_secs": 300 } }
 ```
 
 `purpose` defaults to `deliver` for delivery grants. A delivery grant must not
 include `scheme` or `digest`; a signing grant must include both. `digest` is hex
 on the JSON wire, but the blind-box AAD authenticates the decoded 32-byte digest.
-`scope_type` and `scope_ref` must be non-empty. `ttl_secs` defaults to 300, must
+`grant_id` must be non-empty. `ttl_secs` defaults to 300, must
 be positive, and is capped at 86400. The same normalized `ttl_secs` value is
 authenticated in each grant DEK blind box as an 8-byte unsigned big-endian field
 inside `operation_hash`, so a daemon cannot replay a shorter approved release
@@ -829,7 +813,7 @@ into a longer agent grant. The effective grant expiry is the earlier of
 `release` and `revoke` are aliases. They drop and zeroize the grant if present:
 
 ```json
-{ "type": "release", "scope_type": "session", "scope_ref": "ses_123" }
+{ "type": "release", "grant_id": "gr_123" }
 ```
 
 Response:
@@ -838,23 +822,29 @@ Response:
 { "ok": true, "result": { "released": true } }
 ```
 
-Agent `deliver` uses a cached DEK selected by `{scope_type, scope_ref, name}`. It
-never accepts a `dek_blindbox` on deliver frames; the DEK must already be covered
-by a grant.
+Agent delivery uses cached protected DEKs selected by `{grant_id, name}`. It never
+accepts a `dek_blindbox` on delivery frames; protected DEKs must enter through
+`grant`. Standard entries in a mixed run are opened with the standard
+machine-rooted store inside the same resident-agent frame.
 
 `deliver` run:
 
 ```json
 {
-  "type": "deliver",
-  "scope_type": "session",
-  "scope_ref": "ses_123",
-  "mode": "run",
+  "type": "deliver.run",
+  "grant_id": "gr_123",
   "command": ["/usr/bin/env", "python3", "sync.py"],
   "secrets": [
     {
       "name": "OPENAI_API_KEY",
       "env": "OPENAI_API_KEY",
+      "tier": "standard",
+      "envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." }
+    },
+    {
+      "name": "PROD_DB_URL",
+      "env": "DATABASE_URL",
+      "tier": "protected",
       "envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." }
     }
   ]
@@ -871,12 +861,13 @@ Response:
 
 ```json
 {
-  "type": "deliver",
-  "scope_type": "session",
-  "scope_ref": "ses_123",
-  "mode": "fetch",
-  "name": "GITHUB_TOKEN",
-  "envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." },
+  "type": "deliver.fetch",
+  "grant_id": "gr_123",
+  "auth": {
+    "name": "GITHUB_TOKEN",
+    "tier": "protected",
+    "envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." }
+  },
   "request": {
     "method": "GET",
     "url": "https://api.github.com/user",
@@ -896,16 +887,15 @@ Response `result` is the normal fetch output:
 
 ```json
 {
-  "type": "deliver",
-  "scope_type": "session",
-  "scope_ref": "ses_123",
-  "mode": "inject",
+  "type": "deliver.inject",
+  "grant_id": "gr_123",
   "path": "/path/to/secrets.env",
   "format": "dotenv",
   "secrets": [
     {
       "name": "OPENAI_API_KEY",
       "key": "OPENAI_API_KEY",
+      "tier": "protected",
       "envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." }
     }
   ]
@@ -919,14 +909,13 @@ Response:
 ```
 
 Agent `sign` uses the cached signing DEK selected by
-`{scope_type, scope_ref, name, scheme, digest}` to open the signing-key envelope,
-signs the caller-provided digest, and wipes the private key immediately.
+`{grant_id, name, scheme, digest}` to open the signing-key envelope, signs the
+caller-provided digest, and wipes the private key immediately.
 
 ```json
 {
   "type": "sign",
-  "scope_type": "session",
-  "scope_ref": "ses_123",
+  "grant_id": "gr_123",
   "name": "ETH_SIGNING_KEY",
   "key_envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." },
   "digest": "<hex 32-byte digest>",
