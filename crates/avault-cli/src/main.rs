@@ -2695,6 +2695,7 @@ fn handle_agent_frame_inner(
             if secrets.is_empty() {
                 bail!("deliver run requires at least one secret");
             }
+            reject_agent_env_one_shot_fields(&secrets)?;
             let scope = grant_key_from_id(grant_id)?;
             let opened = {
                 state.purge();
@@ -2769,6 +2770,7 @@ fn handle_agent_frame_inner(
                 format,
                 secrets,
             };
+            reject_agent_named_one_shot_fields(&inject.secrets)?;
             state.purge();
             if !state.grants.contains_key(&scope) {
                 bail!("grant is missing or expired");
@@ -2921,6 +2923,28 @@ fn reject_agent_one_shot_secret_fields(
 ) -> anyhow::Result<()> {
     if dek_blindbox.is_some() || approval.is_some() {
         bail!("agent delivery uses cached grants and rejects one-shot DEK fields");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn reject_agent_env_one_shot_fields(secrets: &[EnvSecretInput]) -> anyhow::Result<()> {
+    for secret in secrets {
+        reject_agent_one_shot_secret_fields(
+            secret.dek_blindbox.as_ref(),
+            secret.approval.as_ref(),
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn reject_agent_named_one_shot_fields(secrets: &[NamedSecretInput]) -> anyhow::Result<()> {
+    for secret in secrets {
+        reject_agent_one_shot_secret_fields(
+            secret.dek_blindbox.as_ref(),
+            secret.approval.as_ref(),
+        )?;
     }
     Ok(())
 }
