@@ -2202,9 +2202,27 @@ impl AgentState {
 
     fn get_grant(&mut self, scope: &GrantKey) -> anyhow::Result<&GrantEntry> {
         self.purge();
-        self.grants
+        self.get_live_grant(scope)
+    }
+
+    fn get_live_grant(&self, scope: &GrantKey) -> anyhow::Result<&GrantEntry> {
+        let now = Instant::now();
+        if now.duration_since(self.last_activity) >= self.idle_timeout {
+            bail!("grant is missing or expired");
+        }
+        let grant = self
+            .grants
             .get(scope)
-            .context("grant is missing or expired")
+            .context("grant is missing or expired")?;
+        if grant.expires_at <= now {
+            bail!("grant is missing or expired");
+        }
+        Ok(grant)
+    }
+
+    fn require_live_grant(&self, scope: &GrantKey) -> anyhow::Result<()> {
+        self.get_live_grant(scope)?;
+        Ok(())
     }
 
     fn ensure_grant_nonce_unused(&mut self, nonce: &[u8]) -> anyhow::Result<()> {
@@ -2699,15 +2717,10 @@ fn handle_agent_frame_inner(
             let scope = grant_key_from_id(grant_id)?;
             let opened = {
                 state.purge();
-                if !state.grants.contains_key(&scope) {
-                    bail!("grant is missing or expired");
-                }
+                state.require_live_grant(&scope)?;
                 let standard_master = state
                     .standard_master(secrets.iter().any(|s| s.tier == SecretTier::Standard))?;
-                let grant = state
-                    .grants
-                    .get(&scope)
-                    .context("grant is missing or expired")?;
+                let grant = state.get_live_grant(&scope)?;
                 open_env_secrets_for_agent(secrets, grant, standard_master.as_ref())?
             };
             let command: Vec<OsString> = command.into_iter().map(OsString::from).collect();
@@ -2733,14 +2746,9 @@ fn handle_agent_frame_inner(
             let scope = grant_key_from_id(grant_id)?;
             let mut secret = {
                 state.purge();
-                if !state.grants.contains_key(&scope) {
-                    bail!("grant is missing or expired");
-                }
+                state.require_live_grant(&scope)?;
                 let standard_master = state.standard_master(fetch.tier == SecretTier::Standard)?;
-                let grant = state
-                    .grants
-                    .get(&scope)
-                    .context("grant is missing or expired")?;
+                let grant = state.get_live_grant(&scope)?;
                 open_agent_secret(
                     &fetch.name,
                     fetch.tier,
@@ -2772,19 +2780,14 @@ fn handle_agent_frame_inner(
             };
             reject_agent_named_one_shot_fields(&inject.secrets)?;
             state.purge();
-            if !state.grants.contains_key(&scope) {
-                bail!("grant is missing or expired");
-            }
+            state.require_live_grant(&scope)?;
             let standard_master = state.standard_master(
                 inject
                     .secrets
                     .iter()
                     .any(|s| s.tier == SecretTier::Standard),
             )?;
-            let grant = state
-                .grants
-                .get(&scope)
-                .context("grant is missing or expired")?;
+            let grant = state.get_live_grant(&scope)?;
             write_inject_from_opened(inject, grant, standard_master.as_ref())?;
             Ok((agent_ok(serde_json::json!({ "ok": true }))?, true))
         }
@@ -3258,5 +3261,52 @@ mod tests {
         let needles = [Zeroizing::new(b"a".to_vec())];
 
         assert!(redact_fetch_body(&mut body, &needles).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_grant_rejects_expired_entry_without_purge() {
+        let mut state = AgentState::new(Duration::from_secs(60), None, None);
+        let scope = GrantKey {
+            grant_id: "expired-grant".to_string(),
+        };
+        state.grants.insert(
+            scope.clone(),
+            GrantEntry {
+                expires_at: Instant::now() - Duration::from_millis(1),
+                deks: HashMap::new(),
+            },
+        );
+
+        let err = match state.get_live_grant(&scope) {
+            Ok(_) => panic!("expired grant should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("grant is missing or expired"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_grant_rejects_idle_expired_entry_without_purge() {
+        let mut state = AgentState::new(Duration::from_secs(1), None, None);
+        let scope = GrantKey {
+            grant_id: "idle-grant".to_string(),
+        };
+        state.last_activity = Instant::now() - Duration::from_secs(2);
+        state.grants.insert(
+            scope.clone(),
+            GrantEntry {
+                expires_at: Instant::now() + Duration::from_secs(60),
+                deks: HashMap::new(),
+            },
+        );
+
+        let err = match state.get_live_grant(&scope) {
+            Ok(_) => panic!("idle-expired grant should be rejected"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("grant is missing or expired"));
     }
 }
