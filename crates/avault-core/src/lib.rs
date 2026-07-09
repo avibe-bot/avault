@@ -70,6 +70,17 @@ struct WrapMeta {
     scheme: String,
     wrapped_dek: String,
     dek_nonce: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    record_meta: Option<ProtectedRecordMeta>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+enum ProtectedRecordMeta {
+    #[serde(rename = "static")]
+    Static,
+    #[serde(rename = "keypair")]
+    Keypair { public_key: String },
 }
 
 /// Passphrase-wrapped machine-key export blob.
@@ -110,6 +121,7 @@ pub fn seal(master_key: &[u8; KEY_BYTES], name: &str, value: &[u8]) -> anyhow::R
         scheme: WRAP_SCHEME.to_string(),
         wrapped_dek: b64(&wrapped_dek),
         dek_nonce: b64(&dek_nonce),
+        record_meta: None,
     };
 
     Ok(Sealed {
@@ -154,7 +166,8 @@ pub fn open(
 /// Open an envelope when the per-record DEK was released through a blind box.
 ///
 /// This is the protected-tier companion to [`open`]: the master key is not used,
-/// but the value ciphertext is still authenticated with the same name/scheme/version AAD.
+/// and the browser-sealed protected value is authenticated with the v2 record AAD
+/// derived from `wrap_meta.record_meta`.
 pub fn open_with_dek(
     dek: &[u8; KEY_BYTES],
     name: &str,
@@ -168,7 +181,7 @@ pub fn open_with_dek(
     if meta.v != WRAP_META_VERSION {
         bail!("unsupported wrap_meta version");
     }
-    open_value_with_dek_aad_only(dek, name, sealed)
+    open_protected_value_with_dek(dek, name, sealed, &meta)
 }
 
 /// Export an existing master key as a P0-compatible scrypt + AES-256-GCM blob.
@@ -282,16 +295,22 @@ fn open_value_with_dek(
     }
 }
 
-fn open_value_with_dek_aad_only(
+fn open_protected_value_with_dek(
     dek: &[u8; KEY_BYTES],
     name: &str,
     sealed: &Sealed,
+    meta: &WrapMeta,
 ) -> anyhow::Result<Zeroizing<Vec<u8>>> {
     let value_nonce = decode_nonce(&sealed.nonce, "nonce")?;
     let ciphertext = unb64(&sealed.ciphertext, "ciphertext")?;
-    decrypt_with_key(dek, &value_nonce, &ciphertext, &aad(name))
-        .map(Zeroizing::new)
-        .context("value decrypt failed")
+    let protected_aad = protected_record_aad(name, meta);
+    match decrypt_with_key(dek, &value_nonce, &ciphertext, &protected_aad) {
+        Ok(plaintext) => Ok(Zeroizing::new(plaintext)),
+        Err(v2_err) => decrypt_with_key(dek, &value_nonce, &ciphertext, &aad(name))
+            .map(Zeroizing::new)
+            .map_err(|_| v2_err)
+            .context("value decrypt failed"),
+    }
 }
 
 fn derive_kek_scrypt(
@@ -331,6 +350,30 @@ fn aad(name: &str) -> Vec<u8> {
     out.extend_from_slice(WRAP_SCHEME.as_bytes());
     out.push(WRAP_META_VERSION);
     out
+}
+
+fn protected_record_aad(name: &str, meta: &WrapMeta) -> Vec<u8> {
+    // Mirrors vault-sandbox stableJson: sorted keys, no whitespace.
+    let record = match meta.record_meta.as_ref() {
+        Some(ProtectedRecordMeta::Static) => "{\"kind\":\"static\"}".to_string(),
+        Some(ProtectedRecordMeta::Keypair { public_key }) => format!(
+            "{{\"kind\":\"keypair\",\"public_key\":{}}}",
+            json_string(&public_key.to_ascii_lowercase())
+        ),
+        None => "null".to_string(),
+    };
+    format!(
+        "{{\"domain\":\"avault:protected-record:aad:v2\",\"name\":{},\"record\":{},\"scheme\":{},\"version\":{}}}",
+        json_string(name),
+        record,
+        json_string(&meta.scheme),
+        meta.v
+    )
+    .into_bytes()
+}
+
+fn json_string(value: &str) -> String {
+    serde_json::to_string(value).expect("string JSON serialization cannot fail")
 }
 
 fn b64(raw: &[u8]) -> String {
@@ -487,6 +530,105 @@ mod tests {
         };
 
         assert!(open_with_dek(&dek, "PROTECTED_KEY", &sealed).is_err());
+    }
+
+    #[test]
+    fn protected_record_aad_matches_sandbox_stable_json_static() {
+        let meta: WrapMeta = serde_json::from_value(json!({
+            "v": 1,
+            "scheme": WRAP_SCHEME,
+            "wrapped_dek": "",
+            "dek_nonce": "",
+            "record_meta": {"kind": "static"}
+        }))
+        .unwrap();
+        let aad = String::from_utf8(protected_record_aad("AI_RELAY_KEY_3", &meta)).unwrap();
+        assert_eq!(
+            aad,
+            "{\"domain\":\"avault:protected-record:aad:v2\",\"name\":\"AI_RELAY_KEY_3\",\"record\":{\"kind\":\"static\"},\"scheme\":\"machine-aesgcm-v1\",\"version\":1}"
+        );
+    }
+
+    #[test]
+    fn protected_record_aad_matches_sandbox_stable_json_keypair() {
+        let meta: WrapMeta = serde_json::from_value(json!({
+            "v": 1,
+            "scheme": WRAP_SCHEME,
+            "wrapped_dek": "",
+            "dek_nonce": "",
+            "record_meta": {
+                "kind": "keypair",
+                "public_key": "ABCDEF0123456789"
+            }
+        }))
+        .unwrap();
+        let aad = String::from_utf8(protected_record_aad("ETH_SIGNING_KEY", &meta)).unwrap();
+        assert_eq!(
+            aad,
+            "{\"domain\":\"avault:protected-record:aad:v2\",\"name\":\"ETH_SIGNING_KEY\",\"record\":{\"kind\":\"keypair\",\"public_key\":\"abcdef0123456789\"},\"scheme\":\"machine-aesgcm-v1\",\"version\":1}"
+        );
+    }
+
+    #[test]
+    fn opens_sandbox_v2_static_record_with_released_dek() {
+        let dek = [0x99u8; KEY_BYTES];
+        let value_nonce = [0x11u8; NONCE_BYTES];
+        let aad = b"{\"domain\":\"avault:protected-record:aad:v2\",\"name\":\"AI_RELAY_KEY_3\",\"record\":{\"kind\":\"static\"},\"scheme\":\"machine-aesgcm-v1\",\"version\":1}";
+        let ciphertext = encrypt_with_key(&dek, &value_nonce, b"protected-key", aad).unwrap();
+        let sealed = Sealed {
+            ciphertext: b64(&ciphertext),
+            nonce: b64(&value_nonce),
+            wrap_meta: json!({
+                "v": 1,
+                "scheme": WRAP_SCHEME,
+                "wrapped_dek": "",
+                "dek_nonce": "",
+                "record_meta": {"kind": "static"}
+            })
+            .to_string(),
+        };
+
+        let opened = open_with_dek(&dek, "AI_RELAY_KEY_3", &sealed).unwrap();
+        assert_eq!(opened.as_slice(), b"protected-key");
+        assert!(open_with_dek(&dek, "OTHER_KEY", &sealed).is_err());
+    }
+
+    #[test]
+    fn opens_sandbox_v2_keypair_record_for_signing() {
+        let dek = [0x53u8; KEY_BYTES];
+        let value_nonce = [0x22u8; NONCE_BYTES];
+        let private_key_hex = "4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+        let private_key = hex::decode(private_key_hex).unwrap();
+        let aad = b"{\"domain\":\"avault:protected-record:aad:v2\",\"name\":\"ETH_SIGNING_KEY\",\"record\":{\"kind\":\"keypair\",\"public_key\":\"abcdef0123456789\"},\"scheme\":\"machine-aesgcm-v1\",\"version\":1}";
+        let ciphertext = encrypt_with_key(&dek, &value_nonce, &private_key, aad).unwrap();
+        let sealed = Sealed {
+            ciphertext: b64(&ciphertext),
+            nonce: b64(&value_nonce),
+            wrap_meta: json!({
+                "v": 1,
+                "scheme": WRAP_SCHEME,
+                "wrapped_dek": "",
+                "dek_nonce": "",
+                "record_meta": {
+                    "kind": "keypair",
+                    "public_key": "ABCDEF0123456789"
+                }
+            })
+            .to_string(),
+        };
+
+        let opened = open_with_dek(&dek, "ETH_SIGNING_KEY", &sealed).unwrap();
+        assert_eq!(hex::encode(opened.as_slice()), private_key_hex);
+        let mut signing_key = Zeroizing::new([0u8; KEY_BYTES]);
+        signing_key.copy_from_slice(opened.as_slice());
+        let signature = LocalSignerProvider
+            .sign_digest(
+                SignatureScheme::EcdsaSecp256k1Der,
+                &signing_key,
+                &[0u8; KEY_BYTES],
+            )
+            .unwrap();
+        assert!(!signature.signature.is_empty());
     }
 
     #[test]
