@@ -316,8 +316,8 @@ Generalized from `vt`'s `AuthCache` rigor: strict TTL with **no** sliding refres
 ## 10. Envelope & crypto
 
 - **Keep the P0 `wrap_meta` column shape** (`{scheme, wrapped_dek, dek_nonce}`): storing `wrapped_dek` gives **cheap master rotation** (re-wrap DEKs without touching ciphertext) and does not break the P0 DB. We do **not** adopt `vt`'s pure-derive model (`derive_dek(master, salt)` with nothing stored), which forces a full re-encrypt on every master rotation. The hygiene win comes from Rust owning the key + crypto, which is orthogonal to the envelope shape.
-- **Borrow from `vt`:** AES-256-GCM with **AAD binding `name + scheme + version`** (so ciphertext can't be transplanted between records), HKDF-based DEK derivation where applicable, decrypt results in `Zeroizing`, constant-time compare (`subtle`).
-- **Protected tier:** VMK wrapped by N factor-copies (password via scrypt; passkey-PRF copies added browser-side), each secret's DEK wrapped by the VMK — the format already prototyped in `storage/vault_protected.py` and `ui/src/lib/vaultCrypto.ts`, now produced/consumed across the browser ↔ `avault` boundary.
+- **Borrow from `vt`:** AES-256-GCM with AAD binding so ciphertext can't be transplanted between records. Standard-tier envelopes use `name + scheme + version`; browser-sealed protected values use the protected-record v2 canonical JSON AAD that binds `domain`, `name`, `record`, `scheme`, and `version`.
+- **Protected tier:** VMK wrapped by N factor-copies (password via scrypt; passkey-PRF copies added browser-side), each secret's DEK wrapped by the VMK — the format already prototyped in `storage/vault_protected.py` and `ui/src/lib/vaultCrypto.ts`, now produced/consumed across the browser ↔ `avault` boundary. Protected value opens reconstruct the v2 AAD from `wrap_meta.record_meta` (`static` or `keypair` public key), `scheme`, and `v`.
 
 ---
 
@@ -617,9 +617,10 @@ envelopes authenticate value ciphertext with AAD
 remove the envelope transplant protection. One-shot `sign` is standard-tier only:
 it unwraps the key envelope with the machine master key and rejects
 `dek_blindbox` / `approval` fields. Protected signing uses the resident agent's
-`grant` + `sign` frames; protected DEK opens require the normal
-`name || "machine-aesgcm-v1" || 0x01` envelope AAD and never take the P0
-empty-AAD read-compatibility fallback.
+`grant` + `sign` frames; protected DEK opens require the browser's protected-record
+v2 JSON AAD reconstructed from `wrap_meta.record_meta`, `scheme`, and `v` (with a
+legacy `name || "machine-aesgcm-v1" || 0x01` fallback for pre-v2 envelopes) and
+never take the P0 empty-AAD read-compatibility fallback.
 
 Supported `scheme` values:
 
@@ -650,8 +651,9 @@ All P1.1 delivery inputs are JSON on stdin. The `envelope` object is the persist
 `{ciphertext, nonce, wrap_meta}` shape. The `name` field is the secret name used for
 AAD. Values never appear in argv. One-shot delivery is standard-tier only and
 rejects `dek_blindbox` / `approval` fields. Protected delivery uses the resident
-agent's `grant` + `deliver` frames; the protected DEK path is AAD-only, and the
-P0 empty-AAD fallback is only for old standard-tier master-key rows.
+agent's `grant` + `deliver` frames; the protected DEK path is AAD-only using the
+protected-record v2 JSON AAD, and the P0 empty-AAD fallback is only for old
+standard-tier master-key rows.
 
 `deliver run` accepts a JSON array and spawns exactly one child:
 
