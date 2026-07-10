@@ -808,9 +808,12 @@ on the JSON wire, but the blind-box AAD authenticates the decoded 32-byte digest
 `grant_id` must be non-empty. `ttl_secs` defaults to 300, must
 be positive, and is capped at 86400. The same normalized `ttl_secs` value is
 authenticated in each grant DEK blind box as an 8-byte unsigned big-endian field
-inside `operation_hash`, so a daemon cannot replay a shorter approved release
-into a longer agent grant. The effective grant expiry is the earlier of
-`ttl_secs` and the approval expiry; TTLs never slide.
+inside `operation_hash`. It is the original approved operation duration, not
+the binding's remaining wall-clock lifetime, and must stay identical across the
+sealer and the resident agent. The effective grant expiry is independently
+bounded to the earlier of `now + ttl_secs` and the approval's absolute
+`expires_at_unix`, so relaying the original operation duration cannot extend a
+resident DEK cache past its binding deadline. TTLs never slide.
 
 `release` and `revoke` are aliases. They drop and zeroize the grant if present:
 
