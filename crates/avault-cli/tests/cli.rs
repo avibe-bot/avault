@@ -225,12 +225,13 @@ fn approval_json(nonce: &[u8], expires_at: u64) -> serde_json::Value {
 }
 
 fn future_expiry() -> u64 {
+    expiry_after(3600)
+}
+
+fn expiry_after(seconds: u64) -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        + 3600
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    now.as_secs() + u64::from(now.subsec_nanos() != 0) + seconds
 }
 
 fn run_operation_hash(env: &str, command: &[&str]) -> [u8; 32] {
@@ -1154,6 +1155,86 @@ fn agent_expires_grants_by_ttl() {
             "grant_id": "ttl-test",
 
             "path": tmp.path().join("expired.env"),
+            "format": "dotenv",
+            "secrets": [
+                {"name": "API_TOKEN", "tier": "protected", "key": "API_TOKEN", "envelope": envelope}
+            ]
+        }),
+    );
+    assert_eq!(denied["ok"], false);
+    assert!(denied["error"].as_str().unwrap().contains("grant"));
+
+    let _ = agent.kill();
+    let _ = agent.wait();
+}
+
+#[test]
+fn agent_grant_uses_operation_ttl_but_expires_at_approval_deadline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("run").join("avault.sock");
+    let inject_path = tmp.path().join("delivered.env");
+    let mut agent = spawn_agent(&socket, 60);
+    let mut stream = connect_agent(&socket);
+    let pubkey = agent_request(&mut stream, json!({"type": "pubkey"}));
+    let public_key = pubkey["result"]["public_key"].as_str().unwrap();
+    let dek = [0x58u8; 32];
+    let approval_nonce = b"binding-expiry01";
+    let approval_expires_at = expiry_after(3);
+    let operation_ttl_secs = 300;
+    let grant = agent_request(
+        &mut stream,
+        json!({
+            "type": "grant",
+            "grant_id": "binding-expiry",
+            "ttl_secs": operation_ttl_secs,
+            "deks": [
+                {
+                    "name": "API_TOKEN",
+                    "dek_blindbox": fixed_blind_box(
+                        public_key,
+                        &dek,
+                        &aad_agent_deliver(
+                            "binding-expiry",
+                            "API_TOKEN",
+                            approval_nonce,
+                            approval_expires_at,
+                            operation_ttl_secs
+                        )
+                    ),
+                    "approval": approval_json(approval_nonce, approval_expires_at)
+                }
+            ]
+        }),
+    );
+    assert_eq!(grant["ok"], true);
+    assert_eq!(grant["result"]["ttl_secs"], operation_ttl_secs);
+
+    let envelope = envelope_encrypted_with_dek("API_TOKEN", &dek, b"before-expiry");
+    let delivered = agent_request(
+        &mut stream,
+        json!({
+            "type": "deliver.inject",
+            "grant_id": "binding-expiry",
+            "path": inject_path,
+            "format": "dotenv",
+            "secrets": [
+                {"name": "API_TOKEN", "tier": "protected", "key": "API_TOKEN", "envelope": envelope}
+            ]
+        }),
+    );
+    assert_eq!(delivered["ok"], true);
+
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let deadline = UNIX_EPOCH + Duration::from_secs(approval_expires_at);
+    if let Ok(remaining) = deadline.duration_since(SystemTime::now()) {
+        thread::sleep(remaining + Duration::from_millis(50));
+    }
+    let denied = agent_request(
+        &mut stream,
+        json!({
+            "type": "deliver.inject",
+            "grant_id": "binding-expiry",
+            "path": tmp.path().join("after-expiry.env"),
             "format": "dotenv",
             "secrets": [
                 {"name": "API_TOKEN", "tier": "protected", "key": "API_TOKEN", "envelope": envelope}

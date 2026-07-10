@@ -443,12 +443,16 @@ fn parse_approval_context(input: &ApprovalContextInput) -> anyhow::Result<Approv
 
 #[cfg(unix)]
 fn approval_expiry_instant(expires_at_unix: u64) -> anyhow::Result<Instant> {
-    let now_unix = current_unix_secs()?;
-    if expires_at_unix <= now_unix {
-        bail!("approval is expired");
-    }
-    Instant::now()
-        .checked_add(Duration::from_secs(expires_at_unix - now_unix))
+    let now_instant = Instant::now();
+    let now = SystemTime::now();
+    let expires_at = UNIX_EPOCH
+        .checked_add(Duration::from_secs(expires_at_unix))
+        .context("approval expiration is invalid")?;
+    let remaining = expires_at
+        .duration_since(now)
+        .map_err(|_| anyhow!("approval is expired"))?;
+    now_instant
+        .checked_add(remaining)
         .context("approval expiration is invalid")
 }
 
