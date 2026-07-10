@@ -230,11 +230,8 @@ fn future_expiry() -> u64 {
 
 fn expiry_after(seconds: u64) -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-        + seconds
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    now.as_secs() + u64::from(now.subsec_nanos() != 0) + seconds
 }
 
 fn run_operation_hash(env: &str, command: &[&str]) -> [u8; 32] {
@@ -1182,7 +1179,7 @@ fn agent_grant_uses_operation_ttl_but_expires_at_approval_deadline() {
     let public_key = pubkey["result"]["public_key"].as_str().unwrap();
     let dek = [0x58u8; 32];
     let approval_nonce = b"binding-expiry01";
-    let approval_expires_at = expiry_after(2);
+    let approval_expires_at = expiry_after(3);
     let operation_ttl_secs = 300;
     let grant = agent_request(
         &mut stream,
