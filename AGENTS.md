@@ -84,6 +84,8 @@ cargo fmt
 
 ## 7. Workflow
 
+- Use the `pr-delivery-loop` skill for every implementation task, including the
+  reply-then-resolve review loop and exact-head close-out gate.
 - Branch from `master`; small, focused commits; `type(scope): summary` messages.
 - Open a PR for review; keep `docs/DESIGN.md` in sync when the design changes materially.
 - This repo is consumed by Avibe — coordinate wire-format / interface changes with the
