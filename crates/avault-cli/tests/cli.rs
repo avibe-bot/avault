@@ -1460,6 +1460,90 @@ fn agent_deliver_run_mixes_standard_and_protected_in_one_child() {
 }
 
 #[test]
+fn agent_delivers_protected_field_records_granted_under_record_names() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("run").join("avault.sock");
+    let mut agent = spawn_agent_command(&socket, 60)
+        .env("AVAULT_HOME", tmp.path().join("vault"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stream = connect_agent(&socket);
+    let pubkey = agent_request(&mut stream, json!({"type": "pubkey"}));
+    let public_key = pubkey["result"]["public_key"].as_str().unwrap();
+    let approval_expires_at = future_expiry();
+    // One protected item: the default record and an extra field record, each with its own DEK,
+    // released under one grant keyed by record name.
+    let records: [(&str, [u8; 32], &[u8; 16]); 2] = [
+        ("GITHUB_LOGIN", [0x61u8; 32], b"field-grant-def1"),
+        ("GITHUB_LOGIN.username", [0x62u8; 32], b"field-grant-usr1"),
+    ];
+    let deks: Vec<serde_json::Value> = records
+        .iter()
+        .map(|(name, dek, nonce)| {
+            json!({
+                "name": name,
+                "dek_blindbox": fixed_blind_box(
+                    public_key,
+                    dek,
+                    &aad_agent_deliver("field-grant", name, *nonce, approval_expires_at, 60)
+                ),
+                "approval": approval_json(*nonce, approval_expires_at)
+            })
+        })
+        .collect();
+    let grant = agent_request(
+        &mut stream,
+        json!({"type": "grant", "grant_id": "field-grant", "ttl_secs": 60, "deks": deks}),
+    );
+    assert_eq!(grant["ok"], true);
+    assert_eq!(grant["result"]["granted"], 2);
+
+    let default_envelope = envelope_encrypted_with_dek("GITHUB_LOGIN", &records[0].1, b"hunter2");
+    let username_envelope =
+        envelope_encrypted_with_dek("GITHUB_LOGIN.username", &records[1].1, b"octocat");
+    let delivered = agent_request(
+        &mut stream,
+        json!({
+            "type": "deliver.run",
+            "grant_id": "field-grant",
+            "command": [
+                "/bin/sh",
+                "-c",
+                r#"test "$GH_PASS" = hunter2 && test "$GH_USER" = octocat"#
+            ],
+            "secrets": [
+                {"name": "GITHUB_LOGIN", "tier": "protected", "env": "GH_PASS", "envelope": default_envelope},
+                {"name": "GITHUB_LOGIN.username", "tier": "protected", "env": "GH_USER", "envelope": username_envelope}
+            ]
+        }),
+    );
+    assert_eq!(delivered["ok"], true);
+    assert_eq!(delivered["result"]["exit_code"], 0);
+
+    // A record the grant never released, and a field envelope presented as the default record.
+    for wrong_name in ["GITHUB_LOGIN.password", "GITHUB_LOGIN"] {
+        let rejected = agent_request(
+            &mut stream,
+            json!({
+                "type": "deliver.run",
+                "grant_id": "field-grant",
+                "command": ["/bin/sh", "-c", "exit 0"],
+                "secrets": [
+                    {"name": wrong_name, "tier": "protected", "env": "X", "envelope": username_envelope}
+                ]
+            }),
+        );
+        assert_eq!(rejected["ok"], false, "{wrong_name} must not deliver");
+    }
+
+    let _ = agent.kill();
+    let _ = agent.wait();
+}
+
+#[test]
 fn agent_rejects_grant_ttl_escalation() {
     let tmp = tempfile::tempdir().unwrap();
     let socket = tmp.path().join("run").join("avault.sock");
@@ -2113,6 +2197,58 @@ fn deliver_run_accepts_multiple_secrets_for_one_child() {
     let output = deliver.wait_with_output().unwrap();
     assert!(output.status.success());
     assert_eq!(output.stdout, b"ok");
+}
+
+#[test]
+fn deliver_run_binds_field_records_to_their_record_names() {
+    // Avibe multi-field secrets: the default field is the record named by the bare secret name
+    // and an extra field is `<secret>.<field>`. Both reach one child; a field envelope presented
+    // under another record name must not open.
+    let home = tempfile::tempdir().unwrap();
+    let vault_home = home.path().join("vault");
+    let default_field = seal_secret(vault_home.as_path(), "GITHUB_LOGIN", b"hunter2");
+    let username = seal_secret(vault_home.as_path(), "GITHUB_LOGIN.username", b"octocat");
+    let deliver = |request: serde_json::Value, script: &str| {
+        let mut child = avault()
+            .arg("deliver")
+            .arg("run")
+            .arg("--")
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .env("AVAULT_HOME", &vault_home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(request.to_string().as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+
+    let output = deliver(
+        json!([
+            {"name": "GITHUB_LOGIN", "env": "GH_PASS", "envelope": default_field},
+            {"name": "GITHUB_LOGIN.username", "env": "GH_USER", "envelope": username}
+        ]),
+        r#"test "$GH_PASS" = hunter2 && test "$GH_USER" = octocat && printf ok"#,
+    );
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"ok");
+
+    for wrong_name in ["GITHUB_LOGIN.password", "GITHUB_LOGIN"] {
+        let output = deliver(
+            json!([{"name": wrong_name, "env": "X", "envelope": username}]),
+            "printf ran",
+        );
+        assert_eq!(output.status.code(), Some(70));
+        assert!(output.stdout.is_empty());
+    }
 }
 
 #[test]

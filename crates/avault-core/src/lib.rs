@@ -449,6 +449,21 @@ mod tests {
     }
 
     #[test]
+    fn field_record_names_bind_standard_envelopes() {
+        // Avibe multi-field secrets: the default field is the record named by the bare secret
+        // name and an extra field is the record `<secret>.<field>`. avault treats the name as an
+        // opaque AAD string, so a field envelope must open only under its own record name.
+        let sealed = seal(&MASTER_KEY, "GITHUB_LOGIN.username", b"octocat").unwrap();
+        let opened = open(&MASTER_KEY, "GITHUB_LOGIN.username", &sealed).unwrap();
+        assert_eq!(opened.as_slice(), b"octocat");
+        assert!(open(&MASTER_KEY, "GITHUB_LOGIN", &sealed).is_err());
+        assert!(open(&MASTER_KEY, "GITHUB_LOGIN.password", &sealed).is_err());
+
+        let default_field = seal(&MASTER_KEY, "GITHUB_LOGIN", b"hunter2").unwrap();
+        assert!(open(&MASTER_KEY, "GITHUB_LOGIN.username", &default_field).is_err());
+    }
+
+    #[test]
     fn tampered_ciphertext_fails() {
         let mut sealed = seal(&MASTER_KEY, "OPENAI_API_KEY", b"sk-test").unwrap();
         let mut ct = unb64(&sealed.ciphertext, "ciphertext").unwrap();
@@ -550,6 +565,23 @@ mod tests {
     }
 
     #[test]
+    fn protected_record_aad_matches_sandbox_stable_json_field_record() {
+        let meta: WrapMeta = serde_json::from_value(json!({
+            "v": 1,
+            "scheme": WRAP_SCHEME,
+            "wrapped_dek": "",
+            "dek_nonce": "",
+            "record_meta": {"kind": "static"}
+        }))
+        .unwrap();
+        let aad = String::from_utf8(protected_record_aad("GITHUB_LOGIN.username", &meta)).unwrap();
+        assert_eq!(
+            aad,
+            "{\"domain\":\"avault:protected-record:aad:v2\",\"name\":\"GITHUB_LOGIN.username\",\"record\":{\"kind\":\"static\"},\"scheme\":\"machine-aesgcm-v1\",\"version\":1}"
+        );
+    }
+
+    #[test]
     fn protected_record_aad_matches_sandbox_stable_json_keypair() {
         let meta: WrapMeta = serde_json::from_value(json!({
             "v": 1,
@@ -591,6 +623,31 @@ mod tests {
         let opened = open_with_dek(&dek, "AI_RELAY_KEY_3", &sealed).unwrap();
         assert_eq!(opened.as_slice(), b"protected-key");
         assert!(open_with_dek(&dek, "OTHER_KEY", &sealed).is_err());
+    }
+
+    #[test]
+    fn opens_sandbox_v2_field_record_only_under_its_record_name() {
+        let dek = [0x77u8; KEY_BYTES];
+        let value_nonce = [0x33u8; NONCE_BYTES];
+        let aad = b"{\"domain\":\"avault:protected-record:aad:v2\",\"name\":\"GITHUB_LOGIN.username\",\"record\":{\"kind\":\"static\"},\"scheme\":\"machine-aesgcm-v1\",\"version\":1}";
+        let ciphertext = encrypt_with_key(&dek, &value_nonce, b"octocat", aad).unwrap();
+        let sealed = Sealed {
+            ciphertext: b64(&ciphertext),
+            nonce: b64(&value_nonce),
+            wrap_meta: json!({
+                "v": 1,
+                "scheme": WRAP_SCHEME,
+                "wrapped_dek": "",
+                "dek_nonce": "",
+                "record_meta": {"kind": "static"}
+            })
+            .to_string(),
+        };
+
+        let opened = open_with_dek(&dek, "GITHUB_LOGIN.username", &sealed).unwrap();
+        assert_eq!(opened.as_slice(), b"octocat");
+        assert!(open_with_dek(&dek, "GITHUB_LOGIN", &sealed).is_err());
+        assert!(open_with_dek(&dek, "GITHUB_LOGIN.password", &sealed).is_err());
     }
 
     #[test]
