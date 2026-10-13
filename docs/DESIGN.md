@@ -317,6 +317,11 @@ Generalized from `vt`'s `AuthCache` rigor: strict TTL with **no** sliding refres
 
 - **Keep the P0 `wrap_meta` column shape** (`{scheme, wrapped_dek, dek_nonce}`): storing `wrapped_dek` gives **cheap master rotation** (re-wrap DEKs without touching ciphertext) and does not break the P0 DB. We do **not** adopt `vt`'s pure-derive model (`derive_dek(master, salt)` with nothing stored), which forces a full re-encrypt on every master rotation. The hygiene win comes from Rust owning the key + crypto, which is orthogonal to the envelope shape.
 - **Borrow from `vt`:** AES-256-GCM with AAD binding so ciphertext can't be transplanted between records. Standard-tier envelopes use `name + scheme + version`; browser-sealed protected values use the protected-record v2 canonical JSON AAD that binds `domain`, `name`, `record`, `scheme`, and `version`.
+- **The AAD `name` is a record name.** A record is one encrypted value. Avibe multi-field secrets give each field its own record:
+  - a secret's default field uses the bare secret name (`GITHUB_LOGIN`);
+  - an extra field uses `<secret>.<field>` (`GITHUB_LOGIN.username`), so record names match `^[A-Za-z_][A-Za-z0-9_]*(\.[a-z][a-z0-9_]{0,63})?$`.
+
+  avault treats the name as an opaque UTF-8 string in envelope AAD, blind-box AAD, operation hashes, and the grant DEK cache key. It must not narrow it to a shell name; only env and inject target names are validated as shell names. Because every envelope binds its record name, a field cannot be opened as another field or as the default value. Keypair records have no fields. Vectors: the `GITHUB_LOGIN.username` cases in `tests/vectors/p2_core_crypto.json`. Avibe contract: `avibe/docs/plans/2026-10-13-vault-multi-field-secrets.md`.
 - **Protected tier:** VMK wrapped by N factor-copies (password via scrypt; passkey-PRF copies added browser-side), each secret's DEK wrapped by the VMK — the format already prototyped in `storage/vault_protected.py` and `ui/src/lib/vaultCrypto.ts`, now produced/consumed across the browser ↔ `avault` boundary. Protected value opens reconstruct the v2 AAD from `wrap_meta.record_meta` (`static` or `keypair` public key), `scheme`, and `v`.
 
 ---
@@ -648,8 +653,9 @@ test deterministic.
 ### P1.1 CLI delivery schemas
 
 All P1.1 delivery inputs are JSON on stdin. The `envelope` object is the persisted
-`{ciphertext, nonce, wrap_meta}` shape. The `name` field is the secret name used for
-AAD. Values never appear in argv. One-shot delivery is standard-tier only and
+`{ciphertext, nonce, wrap_meta}` shape. The `name` field is the record name used for
+AAD: the bare secret name, or `<secret>.<field>` for a multi-field secret's extra
+field (§10). Values never appear in argv. One-shot delivery is standard-tier only and
 rejects `dek_blindbox` / `approval` fields. Protected delivery uses the resident
 agent's `grant` + `deliver` frames; the protected DEK path is AAD-only using the
 protected-record v2 JSON AAD, and the P0 empty-AAD fallback is only for old
@@ -719,7 +725,9 @@ are intentionally left to the `allowed_hosts` policy boundary.
 }
 ```
 
-`key` names the rendered entry, and `env` is accepted as an alias. P1.1 implements
+`key` names the rendered entry, and `env` is accepted as an alias. Without either,
+the key defaults to `name`, so callers delivering a field record (`<secret>.<field>`)
+must pass `key`; a dotted name is not a valid key. P1.1 implements
 `dotenv` and `json`; `yaml` and `toml` remain deferred. Files are written
 atomically through an owner-only temporary file, fsync, rename, and
 parent-directory fsync. Unix uses 0600; Windows uses a protected owner-only DACL.
