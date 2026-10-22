@@ -128,6 +128,9 @@ jobs:
             bash -c '
           set -euo pipefail
           . /usr/local/cargo/env
+          # Debian 11 left the regular mirrors; its final packages live on
+          # archive.debian.org. Keep the bullseye glibc baseline and fetch there.
+          sed -i -E "s#^deb http://deb\.debian\.org/debian(-security)? #deb http://archive.debian.org/debian\1 #" /etc/apt/sources.list
           apt-get update
           apt-get install -y --no-install-recommends \
             ca-certificates \
