@@ -15,6 +15,7 @@ use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1311,6 +1312,302 @@ fn agent_purges_grants_while_deliver_run_child_is_running() {
     );
     assert_eq!(denied["ok"], false);
     assert!(denied["error"].as_str().unwrap().contains("grant"));
+
+    let _ = agent.kill();
+    let _ = agent.wait();
+}
+
+/// A child command that passes only if a second child reaches the same rendezvous while it is
+/// still running, which is impossible if the agent serializes requests.
+fn rendezvous_command(dir: &std::path::Path, env: &str, expected: &str) -> serde_json::Value {
+    let dir = dir.to_str().unwrap();
+    json!([
+        "/bin/sh",
+        "-c",
+        format!(
+            "mkdir '{dir}/a' 2>/dev/null || mkdir '{dir}/b'; i=0; \
+             while [ ! -d '{dir}/a' ] || [ ! -d '{dir}/b' ]; do \
+             i=$((i+1)); [ $i -gt 500 ] && exit 3; sleep 0.02; done; \
+             test \"${env}\" = '{expected}'"
+        )
+    ])
+}
+
+fn send_concurrently(
+    socket: &std::path::Path,
+    requests: Vec<serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    let barrier = Arc::new(Barrier::new(requests.len()));
+    requests
+        .into_iter()
+        .map(|request| {
+            let socket = socket.to_path_buf();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let mut stream = connect_agent(&socket);
+                barrier.wait();
+                agent_request(&mut stream, request)
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect()
+}
+
+fn grant_protected_dek(
+    stream: &mut UnixStream,
+    public_key: &str,
+    grant_id: &str,
+    name: &str,
+    dek: &[u8; 32],
+    approval_nonce: &[u8],
+) -> serde_json::Value {
+    let approval_expires_at = future_expiry();
+    agent_request(
+        stream,
+        json!({
+            "type": "grant",
+            "grant_id": grant_id,
+            "ttl_secs": 60,
+            "deks": [
+                {
+                    "name": name,
+                    "dek_blindbox": fixed_blind_box(
+                        public_key,
+                        dek,
+                        &aad_agent_deliver(grant_id, name, approval_nonce, approval_expires_at, 60)
+                    ),
+                    "approval": approval_json(approval_nonce, approval_expires_at)
+                }
+            ]
+        }),
+    )
+}
+
+#[test]
+fn agent_runs_overlap_across_connections() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("run").join("avault.sock");
+    let rendezvous = tmp.path().join("rendezvous");
+    fs::create_dir(&rendezvous).unwrap();
+    let mut agent = spawn_agent(&socket, 60);
+    let mut setup = connect_agent(&socket);
+    let pubkey = agent_request(&mut setup, json!({"type": "pubkey"}));
+    let public_key = pubkey["result"]["public_key"].as_str().unwrap();
+    let dek = [0x6au8; 32];
+    let grant = grant_protected_dek(
+        &mut setup,
+        public_key,
+        "parallel-run",
+        "API_TOKEN",
+        &dek,
+        b"agent-parallel-1",
+    );
+    assert_eq!(grant["ok"], true);
+    let envelope = envelope_encrypted_with_dek("API_TOKEN", &dek, b"parallel-secret");
+    let request = json!({
+        "type": "deliver.run",
+        "grant_id": "parallel-run",
+        "command": rendezvous_command(&rendezvous, "API_TOKEN", "parallel-secret"),
+        "secrets": [
+            {"name": "API_TOKEN", "tier": "protected", "env": "API_TOKEN", "envelope": envelope}
+        ]
+    });
+
+    let responses = send_concurrently(&socket, vec![request.clone(), request]);
+    for response in responses {
+        assert_eq!(response["ok"], true, "{response}");
+        assert_eq!(response["result"]["exit_code"], 0, "runs were serialized");
+    }
+
+    let _ = agent.kill();
+    let _ = agent.wait();
+}
+
+#[test]
+fn agent_standard_runs_overlap_on_one_cached_master() {
+    let tmp = tempfile::tempdir().unwrap();
+    let vault_home = tmp.path().join("vault");
+    let socket = tmp.path().join("run").join("avault.sock");
+    let rendezvous = tmp.path().join("rendezvous");
+    fs::create_dir(&rendezvous).unwrap();
+    let envelope = seal_secret(&vault_home, "STANDARD_TOKEN", b"parallel-standard");
+    let mut command = spawn_agent_command(&socket, 60);
+    command
+        .env("AVAULT_HOME", &vault_home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut agent = command.spawn().unwrap();
+    let mut setup = connect_agent(&socket);
+    let pubkey = agent_request(&mut setup, json!({"type": "pubkey"}));
+    let public_key = pubkey["result"]["public_key"].as_str().unwrap();
+    let grant = grant_protected_dek(
+        &mut setup,
+        public_key,
+        "parallel-standard",
+        "UNUSED_PROTECTED",
+        &[0x6bu8; 32],
+        b"agent-standard-1",
+    );
+    assert_eq!(grant["ok"], true);
+    let request = json!({
+        "type": "deliver.run",
+        "grant_id": "parallel-standard",
+        "command": rendezvous_command(&rendezvous, "API_TOKEN", "parallel-standard"),
+        "secrets": [
+            {"name": "STANDARD_TOKEN", "tier": "standard", "env": "API_TOKEN", "envelope": envelope}
+        ]
+    });
+
+    let responses = send_concurrently(&socket, vec![request.clone(), request]);
+    for response in responses {
+        assert_eq!(response["ok"], true, "{response}");
+        assert_eq!(response["result"]["exit_code"], 0, "runs were serialized");
+    }
+
+    let _ = agent.kill();
+    let _ = agent.wait();
+}
+
+#[test]
+fn agent_fetches_overlap_across_connections() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("run").join("avault.sock");
+    let mut agent = spawn_agent(&socket, 60);
+    let mut setup = connect_agent(&socket);
+    let pubkey = agent_request(&mut setup, json!({"type": "pubkey"}));
+    let public_key = pubkey["result"]["public_key"].as_str().unwrap();
+    let dek = [0x6cu8; 32];
+    let grant = grant_protected_dek(
+        &mut setup,
+        public_key,
+        "parallel-fetch",
+        "API_TOKEN",
+        &dek,
+        b"agent-parallel-f",
+    );
+    assert_eq!(grant["ok"], true);
+
+    // The server answers only after both requests are open at once.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut clients = Vec::new();
+        while clients.len() < 2 {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).unwrap();
+                    assert!(String::from_utf8_lossy(&buf[..n])
+                        .contains("Authorization: Bearer parallel-fetch-token"));
+                    clients.push(stream);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(Instant::now() < deadline, "fetches were serialized");
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => panic!("accept failed: {err}"),
+            }
+        }
+        for mut stream in clients {
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .unwrap();
+        }
+    });
+    let request = json!({
+        "type": "deliver.fetch",
+        "grant_id": "parallel-fetch",
+        "auth": {
+            "name": "API_TOKEN",
+            "tier": "protected",
+            "envelope": envelope_encrypted_with_dek("API_TOKEN", &dek, b"parallel-fetch-token")
+        },
+        "request": {
+            "method": "GET",
+            "url": format!("http://127.0.0.1:{port}/resource"),
+            "allowed_hosts": ["127.0.0.1"],
+            "inject": {"type": "bearer"}
+        }
+    });
+
+    let responses = send_concurrently(&socket, vec![request.clone(), request]);
+    server.join().unwrap();
+    for response in responses {
+        assert_eq!(response["ok"], true, "{response}");
+        assert_eq!(response["result"]["body"], "ok");
+    }
+
+    let _ = agent.kill();
+    let _ = agent.wait();
+}
+
+#[test]
+fn agent_drops_idle_standard_master_and_reloads_from_store() {
+    let tmp = tempfile::tempdir().unwrap();
+    let vault_home = tmp.path().join("vault");
+    let socket = tmp.path().join("run").join("avault.sock");
+    let envelope = seal_secret(&vault_home, "STANDARD_TOKEN", b"cached-standard");
+    let mut command = spawn_agent_command(&socket, 2);
+    command
+        .env("AVAULT_HOME", &vault_home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut agent = command.spawn().unwrap();
+    let mut stream = connect_agent(&socket);
+    let pubkey = agent_request(&mut stream, json!({"type": "pubkey"}));
+    let public_key = pubkey["result"]["public_key"].as_str().unwrap().to_string();
+    let run = |stream: &mut UnixStream, grant_id: &str| {
+        agent_request(
+            stream,
+            json!({
+                "type": "deliver.run",
+                "grant_id": grant_id,
+                "command": ["/bin/sh", "-c", "test \"$API_TOKEN\" = cached-standard"],
+                "secrets": [
+                    {"name": "STANDARD_TOKEN", "tier": "standard", "env": "API_TOKEN", "envelope": envelope}
+                ]
+            }),
+        )
+    };
+    let grant = grant_protected_dek(
+        &mut stream,
+        &public_key,
+        "cache-first",
+        "UNUSED_PROTECTED",
+        &[0x6du8; 32],
+        b"agent-cache-one1",
+    );
+    assert_eq!(grant["ok"], true);
+    assert_eq!(run(&mut stream, "cache-first")["result"]["exit_code"], 0);
+
+    // While in use the master comes from the agent cache, not the store.
+    fs::remove_file(vault_home.join("machine.key")).unwrap();
+    assert_eq!(run(&mut stream, "cache-first")["result"]["exit_code"], 0);
+
+    // After the idle timeout the cached master is gone and the store is consulted again.
+    thread::sleep(Duration::from_millis(2500));
+    let grant = grant_protected_dek(
+        &mut stream,
+        &public_key,
+        "cache-second",
+        "UNUSED_PROTECTED",
+        &[0x6eu8; 32],
+        b"agent-cache-two1",
+    );
+    assert_eq!(grant["ok"], true);
+    let reloaded = run(&mut stream, "cache-second");
+    assert_eq!(reloaded["ok"], false);
+    assert!(reloaded["error"]
+        .as_str()
+        .unwrap()
+        .contains("failed to load standard master key"));
 
     let _ = agent.kill();
     let _ = agent.wait();
@@ -3679,6 +3976,44 @@ fn key_export_and_import_interoperate_between_stores() {
         fs::read(target_home.path().join("vault").join("machine.key")).unwrap(),
         source_key
     );
+}
+
+#[test]
+fn key_authorize_verifies_the_existing_key_without_creating_one() {
+    let home = tempfile::tempdir().unwrap();
+    let vault_home = home.path().join("vault");
+
+    let missing = avault()
+        .arg("key")
+        .arg("authorize")
+        .env("AVAULT_HOME", &vault_home)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("master key"));
+    assert!(!vault_home.join("machine.key").exists());
+
+    seal_secret(&vault_home, "API_TOKEN", b"value");
+    let authorized = avault()
+        .arg("key")
+        .arg("authorize")
+        .env("AVAULT_HOME", &vault_home)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(authorized.status.success());
+    let output: serde_json::Value = serde_json::from_slice(&authorized.stdout).unwrap();
+    assert_eq!(output["ok"], true);
+
+    let extra = avault()
+        .arg("key")
+        .arg("authorize")
+        .arg("--force")
+        .env("AVAULT_HOME", &vault_home)
+        .output()
+        .unwrap();
+    assert!(!extra.status.success());
 }
 
 #[test]

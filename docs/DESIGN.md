@@ -100,7 +100,7 @@ If a secret must be usable by an unattended agent, the machine must be able to d
 ### 4.1 Standard tier — machine-rooted
 
 - **Where the key lives:** the strongest implemented OS store where available — macOS Keychain, Linux TPM2 sealing, then the file-store floor as the headless fallback (0600 + `mlock` on Unix; protected owner-only DACL + `VirtualLock` on Windows). On macOS and Linux, `auto` preserves existing `machine.key` installs by loading the file key first and mirroring it into the stronger store when possible. If the stronger store is unavailable, `auto` only falls back to a file key when one already exists, or on first use when there is no stronger store available. If file and stronger-store keys both exist but differ, `auto` refuses to choose silently.
-- **How it decrypts:** `avault` asks the selected store to release/use the master key. The macOS Keychain backend stores a regular generic-password item without user-presence / biometry access control, creates the item with no-clobber semantics, and hardens process crash-dump behavior before reading raw Keychain bytes. The Linux TPM backend stores only TPM2 sealed-object blobs on disk and seals/unseals in-process through TSS/ESAPI rather than handing key material to a subprocess; it deliberately does not bind the object to PCRs, a PIN/password, or user-presence policy, so standard-tier use remains headless while the OS user has TPM access. macOS may still ask once to allow a newly installed `avault` binary to access the Keychain item; that is not a per-use Touch ID / passcode policy. Future Secure Enclave backends can make the wrapping key non-extractable while still avoiding per-use human authentication.
+- **How it decrypts:** `avault` asks the selected store to release/use the master key. The macOS Keychain backend stores a regular generic-password item without user-presence / biometry access control, creates the item with no-clobber semantics, and hardens process crash-dump behavior before reading raw Keychain bytes. The Linux TPM backend stores only TPM2 sealed-object blobs on disk and seals/unseals in-process through TSS/ESAPI rather than handing key material to a subprocess; it deliberately does not bind the object to PCRs, a PIN/password, or user-presence policy, so standard-tier use remains headless while the OS user has TPM access. Every Keychain call except the explicit `avault key authorize` runs with Keychain user interaction disabled, so neither the one-shot CLI nor the resident agent can raise a Keychain dialog. When macOS needs its one-time application-access approval (for example for a newly installed or re-signed binary), the call fails with a hint to run `avault key authorize`; that is not a per-use Touch ID / passcode policy (Appendix C · Keychain authorization). Future Secure Enclave backends can make the wrapping key non-extractable while still avoiding per-use human authentication.
 - **Headless:** yes. This is the point of the tier.
 - **What it protects:** at-rest encryption (a stolen disk/backup is useless); other processes (with a hardware store + ACL); swap/coredump; and values never enter the LLM, transcript, or Python's persistent state.
 - **What it does _not_ protect:** a machine compromised under your own UID. An attacker running as you can, while you are present/unlocked, coerce a decryption. Hardware keystores make the key **non-extractable**, but **use can still be coerced while unlocked.** The real boundary here is the OS account + the hardware element, not cryptography.
@@ -366,7 +366,7 @@ The blind box assumes the browser gets `avault`'s **genuine** public key. A full
 **Two run modes (same binary) — and which is safer:**
 
 1. **CLI one-shot (P1):** the daemon spawns `avault seal/open/...`; it reads the master key, uses it, wipes it on `Drop`, exits. **This is the more conservative transport** — no listening endpoint to defend, and the key is in memory only for the op (a tiny window).
-2. **Resident agent (P2):** `avault agent` listens on a unix socket, holds the grant DEK-set for its TTL, and is the signing oracle. It is **strictly more exposed** (a long-lived key in memory + a socket to defend), so it is used only where cross-call state is required (grant DEK-cache, signing). Harden it: short **idle-timeout zeroize**, cache **DEKs not the master 24/7** (read the master transiently to unwrap, then wipe), `mlock` + no-coredump, and `SO_PEERCRED` / `LOCAL_PEERCRED` peer-uid auth (no shared token).
+2. **Resident agent (P2):** `avault agent` listens on a unix socket, holds the grant DEK-set for its TTL, and is the signing oracle. It is **strictly more exposed** (a long-lived key in memory + a socket to defend), so it is used only where cross-call state is required (grant DEK-cache, signing). Harden it: short **idle-timeout zeroize**, cache **DEKs, not the master 24/7** (a machine-store master is cached only while standard-tier requests keep using it and is dropped after the idle timeout; Appendix C · Concurrency and key lifetimes), `mlock` + no-coredump, and `SO_PEERCRED` / `LOCAL_PEERCRED` peer-uid auth (no shared token).
 
 Peer-cred gates *other users* and remote, not a same-uid process — which is correct, because the standard tier's boundary is the OS account anyway (§4.1). Same-uid misuse is bounded by the narrow interface (no `decrypt → plaintext`), full audit, hardware non-extractability, and — for high-value secrets — the protected tier (cryptographic enforcement, not caller-auth).
 
@@ -448,7 +448,8 @@ fresh in-memory receiver keypair that the browser pins/attests (§11.4).
 - **Browser JS hygiene** is best-effort (wipeable typed arrays, non-extractable WebCrypto keys), not a secure enclave; exposure is one operation while the user is present (§8.3).
 - **secp256k1 is not hardware-backed** on Apple SE / passkeys — software key + hardware unlock factor; true hardware custody needs an external wallet (§8.3).
 - **`file + passphrase` defends at-rest, not the running machine** — after the startup unlock the master is in memory; and it needs a passphrase per restart (trades unattended auto-restart for at-rest safety). For fully-unattended servers use TPM/KMS (§13).
-- **The resident agent (P2) widens exposure** vs the one-shot CLI (long-lived key in memory + a socket); mitigated by idle-timeout zeroize, DEK-not-master residency, mlock/no-dump, peer-cred auth (§12).
+- **The resident agent (P2) widens exposure** vs the one-shot CLI (long-lived key in memory + a socket); mitigated by idle-timeout zeroize, idle-bounded master residency, mlock/no-dump, peer-cred auth (§12). The operator-unlocked `file + passphrase` master stays resident for the agent lifetime because it has no re-unlock path (§13).
+- **Keychain authorization is verified against a fake Keychain backend, not the real one.** The gate, cooldown, coalescing, and non-interactive policy are unit-tested; the real application-access flow (how "Always Allow" persists across re-signed binaries, whether `key import --force` can modify an item without UI, and the no-desktop-session error) is a manual macOS check.
 
 ---
 
@@ -501,6 +502,7 @@ These are starting recommendations, not frozen choices — items #2 (envelope) a
 | `deliver` | envelope + mode (`run` / `fetch` / `inject`) | exit code / response body / written file | one-shot standard-tier delivery uses the master key; protected delivery uses resident-agent grants, never inline DEK boxes |
 | `sign` | key envelope + name + 32-byte digest + scheme | signature (public) | one-shot standard-tier signing; protected signing uses resident-agent grants. The private key never leaves `avault` |
 | `key export` / `key import` | passphrase (stdin; if `--store file-passphrase`, first stdin line unlocks the store) | encrypted backup / ok | back up, migrate, restore the master key |
+| `key authorize` | — (if `--store file-passphrase`, first stdin line unlocks the store) | ok | the only verb that may show macOS Keychain UI: lets the user grant this binary access to the existing master key. Never creates a key; on other stores it only verifies the key loads |
 
 Phase A implements the core blind-box opener and secp256k1 signer plus one-shot CLI
 verbs. Phase B adds the resident agent transport plus `grant` / `release`: cache a
@@ -742,7 +744,8 @@ Two modes, the same integration touchpoints as `askill`. **Both channels carry o
 
 Each agent frame is a 4-byte unsigned big-endian JSON byte length followed by
 that many UTF-8 JSON bytes. Frames are processed sequentially on a connection;
-there is no request-id multiplexing in Phase B. Every response is one frame:
+there is no request-id multiplexing in Phase B. Separate connections are served
+concurrently (see Concurrency and key lifetimes). Every response is one frame:
 
 ```json
 { "ok": true, "result": { "...": "..." } }
@@ -834,6 +837,48 @@ Response:
 ```json
 { "ok": true, "result": { "released": true } }
 ```
+
+#### Concurrency and key lifetimes
+
+- **Concurrency.** Each connection gets its own worker, up to 64 at once, so a
+  long `deliver.run` child or a slow fetch never blocks other callers. A
+  connection beyond the limit, or one whose worker cannot start, receives an
+  error frame ending in `retry later` (for example
+  `{"ok":false,"error":"agent is busy; retry later"}`) and is closed; the agent
+  keeps serving. There is no global operation lock.
+- **Key handles live only for the crypto.** A request validates its grant,
+  takes reference-counted handles to the DEKs (and, for standard entries, the
+  master), opens its envelopes, and drops the handles before it runs a child,
+  performs a fetch, or writes an inject file. Only the opened values it is
+  delivering stay alive during that external I/O.
+- **Revocation.** `release` / `revoke` removes the grant under the state lock.
+  Each request takes its grant snapshot under the same lock, and that snapshot
+  is its linearization point. A request whose snapshot comes after the removal
+  fails with `grant is missing or expired`. A request that took its snapshot
+  first may still open its envelopes and finish its current delivery. It never
+  holds a DEK across external I/O, so the DEK pages are zeroized no later than
+  when that request's in-memory crypto finishes.
+- **Expiry.** The listener thread purges expired grants, consumed approval
+  nonces, idle grants, and an idle master every poll interval (200 ms), and
+  every use re-checks TTL and idle age, so expiry never depends on a request
+  arriving and never revives an idle grant. A `grant` is published atomically
+  with consuming its approval nonces and resetting the idle clock, so
+  maintenance cannot purge a grant whose nonces were already spent. A grant
+  whose TTL or approval deadline passed while its DEKs were being opened is
+  rejected without consuming its nonces or touching the idle clock. The idle
+  clock moves only on a published grant, a successful key open, or a `release`
+  that removed a grant; `pubkey`, invalid requests, replays, and failed opens
+  never extend it.
+- **Standard master cache.** With a machine store (`auto`, `keychain`, `tpm`,
+  `file`), the master is loaded on the first standard-tier use. Concurrent cold
+  loads share one store access, and only requests that need the master wait
+  for it: maintenance, `pubkey`, `grant`, `revoke`, protected-only delivery,
+  and signing never do. Each use refreshes the cache's idle clock, which is
+  read and written inside the cache lock, so concurrent uses refresh it in
+  order. The cached master is dropped after `--idle-timeout-secs`
+  without a standard-tier use; the next use reloads it from the store without
+  UI (§13). A `file-passphrase --unlock` agent holds its operator-unlocked
+  master for the agent lifetime, as before, because it has no re-unlock path.
 
 Agent delivery uses cached protected DEKs selected by `{grant_id, name}`. It never
 accepts a `dek_blindbox` on delivery frames; protected DEKs must enter through
@@ -945,12 +990,55 @@ Response `result` is the normal signature output:
 ### Where avault's own keys live (esp. Linux without a Keychain)
 
 - **The X25519 receiver keypair is ephemeral and in-memory.** It is only used to open blind boxes, so it is generated at agent start (or per CLI invocation) and **never written to disk**. The public key is published on demand; the protected tier pins/attests the *current* public key (re-pin on agent restart). This leaves **only the master key** needing durable secure storage.
-- **Master-key store on macOS:** default `auto` uses Keychain generic-password storage for the standard-tier master key when available, but preserves existing file-store keys and only uses the file-store floor when that file key already exists. It deliberately does not attach Touch ID / user-presence access-control flags because standard-tier secrets must be usable by unattended agents. A first-run Keychain application-access prompt may still appear for a newly installed binary.
+- **Master-key store on macOS:** default `auto` uses Keychain generic-password storage for the standard-tier master key when available, but preserves existing file-store keys and only uses the file-store floor when that file key already exists. It deliberately does not attach Touch ID / user-presence access-control flags because standard-tier secrets must be usable by unattended agents. Background access never shows Keychain UI; see Keychain authorization below.
 - **Master-key store on Linux (strongest available wins, once implemented):**
   - **TPM 2.0** (present on most Linux hosts) — seal the master key to the TPM; the wrapping key never leaves the chip, optionally bound to PCRs/policy. This is the Linux analog of Keychain/Secure Enclave.
   - **systemd-creds / kernel keyring** — unseal at service start (via TPM or a host key) into non-swappable kernel memory; good for headless services.
   - **`file (0600) + mlock` / Windows protected DACL + `VirtualLock`** (the no-hardware floor) — owned by the service user, kept out of swap and coredumps where the OS allows it.
 - **Honest floor:** with no hardware root and no operator factor, the master key's at-rest protection reduces to the **OS user account** (the fundamental law again). The file store is plaintext-at-rest: it resists other users / remote / a stolen disk (with full-disk encryption), but not an attacker already running as your uid. Optional hardening: wrap the master key under a **boot-time passphrase KEK** or a **cloud KMS KEK** (stronger at rest, at the cost of headless start or a network + bootstrap credential). And note: the **protected tier stores nothing decryptable on the box at all** — for high-value secrets, that side-steps the Linux at-rest question entirely.
+
+### Keychain authorization
+
+macOS asks the user once to let a newly installed or re-signed binary read an
+existing Keychain item. A background process that triggers that dialog, or many
+processes triggering it at once, produces a storm of prompts the user did not
+ask for. So avault separates the two cases:
+
+- **Background (every verb, and the resident agent).** Keychain calls run with
+  user interaction disabled. If macOS needs approval, the call fails with
+  `errSecInteractionNotAllowed` and the hint `run avault key authorize in a
+  logged-in session`. The one-shot CLI prints the full cause chain, and the
+  resident agent returns it in the error frame, so the hint reaches the caller
+  on both transports. The typed Keychain status is preserved, so `auto` still
+  falls back to an existing file key exactly as for any unavailable Keychain;
+  a denied or cancelled authorization and a file/Keychain key mismatch are
+  never downgraded, and no error ever selects another backend or creates a
+  replacement key.
+- **Explicit (`avault key authorize`).** The only verb that lets macOS show
+  its prompt. It reads the existing key (for `auto`, the same policy as a
+  background load, including file-key migration) and never generates a key.
+  Callers must invoke it only in response to a user action.
+
+Explicit authorizations are serialized through a per-user gate: an advisory
+`flock` on `keychain-authorization.lock` in `bot.avibe.avault/` under the
+Darwin per-user temporary directory (`confstr(_CS_DARWIN_USER_TEMP_DIR)`), so
+every process of the user shares it regardless of `HOME`, `AVAULT_HOME`, or the
+agent socket path. The directory must be an owner-only directory owned by the
+user, and the lock file is opened with `O_NOFOLLOW` and must be a private
+single-link regular file; anything else is rejected, never repaired. The kernel
+releases the lock when the holder exits or crashes.
+
+- The first caller shows the prompt. A caller that finds the gate held prints
+  that it is waiting, waits at most 120 s, and then reuses the outcome with a
+  background read instead of queueing a second dialog.
+- A denied or cancelled prompt (`errSecUserCanceled`, `errSecAuthFailed`)
+  records a 120 s cooldown in the lock file. The window starts when the user
+  answers, not when the prompt opened. Until it passes, every caller fails fast
+  with the remaining time and no prompt. Other failures record nothing, and
+  success clears the record. A record that is unreadable, or ends more than
+  one window from now, is rewritten to exactly one window from now. Bad
+  metadata can therefore suppress prompts for at most one window, and never
+  re-enables them early.
 
 ### Authentication — who may call avault
 
