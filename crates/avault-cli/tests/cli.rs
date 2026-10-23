@@ -15,6 +15,7 @@ use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1311,6 +1312,169 @@ fn agent_purges_grants_while_deliver_run_child_is_running() {
     );
     assert_eq!(denied["ok"], false);
     assert!(denied["error"].as_str().unwrap().contains("grant"));
+
+    let _ = agent.kill();
+    let _ = agent.wait();
+}
+
+#[test]
+fn agent_runs_overlap_across_connections() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("run").join("avault.sock");
+    let mut agent = spawn_agent(&socket, 60);
+    let mut setup = connect_agent(&socket);
+    let pubkey = agent_request(&mut setup, json!({"type": "pubkey"}));
+    let public_key = pubkey["result"]["public_key"].as_str().unwrap();
+    let dek = [0x6au8; 32];
+    let approval_nonce = b"agent-parallel-1";
+    let approval_expires_at = future_expiry();
+    let grant = agent_request(
+        &mut setup,
+        json!({
+            "type": "grant",
+            "grant_id": "parallel-run",
+            "ttl_secs": 60,
+            "deks": [
+                {
+                    "name": "API_TOKEN",
+                    "dek_blindbox": fixed_blind_box(
+                        public_key,
+                        &dek,
+                        &aad_agent_deliver(
+                            "parallel-run",
+                            "API_TOKEN",
+                            approval_nonce,
+                            approval_expires_at,
+                            60
+                        )
+                    ),
+                    "approval": approval_json(approval_nonce, approval_expires_at)
+                }
+            ]
+        }),
+    );
+    assert_eq!(grant["ok"], true);
+    let envelope = envelope_encrypted_with_dek("API_TOKEN", &dek, b"parallel-secret");
+    let request = json!({
+        "type": "deliver.run",
+        "grant_id": "parallel-run",
+        "command": ["sh", "-c", "sleep 1; test \"$API_TOKEN\" = \"parallel-secret\""],
+        "secrets": [
+            {"name": "API_TOKEN", "tier": "protected", "env": "API_TOKEN", "envelope": envelope}
+        ]
+    });
+
+    let barrier = Arc::new(Barrier::new(3));
+    let start = Instant::now();
+    let workers = (0..2)
+        .map(|_| {
+            let socket = socket.clone();
+            let barrier = Arc::clone(&barrier);
+            let request = request.clone();
+            thread::spawn(move || {
+                let mut stream = connect_agent(&socket);
+                barrier.wait();
+                agent_request(&mut stream, request)
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+    let responses = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+    let elapsed = start.elapsed();
+
+    assert!(responses.iter().all(|response| response["ok"] == true));
+    assert!(
+        elapsed < Duration::from_millis(1800),
+        "workers serialized: {elapsed:?}"
+    );
+
+    let _ = agent.kill();
+    let _ = agent.wait();
+}
+
+#[test]
+fn agent_standard_runs_overlap_and_reuse_master_cache() {
+    let tmp = tempfile::tempdir().unwrap();
+    let vault_home = tmp.path().join("vault");
+    let socket = tmp.path().join("run").join("avault.sock");
+    let envelope = seal_secret(&vault_home, "STANDARD_TOKEN", b"parallel-standard");
+    let mut command = spawn_agent_command(&socket, 60);
+    command
+        .env("AVAULT_HOME", &vault_home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut agent = command.spawn().unwrap();
+    let mut setup = connect_agent(&socket);
+    let pubkey = agent_request(&mut setup, json!({"type": "pubkey"}));
+    let public_key = pubkey["result"]["public_key"].as_str().unwrap();
+    let dek = [0x6bu8; 32];
+    let approval_nonce = b"agent-standard-1";
+    let approval_expires_at = future_expiry();
+    let grant = agent_request(
+        &mut setup,
+        json!({
+            "type": "grant",
+            "grant_id": "parallel-standard",
+            "ttl_secs": 60,
+            "deks": [
+                {
+                    "name": "UNUSED_PROTECTED",
+                    "dek_blindbox": fixed_blind_box(
+                        public_key,
+                        &dek,
+                        &aad_agent_deliver(
+                            "parallel-standard",
+                            "UNUSED_PROTECTED",
+                            approval_nonce,
+                            approval_expires_at,
+                            60
+                        )
+                    ),
+                    "approval": approval_json(approval_nonce, approval_expires_at)
+                }
+            ]
+        }),
+    );
+    assert_eq!(grant["ok"], true);
+    let request = json!({
+        "type": "deliver.run",
+        "grant_id": "parallel-standard",
+        "command": ["sh", "-c", "sleep 1; test \"$API_TOKEN\" = \"parallel-standard\""],
+        "secrets": [
+            {"name": "STANDARD_TOKEN", "tier": "standard", "env": "API_TOKEN", "envelope": envelope}
+        ]
+    });
+
+    let barrier = Arc::new(Barrier::new(3));
+    let start = Instant::now();
+    let workers = (0..2)
+        .map(|_| {
+            let socket = socket.clone();
+            let barrier = Arc::clone(&barrier);
+            let request = request.clone();
+            thread::spawn(move || {
+                let mut stream = connect_agent(&socket);
+                barrier.wait();
+                agent_request(&mut stream, request)
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+    let responses = workers
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+    let elapsed = start.elapsed();
+
+    assert!(responses.iter().all(|response| response["ok"] == true));
+    assert!(
+        elapsed < Duration::from_millis(1800),
+        "standard workers serialized: {elapsed:?}"
+    );
 
     let _ = agent.kill();
     let _ = agent.wait();

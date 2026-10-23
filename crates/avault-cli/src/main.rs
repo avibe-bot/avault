@@ -33,6 +33,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
 use std::str::FromStr;
+#[cfg(unix)]
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 #[cfg(unix)]
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -717,11 +719,12 @@ fn run_agent_child_with_opened_env(
     command: &[OsString],
     opened: Vec<OpenedSecret>,
     envelope_stdin: bool,
-    state: &mut AgentState,
+    state: &Arc<Mutex<AgentState>>,
+    master_cache: &Arc<Mutex<AgentMasterCache>>,
 ) -> anyhow::Result<u8> {
     let mut child = spawn_agent_run_helper(command, opened, envelope_stdin)?;
     loop {
-        state.purge();
+        purge_agent_state_and_cache(state, master_cache)?;
         if let Some(status) = child
             .try_wait()
             .context("failed to wait for child command")?
@@ -2115,9 +2118,10 @@ struct GrantKey {
 }
 
 #[cfg(unix)]
+#[derive(Clone)]
 struct GrantEntry {
     expires_at: Instant,
-    deks: HashMap<AgentDekKey, MasterKey>,
+    deks: HashMap<AgentDekKey, Arc<MasterKey>>,
 }
 
 #[cfg(unix)]
@@ -2153,24 +2157,16 @@ struct AgentState {
     used_grant_nonces: HashMap<Vec<u8>, Instant>,
     last_activity: Instant,
     idle_timeout: Duration,
-    standard_backend: Option<Backend>,
-    master: Option<MasterKey>,
 }
 
 #[cfg(unix)]
 impl AgentState {
-    fn new(
-        idle_timeout: Duration,
-        standard_backend: Option<Backend>,
-        master: Option<MasterKey>,
-    ) -> Self {
+    fn new(idle_timeout: Duration) -> Self {
         Self {
             grants: HashMap::new(),
             used_grant_nonces: HashMap::new(),
             last_activity: Instant::now(),
             idle_timeout,
-            standard_backend,
-            master,
         }
     }
 
@@ -2204,11 +2200,6 @@ impl AgentState {
             .retain(|_, grant| grant.expires_at > expiry_cutoff);
     }
 
-    fn get_grant(&mut self, scope: &GrantKey) -> anyhow::Result<&GrantEntry> {
-        self.purge();
-        self.get_live_grant(scope)
-    }
-
     fn get_live_grant(&self, scope: &GrantKey) -> anyhow::Result<&GrantEntry> {
         let now = Instant::now();
         if now.duration_since(self.last_activity) >= self.idle_timeout {
@@ -2224,11 +2215,6 @@ impl AgentState {
         Ok(grant)
     }
 
-    fn require_live_grant(&self, scope: &GrantKey) -> anyhow::Result<()> {
-        self.get_live_grant(scope)?;
-        Ok(())
-    }
-
     fn ensure_grant_nonce_unused(&mut self, nonce: &[u8]) -> anyhow::Result<()> {
         self.purge();
         if self.used_grant_nonces.contains_key(nonce) {
@@ -2241,36 +2227,124 @@ impl AgentState {
         self.used_grant_nonces.insert(nonce, expires_at);
     }
 
-    fn standard_master(&self, needed: bool) -> anyhow::Result<Option<AgentStandardMaster<'_>>> {
-        if !needed {
-            return Ok(None);
+    fn snapshot_grant(&mut self, scope: &GrantKey) -> anyhow::Result<GrantEntry> {
+        self.purge();
+        Ok(self.get_live_grant(scope)?.clone())
+    }
+}
+
+#[cfg(unix)]
+type AgentStandardMaster = Arc<MasterKey>;
+
+#[cfg(unix)]
+struct AgentMasterCache {
+    standard_backend: Option<Backend>,
+    master: Option<AgentStandardMaster>,
+}
+
+#[cfg(unix)]
+impl AgentMasterCache {
+    fn new(standard_backend: Option<Backend>, master: Option<MasterKey>) -> Self {
+        Self {
+            standard_backend,
+            master: master.map(Arc::new),
         }
+    }
+
+    fn load(&mut self) -> anyhow::Result<AgentStandardMaster> {
         if let Some(master) = &self.master {
-            return Ok(Some(AgentStandardMaster::Borrowed(master)));
+            return Ok(Arc::clone(master));
         }
         let backend = self
             .standard_backend
             .context("agent cannot open standard-tier envelopes with this store")?;
-        Ok(Some(AgentStandardMaster::Owned(
+        let master = Arc::new(
             avault_store::load_master_key(backend).context("failed to load standard master key")?,
-        )))
+        );
+        self.master = Some(Arc::clone(&master));
+        Ok(master)
     }
-}
 
-#[cfg(unix)]
-enum AgentStandardMaster<'a> {
-    Borrowed(&'a MasterKey),
-    Owned(MasterKey),
-}
-
-#[cfg(unix)]
-impl AgentStandardMaster<'_> {
-    fn as_bytes(&self) -> &[u8; avault_store::MASTER_KEY_BYTES] {
-        match self {
-            Self::Borrowed(master) => master.as_bytes(),
-            Self::Owned(master) => master.as_bytes(),
+    fn purge_if_idle(&mut self, last_activity: Instant, idle_timeout: Duration) {
+        if Instant::now().duration_since(last_activity) >= idle_timeout {
+            self.master = None;
         }
     }
+}
+
+#[cfg(unix)]
+fn purge_agent_state_and_cache(
+    state: &Arc<Mutex<AgentState>>,
+    master_cache: &Arc<Mutex<AgentMasterCache>>,
+) -> anyhow::Result<()> {
+    let (last_activity, idle_timeout) = {
+        let mut state = state
+            .lock()
+            .map_err(|_| anyhow!("agent state lock is poisoned"))?;
+        state.purge();
+        (state.last_activity, state.idle_timeout)
+    };
+    master_cache
+        .lock()
+        .map_err(|_| anyhow!("agent master cache lock is poisoned"))?
+        .purge_if_idle(last_activity, idle_timeout);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn purge_agent_state_and_cache_best_effort(
+    state: &Arc<Mutex<AgentState>>,
+    master_cache: &Arc<Mutex<AgentMasterCache>>,
+) -> anyhow::Result<()> {
+    let (last_activity, idle_timeout) = {
+        let mut state = state
+            .lock()
+            .map_err(|_| anyhow!("agent state lock is poisoned"))?;
+        state.purge();
+        (state.last_activity, state.idle_timeout)
+    };
+    match master_cache.try_lock() {
+        Ok(mut cache) => cache.purge_if_idle(last_activity, idle_timeout),
+        Err(std::sync::TryLockError::WouldBlock) => {}
+        Err(std::sync::TryLockError::Poisoned(_)) => {
+            return Err(anyhow!("agent master cache lock is poisoned"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn snapshot_agent_keys(
+    state: &Arc<Mutex<AgentState>>,
+    master_cache: &Arc<Mutex<AgentMasterCache>>,
+    scope: &GrantKey,
+    needs_standard_master: bool,
+) -> anyhow::Result<(GrantEntry, Option<AgentStandardMaster>)> {
+    {
+        let mut state = state
+            .lock()
+            .map_err(|_| anyhow!("agent state lock is poisoned"))?;
+        state.purge();
+        state.get_live_grant(scope)?;
+    }
+    let standard_master = if needs_standard_master {
+        Some(
+            master_cache
+                .lock()
+                .map_err(|_| anyhow!("agent master cache lock is poisoned"))?
+                .load()?,
+        )
+    } else {
+        None
+    };
+    let grant = {
+        let mut state = state
+            .lock()
+            .map_err(|_| anyhow!("agent state lock is poisoned"))?;
+        state.purge();
+        state.snapshot_grant(scope)?
+    };
+    Ok((grant, standard_master))
 }
 
 #[cfg(unix)]
@@ -2428,16 +2502,17 @@ fn run_agent(options: AgentOptions, input: &mut impl Read) -> anyhow::Result<u8>
         };
         (Some(backend), None)
     };
-    let keypair = avault_core::generate_blind_box_keypair();
+    let keypair = Arc::new(avault_core::generate_blind_box_keypair());
     let listener = bind_agent_socket(&options.socket_path)?;
     listener
         .set_nonblocking(true)
         .context("failed to configure agent socket")?;
-    let mut state = AgentState::new(options.idle_timeout, standard_backend, master);
+    let state = Arc::new(Mutex::new(AgentState::new(options.idle_timeout)));
+    let master_cache = Arc::new(Mutex::new(AgentMasterCache::new(standard_backend, master)));
 
     loop {
-        state.purge();
-        let (mut stream, _) = match listener.accept() {
+        purge_agent_state_and_cache_best_effort(&state, &master_cache)?;
+        let (stream, _) = match listener.accept() {
             Ok(accepted) => accepted,
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(AGENT_POLL_INTERVAL);
@@ -2445,33 +2520,53 @@ fn run_agent(options: AgentOptions, input: &mut impl Read) -> anyhow::Result<u8>
             }
             Err(err) => return Err(err).context("failed to accept agent connection"),
         };
-        stream
-            .set_nonblocking(true)
-            .context("failed to configure agent connection")?;
-        if let Err(err) = authorize_peer(&stream) {
-            let _ = write_agent_error_frame(&mut stream, &err);
-            continue;
-        }
-        loop {
-            state.purge();
-            match read_agent_frame(&mut stream, &mut state) {
-                Ok(Some(frame)) => {
-                    let (response, refresh_activity) =
-                        handle_agent_frame(frame.as_slice(), &keypair, &mut state);
-                    if refresh_activity {
-                        state.record_activity();
-                    }
-                    if write_agent_json_frame(&mut stream, &response).is_err() {
-                        break;
-                    }
+        let keypair = Arc::clone(&keypair);
+        let state = Arc::clone(&state);
+        let master_cache = Arc::clone(&master_cache);
+        std::thread::Builder::new()
+            .name("avault-agent-client".to_string())
+            .spawn(move || {
+                if let Err(err) = run_agent_connection(stream, keypair, state, master_cache) {
+                    eprintln!("avault agent connection: {err:#}");
                 }
-                Ok(None) => break,
-                Err(err) => {
-                    let _ = write_agent_error_frame(&mut stream, &err);
-                    break;
-                }
+            })
+            .context("failed to spawn agent connection worker")?;
+    }
+}
+
+#[cfg(unix)]
+fn run_agent_connection(
+    mut stream: UnixStream,
+    keypair: Arc<BlindBoxKeypair>,
+    state: Arc<Mutex<AgentState>>,
+    master_cache: Arc<Mutex<AgentMasterCache>>,
+) -> anyhow::Result<()> {
+    stream
+        .set_nonblocking(true)
+        .context("failed to configure agent connection")?;
+    authorize_peer(&stream).map_err(|err| {
+        let _ = write_agent_error_frame(&mut stream, &err);
+        err
+    })?;
+    loop {
+        purge_agent_state_and_cache(&state, &master_cache)?;
+        let frame = match read_agent_frame(&mut stream) {
+            Ok(Some(frame)) => frame,
+            Ok(None) => return Ok(()),
+            Err(err) => {
+                let _ = write_agent_error_frame(&mut stream, &err);
+                return Err(err);
             }
+        };
+        let (response, refresh_activity) =
+            handle_agent_frame(frame.as_slice(), keypair.as_ref(), &state, &master_cache);
+        if refresh_activity {
+            let mut state = state
+                .lock()
+                .map_err(|_| anyhow!("agent state lock is poisoned"))?;
+            state.record_activity();
         }
+        write_agent_json_frame(&mut stream, &response)?;
     }
 }
 
@@ -2571,9 +2666,10 @@ fn validate_agent_home_ancestors(parent: &Path) -> anyhow::Result<()> {
 fn handle_agent_frame(
     frame: &[u8],
     keypair: &BlindBoxKeypair,
-    state: &mut AgentState,
+    state: &Arc<Mutex<AgentState>>,
+    master_cache: &Arc<Mutex<AgentMasterCache>>,
 ) -> (serde_json::Value, bool) {
-    match handle_agent_frame_inner(frame, keypair, state) {
+    match handle_agent_frame_inner(frame, keypair, state, master_cache) {
         Ok(response) => response,
         Err(err) => (
             serde_json::to_value(AgentResponse::<serde_json::Value> {
@@ -2591,7 +2687,8 @@ fn handle_agent_frame(
 fn handle_agent_frame_inner(
     frame: &[u8],
     keypair: &BlindBoxKeypair,
-    state: &mut AgentState,
+    state: &Arc<Mutex<AgentState>>,
+    master_cache: &Arc<Mutex<AgentMasterCache>>,
 ) -> anyhow::Result<(serde_json::Value, bool)> {
     let request: AgentRequest =
         serde_json::from_slice(frame).context("agent frame JSON is invalid")?;
@@ -2604,6 +2701,9 @@ fn handle_agent_frame_inner(
             false,
         )),
         AgentRequest::Grant(request) => {
+            let mut state = state
+                .lock()
+                .map_err(|_| anyhow!("agent state lock is poisoned"))?;
             if request.deks.is_empty() {
                 bail!("grant requires at least one DEK");
             }
@@ -2680,8 +2780,9 @@ fn handle_agent_frame_inner(
                     .open(&dek.dek_blindbox, &context)
                     .context("DEK blind-box open failed")?;
                 let released_dek = zeroizing_vec_to_key32(opened, "released DEK")?;
-                let locked =
-                    MasterKey::from_bytes(&released_dek).context("failed to lock released DEK")?;
+                let locked = Arc::new(
+                    MasterKey::from_bytes(&released_dek).context("failed to lock released DEK")?,
+                );
                 drop(released_dek);
                 deks.insert(key, locked);
                 used_nonces.push((approval.nonce, approval_expires_at));
@@ -2701,6 +2802,9 @@ fn handle_agent_frame_inner(
         }
         AgentRequest::Release(request) | AgentRequest::Revoke(request) => {
             let key = grant_key_from_scope(request)?;
+            let mut state = state
+                .lock()
+                .map_err(|_| anyhow!("agent state lock is poisoned"))?;
             let released = state.grants.remove(&key).is_some();
             Ok((agent_ok(AgentReleaseOutput { released })?, released))
         }
@@ -2719,16 +2823,16 @@ fn handle_agent_frame_inner(
             }
             reject_agent_env_one_shot_fields(&secrets)?;
             let scope = grant_key_from_id(grant_id)?;
-            let opened = {
-                state.purge();
-                state.require_live_grant(&scope)?;
-                let standard_master = state
-                    .standard_master(secrets.iter().any(|s| s.tier == SecretTier::Standard))?;
-                let grant = state.get_live_grant(&scope)?;
-                open_env_secrets_for_agent(secrets, grant, standard_master.as_ref())?
-            };
+            let (grant, standard_master) = snapshot_agent_keys(
+                state,
+                master_cache,
+                &scope,
+                secrets.iter().any(|s| s.tier == SecretTier::Standard),
+            )?;
+            let opened = open_env_secrets_for_agent(secrets, &grant, standard_master.as_ref())?;
             let command: Vec<OsString> = command.into_iter().map(OsString::from).collect();
-            let exit_code = run_agent_child_with_opened_env(&command, opened, true, state)?;
+            let exit_code =
+                run_agent_child_with_opened_env(&command, opened, true, state, master_cache)?;
             Ok((agent_ok(AgentRunOutput { exit_code })?, true))
         }
         AgentRequest::DeliverFetch(request) => {
@@ -2748,24 +2852,28 @@ fn handle_agent_frame_inner(
             };
             let (_url, is_loopback) = validate_fetch_input(&fetch)?;
             let scope = grant_key_from_id(grant_id)?;
-            let mut secret = {
-                state.purge();
-                state.require_live_grant(&scope)?;
-                let standard_master = state.standard_master(fetch.tier == SecretTier::Standard)?;
-                let grant = state.get_live_grant(&scope)?;
-                open_agent_secret(
-                    &fetch.name,
-                    fetch.tier,
-                    &fetch.envelope,
-                    grant,
-                    standard_master.as_ref(),
-                )
-                .context("open failed")?
-            };
-            state.purge_before_blocking(Duration::from_secs(FETCH_TOTAL_TIMEOUT_SECS));
+            let (grant, standard_master) = snapshot_agent_keys(
+                state,
+                master_cache,
+                &scope,
+                fetch.tier == SecretTier::Standard,
+            )?;
+            let mut secret = open_agent_secret(
+                &fetch.name,
+                fetch.tier,
+                &fetch.envelope,
+                &grant,
+                standard_master.as_ref(),
+            )
+            .context("open failed")?;
+            state
+                .lock()
+                .map_err(|_| anyhow!("agent state lock is poisoned"))?
+                .purge_before_blocking(Duration::from_secs(FETCH_TOTAL_TIMEOUT_SECS));
             let output = execute_fetch_request(fetch.request, &mut secret, is_loopback)
                 .context("fetch request failed")?;
             secret.zeroize();
+            purge_agent_state_and_cache(state, master_cache)?;
             Ok((agent_ok(output)?, true))
         }
         AgentRequest::DeliverInject(request) => {
@@ -2783,29 +2891,29 @@ fn handle_agent_frame_inner(
                 secrets,
             };
             reject_agent_named_one_shot_fields(&inject.secrets)?;
-            state.purge();
-            state.require_live_grant(&scope)?;
-            let standard_master = state.standard_master(
+            let (grant, standard_master) = snapshot_agent_keys(
+                state,
+                master_cache,
+                &scope,
                 inject
                     .secrets
                     .iter()
                     .any(|s| s.tier == SecretTier::Standard),
             )?;
-            let grant = state.get_live_grant(&scope)?;
-            write_inject_from_opened(inject, grant, standard_master.as_ref())?;
+            write_inject_from_opened(inject, &grant, standard_master.as_ref())?;
             Ok((agent_ok(serde_json::json!({ "ok": true }))?, true))
         }
         AgentRequest::Sign(request) => {
-            let scope = grant_key_from_id(request.grant_id)?;
-            let grant = state.get_grant(&scope)?;
+            let scope = grant_key_from_id(request.grant_id.clone())?;
             let digest = decode_hex_32(&request.digest, "digest")?;
             let scheme = SignatureScheme::from_str(&request.scheme)?;
+            let grant = snapshot_agent_keys(state, master_cache, &scope, false)?.0;
             let key_plaintext = open_signing_key_with_grant(
                 &request.name,
                 &request.key_envelope,
                 &request.scheme,
                 &digest,
-                grant,
+                &grant,
             )?;
             let output = sign_digest_with_key(scheme, &digest, key_plaintext)?;
             Ok((agent_ok(output)?, true))
@@ -2840,7 +2948,7 @@ fn grant_key_from_id(grant_id: String) -> anyhow::Result<GrantKey> {
 fn open_env_secrets_for_agent(
     secrets: Vec<EnvSecretInput>,
     grant: &GrantEntry,
-    standard_master: Option<&AgentStandardMaster<'_>>,
+    standard_master: Option<&AgentStandardMaster>,
 ) -> anyhow::Result<Vec<OpenedSecret>> {
     let mut opened = Vec::with_capacity(secrets.len());
     let mut seen = BTreeSet::new();
@@ -2873,7 +2981,7 @@ fn open_env_secrets_for_agent(
 fn open_named_secrets_for_agent(
     secrets: Vec<NamedSecretInput>,
     grant: &GrantEntry,
-    standard_master: Option<&AgentStandardMaster<'_>>,
+    standard_master: Option<&AgentStandardMaster>,
 ) -> anyhow::Result<Vec<OpenedSecret>> {
     let mut opened = Vec::with_capacity(secrets.len());
     let mut seen = BTreeSet::new();
@@ -2912,7 +3020,7 @@ fn open_agent_secret(
     tier: SecretTier,
     envelope: &Sealed,
     grant: &GrantEntry,
-    standard_master: Option<&AgentStandardMaster<'_>>,
+    standard_master: Option<&AgentStandardMaster>,
 ) -> anyhow::Result<Zeroizing<Vec<u8>>> {
     match tier {
         SecretTier::Standard => {
@@ -2998,7 +3106,7 @@ fn open_signing_key_with_grant(
 fn write_inject_from_opened(
     inject: InjectInput,
     grant: &GrantEntry,
-    standard_master: Option<&AgentStandardMaster<'_>>,
+    standard_master: Option<&AgentStandardMaster>,
 ) -> anyhow::Result<()> {
     if inject.secrets.is_empty() {
         bail!("deliver inject requires at least one secret");
@@ -3019,12 +3127,9 @@ fn write_inject_from_opened(
 }
 
 #[cfg(unix)]
-fn read_agent_frame(
-    stream: &mut UnixStream,
-    state: &mut AgentState,
-) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
+fn read_agent_frame(stream: &mut UnixStream) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
     let mut len_buf = [0u8; 4];
-    match read_exact_agent(stream, &mut len_buf, state) {
+    match read_exact_agent(stream, &mut len_buf) {
         Ok(()) => {}
         Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(err) => return Err(err).context("failed to read agent frame length"),
@@ -3034,16 +3139,12 @@ fn read_agent_frame(
         bail!("agent frame size is invalid");
     }
     let mut frame = Zeroizing::new(vec![0u8; len]);
-    read_exact_agent(stream, frame.as_mut_slice(), state).context("failed to read agent frame")?;
+    read_exact_agent(stream, frame.as_mut_slice()).context("failed to read agent frame")?;
     Ok(Some(frame))
 }
 
 #[cfg(unix)]
-fn read_exact_agent(
-    stream: &mut UnixStream,
-    mut buf: &mut [u8],
-    state: &mut AgentState,
-) -> io::Result<()> {
+fn read_exact_agent(stream: &mut UnixStream, mut buf: &mut [u8]) -> io::Result<()> {
     let read_deadline = Instant::now()
         + Duration::from_millis(
             AGENT_POLL_INTERVAL.as_millis() as u64 * u64::from(MAX_AGENT_READ_TIMEOUTS),
@@ -3059,7 +3160,6 @@ fn read_exact_agent(
                 if err.kind() == std::io::ErrorKind::WouldBlock
                     || err.kind() == std::io::ErrorKind::TimedOut =>
             {
-                state.purge();
                 if Instant::now() >= read_deadline {
                     return Err(std::io::ErrorKind::TimedOut.into());
                 }
@@ -3269,8 +3369,21 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn idle_purge_drops_cached_standard_master() {
+        let master = MasterKey::from_bytes(&[0x42u8; avault_store::MASTER_KEY_BYTES]).unwrap();
+        let mut cache = AgentMasterCache::new(Some(Backend::File), Some(master));
+        assert!(cache.master.is_some());
+        cache.purge_if_idle(
+            Instant::now() - Duration::from_secs(2),
+            Duration::from_secs(1),
+        );
+        assert!(cache.master.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn live_grant_rejects_expired_entry_without_purge() {
-        let mut state = AgentState::new(Duration::from_secs(60), None, None);
+        let mut state = AgentState::new(Duration::from_secs(60));
         let scope = GrantKey {
             grant_id: "expired-grant".to_string(),
         };
@@ -3293,7 +3406,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn live_grant_rejects_idle_expired_entry_without_purge() {
-        let mut state = AgentState::new(Duration::from_secs(1), None, None);
+        let mut state = AgentState::new(Duration::from_secs(1));
         let scope = GrantKey {
             grant_id: "idle-grant".to_string(),
         };

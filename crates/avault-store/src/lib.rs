@@ -17,6 +17,8 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::env;
+#[cfg(target_os = "macos")]
+use std::fs::OpenOptions;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 #[cfg(unix)]
@@ -25,6 +27,8 @@ use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
+#[cfg(target_os = "macos")]
+use std::time::{SystemTime, UNIX_EPOCH};
 use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(target_os = "linux")]
@@ -55,6 +59,8 @@ use security_framework::base::Error as KeychainError;
 use security_framework::os::macos::keychain::SecKeychain;
 #[cfg(target_os = "macos")]
 use security_framework::passwords::{get_generic_password, set_generic_password};
+#[cfg(target_os = "macos")]
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 #[cfg(windows)]
 use std::ffi::OsStr;
@@ -123,6 +129,26 @@ const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
 const ERR_SEC_NO_DEFAULT_KEYCHAIN: i32 = -25307;
 #[cfg(target_os = "macos")]
 const ERR_SEC_INTERACTION_NOT_ALLOWED: i32 = -25308;
+#[cfg(target_os = "macos")]
+const ERR_SEC_USER_CANCELED: i32 = -128;
+#[cfg(target_os = "macos")]
+const ERR_SEC_AUTH_FAILED: i32 = -25293;
+#[cfg(target_os = "macos")]
+const KEYCHAIN_ACCESS_COOLDOWN_SECS: u64 = 120;
+#[cfg(target_os = "macos")]
+const KEYCHAIN_ACCESS_LOCK_FILE: &str = ".keychain-access.lock";
+#[cfg(target_os = "macos")]
+const KEYCHAIN_ACCESS_STATE_FILE: &str = ".keychain-access.cooldown";
+
+/// How a Keychain operation may interact with the user.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeychainAccessMode {
+    /// Permit macOS to show its normal Keychain authorization UI.
+    Interactive,
+    /// Fail instead of showing an authorization UI.
+    NonInteractive,
+}
 
 /// Selected master-key storage backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,6 +164,12 @@ pub enum Backend {
 pub struct MasterKey {
     page: LockedKeyPage,
 }
+
+// Safety: after construction, `MasterKey` exposes only shared immutable access to its dedicated
+// locked page. Mutation is confined to private constructors before the value is shared, and Drop
+// runs only after the last owner is gone, so immutable cross-thread sharing is sound.
+unsafe impl Send for MasterKey {}
+unsafe impl Sync for MasterKey {}
 
 impl MasterKey {
     fn zeroed_locked() -> anyhow::Result<Self> {
@@ -431,12 +463,38 @@ pub fn load_or_create_master_key(backend: Backend) -> anyhow::Result<MasterKey> 
     }
 }
 
-/// Load the existing 32-byte master key. This never creates a replacement key.
+/// Load the existing 32-byte master key without allowing an interactive Keychain prompt.
 pub fn load_master_key(backend: Backend) -> anyhow::Result<MasterKey> {
     match backend {
         Backend::Auto => load_auto_master_key(),
         Backend::File => FileStore::new(default_master_key_path()?).get(),
+        Backend::Keychain => KeychainStore::new().get_noninteractive(),
+        Backend::Tpm => TpmStore::new(default_tpm_master_key_path()?).get(),
+        Backend::FilePassphrase => {
+            bail!("passphrase backend requires an explicit passphrase unlock")
+        }
+    }
+}
+
+/// Load the existing master key through an explicit interactive Keychain access.
+pub fn load_master_key_interactive(backend: Backend) -> anyhow::Result<MasterKey> {
+    match backend {
+        Backend::Auto => load_auto_master_key_interactive(),
+        Backend::File => FileStore::new(default_master_key_path()?).get(),
         Backend::Keychain => KeychainStore::new().get(),
+        Backend::Tpm => TpmStore::new(default_tpm_master_key_path()?).get(),
+        Backend::FilePassphrase => {
+            bail!("passphrase backend requires an explicit passphrase unlock")
+        }
+    }
+}
+
+/// Perform one explicit Keychain authorization attempt, bypassing the recent-failure cooldown.
+pub fn authorize_master_key(backend: Backend) -> anyhow::Result<MasterKey> {
+    match backend {
+        Backend::Auto => authorize_auto_master_key(),
+        Backend::File => FileStore::new(default_master_key_path()?).get(),
+        Backend::Keychain => KeychainStore::new().authorize(),
         Backend::Tpm => TpmStore::new(default_tpm_master_key_path()?).get(),
         Backend::FilePassphrase => {
             bail!("passphrase backend requires an explicit passphrase unlock")
@@ -499,7 +557,49 @@ fn load_or_create_auto_master_key() -> anyhow::Result<MasterKey> {
 }
 
 #[cfg(target_os = "macos")]
-fn load_auto_master_key() -> anyhow::Result<MasterKey> {
+fn authorize_auto_master_key() -> anyhow::Result<MasterKey> {
+    let keychain = KeychainStore::new();
+    let file = auto_file_store()?;
+
+    if let Some(file_key) = load_existing_file_master_key(file.as_ref())? {
+        return match keychain.authorize() {
+            Ok(keychain_key) => {
+                if keychain_key.as_bytes() == file_key.as_bytes() {
+                    Ok(keychain_key)
+                } else {
+                    bail!(
+                        "file master key differs from Keychain master key; refusing to choose automatically"
+                    )
+                }
+            }
+            Err(err) if is_keychain_not_found(&err) => {
+                keychain.create_noclobber(file_key.as_bytes())?;
+                Ok(file_key)
+            }
+            Err(err) if is_keychain_unavailable(&err) => Ok(file_key),
+            Err(err) => Err(err),
+        };
+    }
+
+    match keychain.authorize() {
+        Ok(key) => Ok(key),
+        Err(err) if is_keychain_not_found(&err) => {
+            create_keychain_key(&keychain, MasterKey::generate_locked()?)
+        }
+        Err(err) if is_keychain_unavailable(&err) => {
+            Err(err).context("Keychain is unavailable and no existing file master key was found")
+        }
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn authorize_auto_master_key() -> anyhow::Result<MasterKey> {
+    load_auto_master_key()
+}
+
+#[cfg(target_os = "macos")]
+fn load_auto_master_key_interactive() -> anyhow::Result<MasterKey> {
     let keychain = KeychainStore::new();
     let file = auto_file_store()?;
 
@@ -508,6 +608,29 @@ fn load_auto_master_key() -> anyhow::Result<MasterKey> {
     }
 
     match keychain.get() {
+        Ok(key) => Ok(key),
+        Err(err) if is_keychain_unavailable(&err) => {
+            Err(err).context("Keychain is unavailable and no existing file master key was found")
+        }
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn load_auto_master_key_interactive() -> anyhow::Result<MasterKey> {
+    load_auto_master_key()
+}
+
+#[cfg(target_os = "macos")]
+fn load_auto_master_key() -> anyhow::Result<MasterKey> {
+    let keychain = KeychainStore::new();
+    let file = auto_file_store()?;
+
+    if let Some(file_key) = load_existing_file_master_key(file.as_ref())? {
+        return migrate_file_key_to_keychain_noninteractive(&keychain, file_key);
+    }
+
+    match keychain.get_noninteractive() {
         Ok(key) => Ok(key),
         Err(err) if is_keychain_unavailable(&err) => {
             Err(err).context("Keychain is unavailable and no existing file master key was found")
@@ -722,6 +845,43 @@ fn migrate_file_key_to_keychain(
                 Ok(()) => Ok(file_key),
                 Err(err) if is_keychain_duplicate(&err) => {
                     let keychain_key = keychain.get()?;
+                    if keychain_key.as_bytes() == file_key.as_bytes() {
+                        Ok(keychain_key)
+                    } else {
+                        bail!(
+                            "file master key differs from concurrently created Keychain master key"
+                        )
+                    }
+                }
+                Err(err) if is_keychain_unavailable(&err) => Ok(file_key),
+                Err(err) => Err(err).context("failed to migrate file master key to Keychain"),
+            }
+        }
+        Err(err) if is_keychain_unavailable(&err) => Ok(file_key),
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn migrate_file_key_to_keychain_noninteractive(
+    keychain: &KeychainStore,
+    file_key: MasterKey,
+) -> anyhow::Result<MasterKey> {
+    match keychain.get_noninteractive() {
+        Ok(keychain_key) => {
+            if keychain_key.as_bytes() == file_key.as_bytes() {
+                Ok(keychain_key)
+            } else {
+                bail!(
+                    "file master key differs from Keychain master key; refusing to choose automatically"
+                )
+            }
+        }
+        Err(err) if is_keychain_not_found(&err) => {
+            match keychain.create_noclobber_noninteractive(file_key.as_bytes()) {
+                Ok(()) => Ok(file_key),
+                Err(err) if is_keychain_duplicate(&err) => {
+                    let keychain_key = keychain.get_noninteractive()?;
                     if keychain_key.as_bytes() == file_key.as_bytes() {
                         Ok(keychain_key)
                     } else {
@@ -1343,20 +1503,209 @@ impl Default for KeychainStore {
 }
 
 #[cfg(target_os = "macos")]
+static KEYCHAIN_ACCESS_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+
+#[cfg(target_os = "macos")]
+struct KeychainAccessGuard {
+    _thread: MutexGuard<'static, ()>,
+    file: File,
+    interaction: Option<security_framework::os::macos::keychain::KeychainUserInteractionLock>,
+}
+
+#[cfg(target_os = "macos")]
+impl KeychainAccessGuard {
+    fn acquire(mode: KeychainAccessMode, bypass_cooldown: bool) -> anyhow::Result<Self> {
+        let thread = KEYCHAIN_ACCESS_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .map_err(|_| anyhow!("Keychain access gate is poisoned"))?;
+        let file = open_keychain_access_file()?;
+        lock_keychain_access_file(&file)?;
+        if !bypass_cooldown {
+            check_keychain_cooldown()?;
+        }
+        let interaction = match mode {
+            KeychainAccessMode::Interactive => None,
+            KeychainAccessMode::NonInteractive => Some(
+                SecKeychain::disable_user_interaction()
+                    .map_err(anyhow::Error::from)
+                    .context("failed to disable Keychain user interaction")?,
+            ),
+        };
+        Ok(Self {
+            _thread: thread,
+            file,
+            interaction,
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for KeychainAccessGuard {
+    fn drop(&mut self) {
+        // Re-enable Keychain user interaction before releasing the cross-process lock. Otherwise a
+        // next process could enter the Keychain while this process still has interaction disabled.
+        self.interaction.take();
+        // Safety invariant: the descriptor remains open for the lifetime of this guard, and the
+        // lock covers only the Keychain API call, never Vault decryption, network I/O, or children.
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn keychain_access_parent() -> anyhow::Result<PathBuf> {
+    let parent = user_home_dir()?.join(".avibe").join("run");
+    ensure_secret_parent_directory(&parent)?;
+    Ok(parent)
+}
+
+#[cfg(target_os = "macos")]
+fn open_keychain_access_file() -> anyhow::Result<File> {
+    let path = keychain_access_parent()?.join(KEYCHAIN_ACCESS_LOCK_FILE);
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .context("failed to open Keychain access lock")?;
+    secure_created_file(&path, CreatedFileOwner::SetCurrentUser)?;
+    validate_file_mode(&path)?;
+    Ok(file)
+}
+
+#[cfg(target_os = "macos")]
+fn lock_keychain_access_file(file: &File) -> anyhow::Result<()> {
+    // Safety invariant: `file` is an open regular file owned by this process. `flock` only
+    // changes advisory lock state associated with its descriptor.
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error()).context("failed to lock Keychain access");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn keychain_cooldown_path() -> anyhow::Result<PathBuf> {
+    Ok(keychain_access_parent()?.join(KEYCHAIN_ACCESS_STATE_FILE))
+}
+
+#[cfg(target_os = "macos")]
+fn check_keychain_cooldown() -> anyhow::Result<()> {
+    let path = keychain_cooldown_path()?;
+    let Ok(contents) = fs::read_to_string(&path) else {
+        return Ok(());
+    };
+    let Ok(until) = contents.trim().parse::<u64>() else {
+        let _ = fs::remove_file(path);
+        return Ok(());
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?
+        .as_secs();
+    if until > now {
+        bail!("Keychain access is temporarily suppressed after a recent authorization failure");
+    }
+    let _ = fs::remove_file(path);
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn mark_keychain_cooldown() {
+    let Ok(path) = keychain_cooldown_path() else {
+        return;
+    };
+    let Ok(until) = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|now| now.as_secs().saturating_add(KEYCHAIN_ACCESS_COOLDOWN_SECS))
+    else {
+        return;
+    };
+    if fs::write(&path, until.to_string()).is_ok() {
+        let _ = secure_created_file(&path, CreatedFileOwner::SetCurrentUser);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn clear_keychain_cooldown() {
+    if let Ok(path) = keychain_cooldown_path() {
+        let _ = fs::remove_file(path);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn is_keychain_interaction_failure(err: &anyhow::Error) -> bool {
+    matches!(
+        keychain_error_code(err),
+        Some(
+            ERR_SEC_NOT_AVAILABLE
+                | ERR_SEC_NO_DEFAULT_KEYCHAIN
+                | ERR_SEC_INTERACTION_NOT_ALLOWED
+                | ERR_SEC_USER_CANCELED
+                | ERR_SEC_AUTH_FAILED
+        )
+    )
+}
+
+#[cfg(target_os = "macos")]
 impl KeychainStore {
     /// Return the master key, creating it in the user's default Keychain if missing.
     ///
-    /// This uses a regular generic-password item and does not attach a
-    /// user-presence / biometry access-control policy. That keeps the standard
-    /// tier headless after the OS session is unlocked.
+    /// The cross-process gate covers only the Keychain call. Once this returns, the caller may
+    /// decrypt Vault records and perform network or child-process work concurrently with others.
     pub fn get_or_create(&self) -> anyhow::Result<MasterKey> {
-        match self.get() {
+        self.get_or_create_with_mode(KeychainAccessMode::Interactive, false)
+    }
+
+    /// Return the master key without allowing a Keychain authorization dialog.
+    pub fn get_or_create_noninteractive(&self) -> anyhow::Result<MasterKey> {
+        self.get_or_create_with_mode(KeychainAccessMode::NonInteractive, false)
+    }
+
+    /// Return the existing Keychain master key.
+    pub fn get(&self) -> anyhow::Result<MasterKey> {
+        self.get_with_mode(KeychainAccessMode::Interactive, false)
+    }
+
+    /// Return the existing Keychain master key without allowing a Keychain authorization dialog.
+    pub fn get_noninteractive(&self) -> anyhow::Result<MasterKey> {
+        self.get_with_mode(KeychainAccessMode::NonInteractive, false)
+    }
+
+    /// Retry an interactive read after an explicit user authorization action.
+    pub fn authorize(&self) -> anyhow::Result<MasterKey> {
+        self.get_with_mode(KeychainAccessMode::Interactive, true)
+    }
+
+    fn get_or_create_with_mode(
+        &self,
+        mode: KeychainAccessMode,
+        bypass_cooldown: bool,
+    ) -> anyhow::Result<MasterKey> {
+        let _gate = KeychainAccessGuard::acquire(mode, bypass_cooldown)?;
+        finish_keychain_access(self.get_or_create_unlocked())
+    }
+
+    fn get_with_mode(
+        &self,
+        mode: KeychainAccessMode,
+        bypass_cooldown: bool,
+    ) -> anyhow::Result<MasterKey> {
+        let _gate = KeychainAccessGuard::acquire(mode, bypass_cooldown)?;
+        finish_keychain_access(self.get_unlocked())
+    }
+
+    fn get_or_create_unlocked(&self) -> anyhow::Result<MasterKey> {
+        match self.get_unlocked() {
             Ok(key) => Ok(key),
             Err(err) if is_keychain_not_found(&err) => {
                 let key = MasterKey::generate_locked()?;
-                match self.create_noclobber(key.as_bytes()) {
+                match self.create_noclobber_unlocked(key.as_bytes()) {
                     Ok(()) => Ok(key),
-                    Err(err) if is_keychain_duplicate(&err) => self.get(),
+                    Err(err) if is_keychain_duplicate(&err) => self.get_unlocked(),
                     Err(err) => Err(err).context("failed to store master key in Keychain"),
                 }
             }
@@ -1364,8 +1713,7 @@ impl KeychainStore {
         }
     }
 
-    /// Return the existing Keychain master key.
-    pub fn get(&self) -> anyhow::Result<MasterKey> {
+    fn get_unlocked(&self) -> anyhow::Result<MasterKey> {
         harden_process_memory();
         let mut bytes = Zeroizing::new(
             get_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
@@ -1383,24 +1731,47 @@ impl KeychainStore {
 
     /// Import a master key into Keychain, refusing to overwrite unless `force` is true.
     pub fn import(&self, key: &[u8; MASTER_KEY_BYTES], force: bool) -> anyhow::Result<()> {
-        if force {
-            return set_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, key)
-                .context("failed to store imported master key in Keychain");
-        }
-
-        match self.create_noclobber(key) {
-            Ok(()) => Ok(()),
-            Err(err) if is_keychain_duplicate(&err) => {
-                Err(err).context("master key already exists")
-            }
-            Err(err) => Err(err).context("failed to store imported master key in Keychain"),
-        }
+        let _gate = KeychainAccessGuard::acquire(KeychainAccessMode::Interactive, true)?;
+        let result = if force {
+            set_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, key)
+                .map_err(anyhow::Error::from)
+        } else {
+            self.create_noclobber_unlocked(key)
+                .map_err(|err| err.context("master key already exists"))
+        };
+        finish_keychain_access(result)
     }
 
     fn create_noclobber(&self, key: &[u8; MASTER_KEY_BYTES]) -> anyhow::Result<()> {
+        let _gate = KeychainAccessGuard::acquire(KeychainAccessMode::Interactive, true)?;
+        finish_keychain_access(self.create_noclobber_unlocked(key))
+    }
+
+    fn create_noclobber_noninteractive(&self, key: &[u8; MASTER_KEY_BYTES]) -> anyhow::Result<()> {
+        let _gate = KeychainAccessGuard::acquire(KeychainAccessMode::NonInteractive, false)?;
+        finish_keychain_access(self.create_noclobber_unlocked(key))
+    }
+
+    fn create_noclobber_unlocked(&self, key: &[u8; MASTER_KEY_BYTES]) -> anyhow::Result<()> {
         SecKeychain::default()?
             .add_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, key)
             .map_err(anyhow::Error::from)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn finish_keychain_access<T>(result: anyhow::Result<T>) -> anyhow::Result<T> {
+    match result {
+        Ok(value) => {
+            clear_keychain_cooldown();
+            Ok(value)
+        }
+        Err(err) => {
+            if is_keychain_interaction_failure(&err) {
+                mark_keychain_cooldown();
+            }
+            Err(err)
+        }
     }
 }
 
@@ -1410,7 +1781,19 @@ impl KeychainStore {
         bail!("Keychain master-key backend is only available on macOS")
     }
 
+    pub fn get_or_create_noninteractive(&self) -> anyhow::Result<MasterKey> {
+        bail!("Keychain master-key backend is only available on macOS")
+    }
+
     pub fn get(&self) -> anyhow::Result<MasterKey> {
+        bail!("Keychain master-key backend is only available on macOS")
+    }
+
+    pub fn get_noninteractive(&self) -> anyhow::Result<MasterKey> {
+        bail!("Keychain master-key backend is only available on macOS")
+    }
+
+    pub fn authorize(&self) -> anyhow::Result<MasterKey> {
         bail!("Keychain master-key backend is only available on macOS")
     }
 
