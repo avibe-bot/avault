@@ -2441,12 +2441,19 @@ impl AgentAdmission {
     }
 
     fn try_admit(self: &Arc<Self>) -> Option<AgentPermit> {
-        self.active
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                (active < self.limit).then_some(active + 1)
-            })
-            .ok()?;
-        Some(AgentPermit(Arc::clone(self)))
+        let mut active = self.active.load(Ordering::Acquire);
+        while active < self.limit {
+            match self.active.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(AgentPermit(Arc::clone(self))),
+                Err(current) => active = current,
+            }
+        }
+        None
     }
 }
 
@@ -4105,6 +4112,32 @@ mod tests {
             assert!(admission.try_admit().is_none());
             drop(permit);
             assert!(admission.try_admit().is_some());
+        }
+
+        #[test]
+        fn admission_never_exceeds_its_limit_under_contention() {
+            let admission = AgentAdmission::new(5);
+            let barrier = Arc::new(std::sync::Barrier::new(16));
+            let workers = (0..16)
+                .map(|_| {
+                    let admission = Arc::clone(&admission);
+                    let barrier = Arc::clone(&barrier);
+                    thread::spawn(move || {
+                        barrier.wait();
+                        (0..100)
+                            .filter_map(|_| admission.try_admit())
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect::<Vec<_>>();
+            let permits = workers
+                .into_iter()
+                .flat_map(|worker| worker.join().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(permits.len(), 5);
+            assert_eq!(admission.active.load(Ordering::SeqCst), 5);
+            drop(permits);
+            assert_eq!(admission.active.load(Ordering::SeqCst), 0);
         }
 
         /// A connected pair whose client side cannot block the test forever.
