@@ -18,17 +18,25 @@ use serde::{Deserialize, Serialize};
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::env;
 #[cfg(target_os = "macos")]
+use std::ffi::OsString;
+#[cfg(target_os = "macos")]
 use std::fs::OpenOptions;
 use std::fs::{self, File};
 use std::io::{Read, Write};
+#[cfg(target_os = "macos")]
+use std::io::{Seek, SeekFrom};
 #[cfg(unix)]
 use std::os::fd::{AsFd, AsRawFd};
+#[cfg(target_os = "macos")]
+use std::os::unix::ffi::OsStringExt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(target_os = "macos")]
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 #[cfg(target_os = "macos")]
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use zeroize::{Zeroize, Zeroizing};
 
 #[cfg(target_os = "linux")]
@@ -60,7 +68,7 @@ use security_framework::os::macos::keychain::SecKeychain;
 #[cfg(target_os = "macos")]
 use security_framework::passwords::{get_generic_password, set_generic_password};
 #[cfg(target_os = "macos")]
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Mutex, PoisonError};
 
 #[cfg(windows)]
 use std::ffi::OsStr;
@@ -134,21 +142,23 @@ const ERR_SEC_USER_CANCELED: i32 = -128;
 #[cfg(target_os = "macos")]
 const ERR_SEC_AUTH_FAILED: i32 = -25293;
 #[cfg(target_os = "macos")]
-const KEYCHAIN_ACCESS_COOLDOWN_SECS: u64 = 120;
+const KEYCHAIN_AUTHORIZE_HINT: &str = "macOS Keychain needs a one-time authorization for avault; \
+     run `avault key authorize` in a logged-in session";
 #[cfg(target_os = "macos")]
-const KEYCHAIN_ACCESS_LOCK_FILE: &str = ".keychain-access.lock";
+const KEYCHAIN_SESSION_HINT: &str =
+    "macOS can show the Keychain authorization prompt only in a logged-in desktop session";
 #[cfg(target_os = "macos")]
-const KEYCHAIN_ACCESS_STATE_FILE: &str = ".keychain-access.cooldown";
-
-/// How a Keychain operation may interact with the user.
+const KEYCHAIN_AUTHORIZATION_COOLDOWN_SECS: u64 = 120;
 #[cfg(target_os = "macos")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeychainAccessMode {
-    /// Permit macOS to show its normal Keychain authorization UI.
-    Interactive,
-    /// Fail instead of showing an authorization UI.
-    NonInteractive,
-}
+const KEYCHAIN_AUTHORIZATION_WAIT: Duration = Duration::from_secs(120);
+#[cfg(target_os = "macos")]
+const KEYCHAIN_AUTHORIZATION_POLL: Duration = Duration::from_millis(100);
+#[cfg(target_os = "macos")]
+const KEYCHAIN_AUTHORIZATION_DIR: &str = "bot.avibe.avault";
+#[cfg(target_os = "macos")]
+const KEYCHAIN_AUTHORIZATION_GATE_FILE: &str = "keychain-authorization.lock";
+#[cfg(target_os = "macos")]
+const MAX_KEYCHAIN_COOLDOWN_RECORD_BYTES: u64 = 32;
 
 /// Selected master-key storage backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -451,6 +461,9 @@ fn user_home_dir() -> anyhow::Result<PathBuf> {
 }
 
 /// Load the 32-byte master key, or create it on first use.
+///
+/// Like every store operation except [`authorize_master_key`], this never shows macOS Keychain
+/// UI: a Keychain that needs user authorization fails with an `avault key authorize` hint.
 pub fn load_or_create_master_key(backend: Backend) -> anyhow::Result<MasterKey> {
     match backend {
         Backend::Auto => load_or_create_auto_master_key(),
@@ -463,23 +476,11 @@ pub fn load_or_create_master_key(backend: Backend) -> anyhow::Result<MasterKey> 
     }
 }
 
-/// Load the existing 32-byte master key without allowing an interactive Keychain prompt.
+/// Load the existing 32-byte master key. This never creates a replacement key and never shows
+/// macOS Keychain UI.
 pub fn load_master_key(backend: Backend) -> anyhow::Result<MasterKey> {
     match backend {
         Backend::Auto => load_auto_master_key(),
-        Backend::File => FileStore::new(default_master_key_path()?).get(),
-        Backend::Keychain => KeychainStore::new().get_noninteractive(),
-        Backend::Tpm => TpmStore::new(default_tpm_master_key_path()?).get(),
-        Backend::FilePassphrase => {
-            bail!("passphrase backend requires an explicit passphrase unlock")
-        }
-    }
-}
-
-/// Load the existing master key through an explicit interactive Keychain access.
-pub fn load_master_key_interactive(backend: Backend) -> anyhow::Result<MasterKey> {
-    match backend {
-        Backend::Auto => load_auto_master_key_interactive(),
         Backend::File => FileStore::new(default_master_key_path()?).get(),
         Backend::Keychain => KeychainStore::new().get(),
         Backend::Tpm => TpmStore::new(default_tpm_master_key_path()?).get(),
@@ -489,15 +490,19 @@ pub fn load_master_key_interactive(backend: Backend) -> anyhow::Result<MasterKey
     }
 }
 
-/// Perform one explicit Keychain authorization attempt, bypassing the recent-failure cooldown.
-pub fn authorize_master_key(backend: Backend) -> anyhow::Result<MasterKey> {
+/// Explicitly authorize this binary to read the existing master key.
+///
+/// This is the only store operation that may show macOS Keychain UI, so call it only for a user
+/// who asked to authorize. Concurrent attempts share one prompt, and a denied or cancelled prompt
+/// suppresses further prompts for a cooldown window. `on_wait` runs once if another
+/// authorization is already in progress. Other backends have no authorization UI, so this only
+/// verifies that the existing key loads. It never creates a key.
+pub fn authorize_master_key(backend: Backend, on_wait: impl FnOnce()) -> anyhow::Result<()> {
     match backend {
-        Backend::Auto => authorize_auto_master_key(),
-        Backend::File => FileStore::new(default_master_key_path()?).get(),
-        Backend::Keychain => KeychainStore::new().authorize(),
-        Backend::Tpm => TpmStore::new(default_tpm_master_key_path()?).get(),
-        Backend::FilePassphrase => {
-            bail!("passphrase backend requires an explicit passphrase unlock")
+        Backend::Auto => authorize_auto_master_key(on_wait),
+        Backend::Keychain => KeychainStore::new().authorize(on_wait),
+        Backend::File | Backend::Tpm | Backend::FilePassphrase => {
+            load_master_key(backend).map(drop)
         }
     }
 }
@@ -527,23 +532,11 @@ pub fn import_master_key(
 
 #[cfg(target_os = "macos")]
 fn load_or_create_auto_master_key() -> anyhow::Result<MasterKey> {
-    let keychain = KeychainStore::new();
-    let file = auto_file_store()?;
-
-    if let Some(file_key) = load_existing_file_master_key(file.as_ref())? {
-        return migrate_file_key_to_keychain(&keychain, file_key);
-    }
-
-    match keychain.get() {
-        Ok(key) => Ok(key),
-        Err(err) if is_keychain_not_found(&err) => {
-            create_keychain_key(&keychain, MasterKey::generate_locked()?)
-        }
-        Err(err) if is_keychain_unavailable(&err) => {
-            Err(err).context("Keychain is unavailable and no existing file master key was found")
-        }
-        Err(err) => Err(err),
-    }
+    load_auto_master_key_with(
+        &SystemKeychain::Background,
+        auto_file_store()?.as_ref(),
+        true,
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -557,86 +550,12 @@ fn load_or_create_auto_master_key() -> anyhow::Result<MasterKey> {
 }
 
 #[cfg(target_os = "macos")]
-fn authorize_auto_master_key() -> anyhow::Result<MasterKey> {
-    let keychain = KeychainStore::new();
-    let file = auto_file_store()?;
-
-    if let Some(file_key) = load_existing_file_master_key(file.as_ref())? {
-        return match keychain.authorize() {
-            Ok(keychain_key) => {
-                if keychain_key.as_bytes() == file_key.as_bytes() {
-                    Ok(keychain_key)
-                } else {
-                    bail!(
-                        "file master key differs from Keychain master key; refusing to choose automatically"
-                    )
-                }
-            }
-            Err(err) if is_keychain_not_found(&err) => {
-                keychain.create_noclobber(file_key.as_bytes())?;
-                Ok(file_key)
-            }
-            Err(err) if is_keychain_unavailable(&err) => Ok(file_key),
-            Err(err) => Err(err),
-        };
-    }
-
-    match keychain.authorize() {
-        Ok(key) => Ok(key),
-        Err(err) if is_keychain_not_found(&err) => {
-            create_keychain_key(&keychain, MasterKey::generate_locked()?)
-        }
-        Err(err) if is_keychain_unavailable(&err) => {
-            Err(err).context("Keychain is unavailable and no existing file master key was found")
-        }
-        Err(err) => Err(err),
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn authorize_auto_master_key() -> anyhow::Result<MasterKey> {
-    load_auto_master_key()
-}
-
-#[cfg(target_os = "macos")]
-fn load_auto_master_key_interactive() -> anyhow::Result<MasterKey> {
-    let keychain = KeychainStore::new();
-    let file = auto_file_store()?;
-
-    if let Some(file_key) = load_existing_file_master_key(file.as_ref())? {
-        return migrate_file_key_to_keychain(&keychain, file_key);
-    }
-
-    match keychain.get() {
-        Ok(key) => Ok(key),
-        Err(err) if is_keychain_unavailable(&err) => {
-            Err(err).context("Keychain is unavailable and no existing file master key was found")
-        }
-        Err(err) => Err(err),
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn load_auto_master_key_interactive() -> anyhow::Result<MasterKey> {
-    load_auto_master_key()
-}
-
-#[cfg(target_os = "macos")]
 fn load_auto_master_key() -> anyhow::Result<MasterKey> {
-    let keychain = KeychainStore::new();
-    let file = auto_file_store()?;
-
-    if let Some(file_key) = load_existing_file_master_key(file.as_ref())? {
-        return migrate_file_key_to_keychain_noninteractive(&keychain, file_key);
-    }
-
-    match keychain.get_noninteractive() {
-        Ok(key) => Ok(key),
-        Err(err) if is_keychain_unavailable(&err) => {
-            Err(err).context("Keychain is unavailable and no existing file master key was found")
-        }
-        Err(err) => Err(err),
-    }
+    load_auto_master_key_with(
+        &SystemKeychain::Background,
+        auto_file_store()?.as_ref(),
+        false,
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -647,6 +566,45 @@ fn load_auto_master_key() -> anyhow::Result<MasterKey> {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn load_auto_master_key() -> anyhow::Result<MasterKey> {
     load_master_key(default_backend())
+}
+
+#[cfg(target_os = "macos")]
+fn authorize_auto_master_key(on_wait: impl FnOnce()) -> anyhow::Result<()> {
+    let file = auto_file_store()?;
+    authorize_keychain(on_wait, |keychain| {
+        load_auto_master_key_with(keychain, file.as_ref(), false)
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn authorize_auto_master_key(_on_wait: impl FnOnce()) -> anyhow::Result<()> {
+    load_auto_master_key().map(drop)
+}
+
+/// The macOS `auto` policy. An existing file key stays authoritative and is migrated into
+/// Keychain; otherwise Keychain holds the key. A Keychain error never selects another backend
+/// or creates a replacement key.
+#[cfg(target_os = "macos")]
+fn load_auto_master_key_with(
+    keychain: &impl KeychainBackend,
+    file: Option<&FileStore>,
+    create: bool,
+) -> anyhow::Result<MasterKey> {
+    if let Some(file_key) = load_existing_file_master_key(file)? {
+        return migrate_file_key_to_keychain(keychain, file_key);
+    }
+
+    let result = if create {
+        get_or_create_keychain_key(keychain)
+    } else {
+        keychain.read()
+    };
+    match result {
+        Err(err) if is_keychain_unavailable(&err) => {
+            Err(err).context("Keychain is unavailable and no existing file master key was found")
+        }
+        result => result,
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -827,10 +785,10 @@ fn load_existing_file_master_key(file: Option<&FileStore>) -> anyhow::Result<Opt
 
 #[cfg(target_os = "macos")]
 fn migrate_file_key_to_keychain(
-    keychain: &KeychainStore,
+    keychain: &impl KeychainBackend,
     file_key: MasterKey,
 ) -> anyhow::Result<MasterKey> {
-    match keychain.get() {
+    match keychain.read() {
         Ok(keychain_key) => {
             if keychain_key.as_bytes() == file_key.as_bytes() {
                 Ok(keychain_key)
@@ -840,71 +798,56 @@ fn migrate_file_key_to_keychain(
                 )
             }
         }
-        Err(err) if is_keychain_not_found(&err) => {
-            match keychain.create_noclobber(file_key.as_bytes()) {
-                Ok(()) => Ok(file_key),
-                Err(err) if is_keychain_duplicate(&err) => {
-                    let keychain_key = keychain.get()?;
-                    if keychain_key.as_bytes() == file_key.as_bytes() {
-                        Ok(keychain_key)
-                    } else {
-                        bail!(
-                            "file master key differs from concurrently created Keychain master key"
-                        )
-                    }
+        Err(err) if is_keychain_not_found(&err) => match keychain.add(file_key.as_bytes()) {
+            Ok(()) => Ok(file_key),
+            Err(err) if is_keychain_duplicate(&err) => {
+                let keychain_key = keychain.read()?;
+                if keychain_key.as_bytes() == file_key.as_bytes() {
+                    Ok(keychain_key)
+                } else {
+                    bail!("file master key differs from concurrently created Keychain master key")
                 }
-                Err(err) if is_keychain_unavailable(&err) => Ok(file_key),
-                Err(err) => Err(err).context("failed to migrate file master key to Keychain"),
             }
-        }
+            Err(err) if is_keychain_unavailable(&err) => Ok(file_key),
+            Err(err) => Err(err).context("failed to migrate file master key to Keychain"),
+        },
         Err(err) if is_keychain_unavailable(&err) => Ok(file_key),
         Err(err) => Err(err),
     }
 }
 
 #[cfg(target_os = "macos")]
-fn migrate_file_key_to_keychain_noninteractive(
-    keychain: &KeychainStore,
-    file_key: MasterKey,
-) -> anyhow::Result<MasterKey> {
-    match keychain.get_noninteractive() {
-        Ok(keychain_key) => {
-            if keychain_key.as_bytes() == file_key.as_bytes() {
-                Ok(keychain_key)
-            } else {
-                bail!(
-                    "file master key differs from Keychain master key; refusing to choose automatically"
-                )
-            }
-        }
+fn get_or_create_keychain_key(keychain: &impl KeychainBackend) -> anyhow::Result<MasterKey> {
+    match keychain.read() {
+        Ok(key) => Ok(key),
         Err(err) if is_keychain_not_found(&err) => {
-            match keychain.create_noclobber_noninteractive(file_key.as_bytes()) {
-                Ok(()) => Ok(file_key),
-                Err(err) if is_keychain_duplicate(&err) => {
-                    let keychain_key = keychain.get_noninteractive()?;
-                    if keychain_key.as_bytes() == file_key.as_bytes() {
-                        Ok(keychain_key)
-                    } else {
-                        bail!(
-                            "file master key differs from concurrently created Keychain master key"
-                        )
-                    }
-                }
-                Err(err) if is_keychain_unavailable(&err) => Ok(file_key),
-                Err(err) => Err(err).context("failed to migrate file master key to Keychain"),
+            let key = MasterKey::generate_locked()?;
+            match keychain.add(key.as_bytes()) {
+                Ok(()) => Ok(key),
+                Err(err) if is_keychain_duplicate(&err) => keychain.read(),
+                Err(err) => Err(err).context("failed to create master key in Keychain"),
             }
         }
-        Err(err) if is_keychain_unavailable(&err) => Ok(file_key),
         Err(err) => Err(err),
     }
 }
 
 #[cfg(target_os = "macos")]
-fn create_keychain_key(keychain: &KeychainStore, key: MasterKey) -> anyhow::Result<MasterKey> {
-    match keychain.create_noclobber(key.as_bytes()) {
-        Ok(()) => Ok(key),
-        Err(err) if is_keychain_duplicate(&err) => keychain.get(),
-        Err(err) => Err(err).context("failed to create master key in Keychain"),
+fn import_keychain_key(
+    keychain: &impl KeychainBackend,
+    key: &[u8; MASTER_KEY_BYTES],
+    force: bool,
+) -> anyhow::Result<()> {
+    if force {
+        return keychain
+            .replace(key)
+            .context("failed to store imported master key in Keychain");
+    }
+
+    match keychain.add(key) {
+        Ok(()) => Ok(()),
+        Err(err) if is_keychain_duplicate(&err) => Err(err).context("master key already exists"),
+        Err(err) => Err(err).context("failed to store imported master key in Keychain"),
     }
 }
 
@@ -1502,277 +1445,399 @@ impl Default for KeychainStore {
     }
 }
 
+/// Serializes this process's Security.framework calls. `SecKeychainSetUserInteractionAllowed` is
+/// process-global, so no call may overlap a background call while interaction is switched off.
 #[cfg(target_os = "macos")]
-static KEYCHAIN_ACCESS_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+static KEYCHAIN_CALL_MUTEX: Mutex<()> = Mutex::new(());
 
+/// Keychain item operations behind the master-key policy. Production uses [`SystemKeychain`];
+/// tests substitute a fake so they never touch the user's Keychain.
 #[cfg(target_os = "macos")]
-struct KeychainAccessGuard {
-    _thread: MutexGuard<'static, ()>,
-    file: File,
-    interaction: Option<security_framework::os::macos::keychain::KeychainUserInteractionLock>,
+trait KeychainBackend {
+    fn read(&self) -> anyhow::Result<MasterKey>;
+    fn add(&self, key: &[u8; MASTER_KEY_BYTES]) -> anyhow::Result<()>;
+    fn replace(&self, key: &[u8; MASTER_KEY_BYTES]) -> anyhow::Result<()>;
+}
+
+/// Whether a Security.framework call may show Keychain UI.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SystemKeychain {
+    /// Every command and the resident agent: fail instead of prompting.
+    Background,
+    /// Only `avault key authorize`, behind the authorization gate.
+    Authorize,
 }
 
 #[cfg(target_os = "macos")]
-impl KeychainAccessGuard {
-    fn acquire(mode: KeychainAccessMode, bypass_cooldown: bool) -> anyhow::Result<Self> {
-        let thread = KEYCHAIN_ACCESS_MUTEX
-            .get_or_init(|| Mutex::new(()))
+impl SystemKeychain {
+    fn call<T>(self, call: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
+        let _serial = KEYCHAIN_CALL_MUTEX
             .lock()
-            .map_err(|_| anyhow!("Keychain access gate is poisoned"))?;
-        let file = open_keychain_access_file()?;
-        lock_keychain_access_file(&file)?;
-        if !bypass_cooldown {
-            check_keychain_cooldown()?;
-        }
-        let interaction = match mode {
-            KeychainAccessMode::Interactive => None,
-            KeychainAccessMode::NonInteractive => Some(
-                SecKeychain::disable_user_interaction()
+            .unwrap_or_else(PoisonError::into_inner);
+        match self {
+            Self::Background => {
+                let _no_ui = SecKeychain::disable_user_interaction()
                     .map_err(anyhow::Error::from)
-                    .context("failed to disable Keychain user interaction")?,
-            ),
-        };
-        Ok(Self {
-            _thread: thread,
-            file,
-            interaction,
+                    .context("failed to disable Keychain user interaction")?;
+                call().map_err(|err| {
+                    if keychain_error_code(&err) == Some(ERR_SEC_INTERACTION_NOT_ALLOWED) {
+                        err.context(KEYCHAIN_AUTHORIZE_HINT)
+                    } else {
+                        err
+                    }
+                })
+            }
+            Self::Authorize => call().map_err(|err| {
+                if keychain_error_code(&err) == Some(ERR_SEC_INTERACTION_NOT_ALLOWED) {
+                    err.context(KEYCHAIN_SESSION_HINT)
+                } else {
+                    err
+                }
+            }),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl KeychainBackend for SystemKeychain {
+    fn read(&self) -> anyhow::Result<MasterKey> {
+        self.call(|| {
+            harden_process_memory();
+            let mut bytes = Zeroizing::new(
+                get_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+                    .context("failed to read master key from Keychain")?,
+            );
+            let mut key_bytes: [u8; MASTER_KEY_BYTES] = bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| anyhow!("master key has invalid length"))?;
+            bytes.zeroize();
+            let key = MasterKey::from_bytes(&key_bytes);
+            key_bytes.zeroize();
+            key
         })
     }
-}
 
-#[cfg(target_os = "macos")]
-impl Drop for KeychainAccessGuard {
-    fn drop(&mut self) {
-        // Re-enable Keychain user interaction before releasing the cross-process lock. Otherwise a
-        // next process could enter the Keychain while this process still has interaction disabled.
-        self.interaction.take();
-        // Safety invariant: the descriptor remains open for the lifetime of this guard, and the
-        // lock covers only the Keychain API call, never Vault decryption, network I/O, or children.
-        unsafe {
-            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
-        }
+    fn add(&self, key: &[u8; MASTER_KEY_BYTES]) -> anyhow::Result<()> {
+        self.call(|| {
+            SecKeychain::default()?
+                .add_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, key)
+                .map_err(anyhow::Error::from)
+        })
     }
-}
 
-#[cfg(target_os = "macos")]
-fn keychain_access_parent() -> anyhow::Result<PathBuf> {
-    let parent = user_home_dir()?.join(".avibe").join("run");
-    ensure_secret_parent_directory(&parent)?;
-    Ok(parent)
-}
-
-#[cfg(target_os = "macos")]
-fn open_keychain_access_file() -> anyhow::Result<File> {
-    let path = keychain_access_parent()?.join(KEYCHAIN_ACCESS_LOCK_FILE);
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&path)
-        .context("failed to open Keychain access lock")?;
-    secure_created_file(&path, CreatedFileOwner::SetCurrentUser)?;
-    validate_file_mode(&path)?;
-    Ok(file)
-}
-
-#[cfg(target_os = "macos")]
-fn lock_keychain_access_file(file: &File) -> anyhow::Result<()> {
-    // Safety invariant: `file` is an open regular file owned by this process. `flock` only
-    // changes advisory lock state associated with its descriptor.
-    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-    if result != 0 {
-        return Err(std::io::Error::last_os_error()).context("failed to lock Keychain access");
+    fn replace(&self, key: &[u8; MASTER_KEY_BYTES]) -> anyhow::Result<()> {
+        self.call(|| {
+            set_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, key)
+                .map_err(anyhow::Error::from)
+        })
     }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn keychain_cooldown_path() -> anyhow::Result<PathBuf> {
-    Ok(keychain_access_parent()?.join(KEYCHAIN_ACCESS_STATE_FILE))
-}
-
-#[cfg(target_os = "macos")]
-fn check_keychain_cooldown() -> anyhow::Result<()> {
-    let path = keychain_cooldown_path()?;
-    let Ok(contents) = fs::read_to_string(&path) else {
-        return Ok(());
-    };
-    let Ok(until) = contents.trim().parse::<u64>() else {
-        let _ = fs::remove_file(path);
-        return Ok(());
-    };
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("system clock is before Unix epoch")?
-        .as_secs();
-    if until > now {
-        bail!("Keychain access is temporarily suppressed after a recent authorization failure");
-    }
-    let _ = fs::remove_file(path);
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn mark_keychain_cooldown() {
-    let Ok(path) = keychain_cooldown_path() else {
-        return;
-    };
-    let Ok(until) = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|now| now.as_secs().saturating_add(KEYCHAIN_ACCESS_COOLDOWN_SECS))
-    else {
-        return;
-    };
-    if fs::write(&path, until.to_string()).is_ok() {
-        let _ = secure_created_file(&path, CreatedFileOwner::SetCurrentUser);
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn clear_keychain_cooldown() {
-    if let Ok(path) = keychain_cooldown_path() {
-        let _ = fs::remove_file(path);
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn is_keychain_interaction_failure(err: &anyhow::Error) -> bool {
-    matches!(
-        keychain_error_code(err),
-        Some(
-            ERR_SEC_NOT_AVAILABLE
-                | ERR_SEC_NO_DEFAULT_KEYCHAIN
-                | ERR_SEC_INTERACTION_NOT_ALLOWED
-                | ERR_SEC_USER_CANCELED
-                | ERR_SEC_AUTH_FAILED
-        )
-    )
 }
 
 #[cfg(target_os = "macos")]
 impl KeychainStore {
     /// Return the master key, creating it in the user's default Keychain if missing.
     ///
-    /// The cross-process gate covers only the Keychain call. Once this returns, the caller may
-    /// decrypt Vault records and perform network or child-process work concurrently with others.
+    /// This uses a regular generic-password item and does not attach a
+    /// user-presence / biometry access-control policy. That keeps the standard
+    /// tier headless after the OS session is unlocked. It never shows Keychain UI;
+    /// see [`KeychainStore::authorize`].
     pub fn get_or_create(&self) -> anyhow::Result<MasterKey> {
-        self.get_or_create_with_mode(KeychainAccessMode::Interactive, false)
+        get_or_create_keychain_key(&SystemKeychain::Background)
     }
 
-    /// Return the master key without allowing a Keychain authorization dialog.
-    pub fn get_or_create_noninteractive(&self) -> anyhow::Result<MasterKey> {
-        self.get_or_create_with_mode(KeychainAccessMode::NonInteractive, false)
-    }
-
-    /// Return the existing Keychain master key.
+    /// Return the existing Keychain master key without showing Keychain UI.
     pub fn get(&self) -> anyhow::Result<MasterKey> {
-        self.get_with_mode(KeychainAccessMode::Interactive, false)
+        SystemKeychain::Background.read()
     }
 
-    /// Return the existing Keychain master key without allowing a Keychain authorization dialog.
-    pub fn get_noninteractive(&self) -> anyhow::Result<MasterKey> {
-        self.get_with_mode(KeychainAccessMode::NonInteractive, false)
-    }
-
-    /// Retry an interactive read after an explicit user authorization action.
-    pub fn authorize(&self) -> anyhow::Result<MasterKey> {
-        self.get_with_mode(KeychainAccessMode::Interactive, true)
-    }
-
-    fn get_or_create_with_mode(
-        &self,
-        mode: KeychainAccessMode,
-        bypass_cooldown: bool,
-    ) -> anyhow::Result<MasterKey> {
-        let _gate = KeychainAccessGuard::acquire(mode, bypass_cooldown)?;
-        finish_keychain_access(self.get_or_create_unlocked())
-    }
-
-    fn get_with_mode(
-        &self,
-        mode: KeychainAccessMode,
-        bypass_cooldown: bool,
-    ) -> anyhow::Result<MasterKey> {
-        let _gate = KeychainAccessGuard::acquire(mode, bypass_cooldown)?;
-        finish_keychain_access(self.get_unlocked())
-    }
-
-    fn get_or_create_unlocked(&self) -> anyhow::Result<MasterKey> {
-        match self.get_unlocked() {
-            Ok(key) => Ok(key),
-            Err(err) if is_keychain_not_found(&err) => {
-                let key = MasterKey::generate_locked()?;
-                match self.create_noclobber_unlocked(key.as_bytes()) {
-                    Ok(()) => Ok(key),
-                    Err(err) if is_keychain_duplicate(&err) => self.get_unlocked(),
-                    Err(err) => Err(err).context("failed to store master key in Keychain"),
-                }
-            }
-            Err(err) => Err(err),
-        }
-    }
-
-    fn get_unlocked(&self) -> anyhow::Result<MasterKey> {
-        harden_process_memory();
-        let mut bytes = Zeroizing::new(
-            get_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
-                .context("master key not found in Keychain")?,
-        );
-        let mut key_bytes: [u8; MASTER_KEY_BYTES] = bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow!("master key has invalid length"))?;
-        bytes.zeroize();
-        let key = MasterKey::from_bytes(&key_bytes);
-        key_bytes.zeroize();
-        key
+    /// Read the existing master key once with Keychain UI allowed, so the user can grant this
+    /// binary access. See [`authorize_master_key`].
+    pub fn authorize(&self, on_wait: impl FnOnce()) -> anyhow::Result<()> {
+        authorize_keychain(on_wait, |keychain| keychain.read())
     }
 
     /// Import a master key into Keychain, refusing to overwrite unless `force` is true.
     pub fn import(&self, key: &[u8; MASTER_KEY_BYTES], force: bool) -> anyhow::Result<()> {
-        let _gate = KeychainAccessGuard::acquire(KeychainAccessMode::Interactive, true)?;
-        let result = if force {
-            set_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, key)
-                .map_err(anyhow::Error::from)
-        } else {
-            self.create_noclobber_unlocked(key)
-                .map_err(|err| err.context("master key already exists"))
-        };
-        finish_keychain_access(result)
+        import_keychain_key(&SystemKeychain::Background, key, force)
     }
+}
 
-    fn create_noclobber(&self, key: &[u8; MASTER_KEY_BYTES]) -> anyhow::Result<()> {
-        let _gate = KeychainAccessGuard::acquire(KeychainAccessMode::Interactive, true)?;
-        finish_keychain_access(self.create_noclobber_unlocked(key))
-    }
+/// Run `operation` with Keychain UI allowed behind the per-user authorization gate. A caller that
+/// waited behind another authorization reuses its outcome through a background read.
+#[cfg(target_os = "macos")]
+fn authorize_keychain<T>(
+    on_wait: impl FnOnce(),
+    operation: impl Fn(&SystemKeychain) -> anyhow::Result<T>,
+) -> anyhow::Result<()> {
+    authorize_with_gate(
+        &keychain_authorization_dir()?,
+        KEYCHAIN_AUTHORIZATION_WAIT,
+        unix_now_secs,
+        on_wait,
+        || operation(&SystemKeychain::Authorize),
+        || operation(&SystemKeychain::Background),
+    )
+    .map(drop)
+}
 
-    fn create_noclobber_noninteractive(&self, key: &[u8; MASTER_KEY_BYTES]) -> anyhow::Result<()> {
-        let _gate = KeychainAccessGuard::acquire(KeychainAccessMode::NonInteractive, false)?;
-        finish_keychain_access(self.create_noclobber_unlocked(key))
-    }
+/// A recent authorization prompt was denied or cancelled, so no new prompt is shown yet.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct KeychainAuthorizationCooldown {
+    remaining_secs: u64,
+}
 
-    fn create_noclobber_unlocked(&self, key: &[u8; MASTER_KEY_BYTES]) -> anyhow::Result<()> {
-        SecKeychain::default()?
-            .add_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, key)
-            .map_err(anyhow::Error::from)
+#[cfg(target_os = "macos")]
+impl std::fmt::Display for KeychainAuthorizationCooldown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "macOS Keychain authorization was recently denied or cancelled; \
+             retry `avault key authorize` in {}s",
+            self.remaining_secs
+        )
     }
 }
 
 #[cfg(target_os = "macos")]
-fn finish_keychain_access<T>(result: anyhow::Result<T>) -> anyhow::Result<T> {
-    match result {
-        Ok(value) => {
-            clear_keychain_cooldown();
-            Ok(value)
-        }
-        Err(err) => {
-            if is_keychain_interaction_failure(&err) {
-                mark_keychain_cooldown();
+impl std::error::Error for KeychainAuthorizationCooldown {}
+
+/// Another process kept its authorization prompt open for longer than this caller waits.
+#[cfg(target_os = "macos")]
+#[derive(Debug)]
+struct KeychainAuthorizationBusy;
+
+#[cfg(target_os = "macos")]
+impl std::fmt::Display for KeychainAuthorizationBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "another `avault key authorize` is still waiting for the user; \
+             answer that Keychain prompt first",
+        )
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl std::error::Error for KeychainAuthorizationBusy {}
+
+/// Serialize Keychain authorization prompts across all of this user's processes.
+///
+/// The caller that takes the gate first runs `interactive`. A caller that had to wait never
+/// prompts: it runs `coalesced`, which observes the earlier outcome. A denied or cancelled prompt
+/// starts a cooldown, measured from the denial, during which nobody prompts. Waiting is bounded,
+/// and the kernel releases the lock when its holder exits or crashes. `clock` returns Unix
+/// seconds.
+#[cfg(target_os = "macos")]
+fn authorize_with_gate<T>(
+    dir: &Path,
+    wait: Duration,
+    clock: impl Fn() -> anyhow::Result<u64>,
+    on_wait: impl FnOnce(),
+    interactive: impl FnOnce() -> anyhow::Result<T>,
+    coalesced: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let mut gate = open_keychain_authorization_gate(dir)?;
+    let waited = !try_lock_keychain_authorization_gate(&gate)?;
+    if waited {
+        on_wait();
+        let deadline = Instant::now() + wait;
+        while !try_lock_keychain_authorization_gate(&gate)? {
+            if Instant::now() >= deadline {
+                return Err(KeychainAuthorizationBusy.into());
             }
-            Err(err)
+            std::thread::sleep(KEYCHAIN_AUTHORIZATION_POLL);
         }
     }
+
+    if let Some(remaining_secs) = keychain_authorization_cooldown(&mut gate, clock()?)? {
+        return Err(KeychainAuthorizationCooldown { remaining_secs }.into());
+    }
+    if waited {
+        return coalesced();
+    }
+    match interactive() {
+        Ok(value) => {
+            // Best effort: a stale record could only delay a later explicit retry.
+            let _ = gate.set_len(0);
+            Ok(value)
+        }
+        Err(err) if is_keychain_denial(&err) => {
+            // The prompt may have stayed open for minutes: the window starts at the answer.
+            let recorded = clock().and_then(|denied_at| {
+                record_keychain_authorization_cooldown(
+                    &mut gate,
+                    denied_at.saturating_add(KEYCHAIN_AUTHORIZATION_COOLDOWN_SECS),
+                )
+            });
+            match recorded {
+                Ok(()) => Err(err),
+                Err(record_err) => Err(err.context(format!(
+                    "failed to record Keychain authorization cooldown: {record_err:#}"
+                ))),
+            }
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// The per-user directory holding the authorization gate. It derives from the Darwin per-user
+/// temporary directory, so every process of this user shares it whatever its `HOME`,
+/// `AVAULT_HOME`, or agent socket.
+#[cfg(target_os = "macos")]
+fn keychain_authorization_dir() -> anyhow::Result<PathBuf> {
+    let parent = darwin_user_temp_dir()?;
+    validate_private_directory(&parent)?;
+    let dir = parent.join(KEYCHAIN_AUTHORIZATION_DIR);
+    match fs::DirBuilder::new().mode(0o700).create(&dir) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(err) => return Err(err).context("failed to create Keychain authorization directory"),
+    }
+    Ok(dir)
+}
+
+#[cfg(target_os = "macos")]
+fn darwin_user_temp_dir() -> anyhow::Result<PathBuf> {
+    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+    // Safety invariant: `buf` is valid for writes of `buf.len()` bytes. `confstr` writes at most
+    // that many bytes, including the NUL terminator, and returns the length it needs.
+    let len = unsafe {
+        libc::confstr(
+            libc::_CS_DARWIN_USER_TEMP_DIR,
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    if len == 0 || len > buf.len() {
+        bail!("failed to resolve the per-user temporary directory");
+    }
+    buf.truncate(len - 1);
+    while buf.len() > 1 && buf.last() == Some(&b'/') {
+        buf.pop();
+    }
+    let dir = PathBuf::from(OsString::from_vec(buf));
+    if !dir.is_absolute() {
+        bail!("per-user temporary directory is not absolute");
+    }
+    Ok(dir)
+}
+
+/// Reject anything but a real directory owned by this user with no group or other access.
+#[cfg(target_os = "macos")]
+fn validate_private_directory(dir: &Path) -> anyhow::Result<()> {
+    let metadata =
+        fs::symlink_metadata(dir).context("failed to inspect Keychain authorization directory")?;
+    if !metadata.is_dir() || metadata.uid() != current_euid() || metadata.mode() & 0o077 != 0 {
+        bail!("Keychain authorization directory is not private to the current user");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn open_keychain_authorization_gate(dir: &Path) -> anyhow::Result<File> {
+    validate_private_directory(dir)?;
+    let gate = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dir.join(KEYCHAIN_AUTHORIZATION_GATE_FILE))
+        .context("failed to open Keychain authorization gate")?;
+    let metadata = gate
+        .metadata()
+        .context("failed to inspect Keychain authorization gate")?;
+    if !metadata.is_file()
+        || metadata.uid() != current_euid()
+        || metadata.mode() & 0o077 != 0
+        || metadata.nlink() != 1
+    {
+        bail!("Keychain authorization gate is not a private regular file");
+    }
+    Ok(gate)
+}
+
+#[cfg(target_os = "macos")]
+fn try_lock_keychain_authorization_gate(gate: &File) -> anyhow::Result<bool> {
+    loop {
+        // Safety invariant: `gate` is an open descriptor owned by this process. `flock` changes
+        // only its advisory lock, which the kernel drops when the descriptor closes or the
+        // process dies.
+        if unsafe { libc::flock(gate.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(true);
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EWOULDBLOCK) => return Ok(false),
+            _ => return Err(err).context("failed to lock Keychain authorization gate"),
+        }
+    }
+}
+
+/// Return the remaining cooldown recorded in the gate, whose lock the caller holds.
+///
+/// A record that is unreadable, or ends more than one window from now (a clock change or a
+/// hand-edited file), is rewritten to exactly one window from now. Bad metadata can therefore
+/// suppress prompts for at most one window, and never re-enables them early.
+#[cfg(target_os = "macos")]
+fn keychain_authorization_cooldown(gate: &mut File, now: u64) -> anyhow::Result<Option<u64>> {
+    let mut record = Vec::new();
+    gate.seek(SeekFrom::Start(0))
+        .and_then(|_| {
+            Read::by_ref(gate)
+                .take(MAX_KEYCHAIN_COOLDOWN_RECORD_BYTES + 1)
+                .read_to_end(&mut record)
+        })
+        .context("failed to read Keychain authorization cooldown")?;
+    if record.is_empty() {
+        return Ok(None);
+    }
+    let until = std::str::from_utf8(&record)
+        .ok()
+        .filter(|_| record.len() as u64 <= MAX_KEYCHAIN_COOLDOWN_RECORD_BYTES)
+        .and_then(|text| text.trim().parse::<u64>().ok());
+    match until {
+        Some(until) if until <= now => {
+            gate.set_len(0)
+                .context("failed to clear Keychain authorization cooldown")?;
+            Ok(None)
+        }
+        Some(until) if until - now <= KEYCHAIN_AUTHORIZATION_COOLDOWN_SECS => Ok(Some(until - now)),
+        _ => {
+            record_keychain_authorization_cooldown(
+                gate,
+                now.saturating_add(KEYCHAIN_AUTHORIZATION_COOLDOWN_SECS),
+            )?;
+            Ok(Some(KEYCHAIN_AUTHORIZATION_COOLDOWN_SECS))
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn record_keychain_authorization_cooldown(gate: &mut File, until: u64) -> anyhow::Result<()> {
+    gate.set_len(0)
+        .and_then(|_| gate.seek(SeekFrom::Start(0)))
+        .and_then(|_| gate.write_all(until.to_string().as_bytes()))
+        .context("failed to record Keychain authorization cooldown")
+}
+
+#[cfg(target_os = "macos")]
+fn unix_now_secs() -> anyhow::Result<u64> {
+    Ok(SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?
+        .as_secs())
+}
+
+#[cfg(target_os = "macos")]
+fn is_keychain_denial(err: &anyhow::Error) -> bool {
+    matches!(
+        keychain_error_code(err),
+        Some(ERR_SEC_USER_CANCELED | ERR_SEC_AUTH_FAILED)
+    )
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1781,19 +1846,11 @@ impl KeychainStore {
         bail!("Keychain master-key backend is only available on macOS")
     }
 
-    pub fn get_or_create_noninteractive(&self) -> anyhow::Result<MasterKey> {
-        bail!("Keychain master-key backend is only available on macOS")
-    }
-
     pub fn get(&self) -> anyhow::Result<MasterKey> {
         bail!("Keychain master-key backend is only available on macOS")
     }
 
-    pub fn get_noninteractive(&self) -> anyhow::Result<MasterKey> {
-        bail!("Keychain master-key backend is only available on macOS")
-    }
-
-    pub fn authorize(&self) -> anyhow::Result<MasterKey> {
+    pub fn authorize(&self, _on_wait: impl FnOnce()) -> anyhow::Result<()> {
         bail!("Keychain master-key backend is only available on macOS")
     }
 
@@ -2918,6 +2975,588 @@ mod tests {
         match previous_home {
             Some(home) => env::set_var("HOME", home),
             None => env::remove_var("HOME"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    mod keychain {
+        use super::*;
+        use std::cell::{Cell, RefCell};
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        use std::sync::{mpsc, Arc};
+        use std::thread;
+
+        const WAIT: Duration = Duration::from_secs(10);
+        const GATE_HOLDER_ENV: &str = "AVAULT_TEST_KEYCHAIN_GATE_HOLDER_DIR";
+        const GATE_HELD: &str = "avault-test-gate-held";
+
+        fn keychain_error(code: i32) -> anyhow::Error {
+            anyhow::Error::from(KeychainError::from_code(code))
+        }
+
+        /// An in-memory Keychain item that never touches the user's real Keychain.
+        #[derive(Default)]
+        struct FakeKeychain {
+            item: RefCell<Option<[u8; MASTER_KEY_BYTES]>>,
+            read_error: Option<i32>,
+            add_error: Option<i32>,
+            adds: Cell<usize>,
+        }
+
+        impl FakeKeychain {
+            fn holding(key: [u8; MASTER_KEY_BYTES]) -> Self {
+                Self {
+                    item: RefCell::new(Some(key)),
+                    ..Self::default()
+                }
+            }
+
+            fn failing_reads(code: i32) -> Self {
+                Self {
+                    read_error: Some(code),
+                    ..Self::default()
+                }
+            }
+        }
+
+        impl KeychainBackend for FakeKeychain {
+            fn read(&self) -> anyhow::Result<MasterKey> {
+                if let Some(code) = self.read_error {
+                    return Err(keychain_error(code));
+                }
+                match *self.item.borrow() {
+                    Some(key) => MasterKey::from_bytes(&key),
+                    None => Err(keychain_error(ERR_SEC_ITEM_NOT_FOUND)),
+                }
+            }
+
+            fn add(&self, key: &[u8; MASTER_KEY_BYTES]) -> anyhow::Result<()> {
+                self.adds.set(self.adds.get() + 1);
+                if let Some(code) = self.add_error {
+                    return Err(keychain_error(code));
+                }
+                if self.item.borrow().is_some() {
+                    return Err(keychain_error(ERR_SEC_DUPLICATE_ITEM));
+                }
+                *self.item.borrow_mut() = Some(*key);
+                Ok(())
+            }
+
+            fn replace(&self, key: &[u8; MASTER_KEY_BYTES]) -> anyhow::Result<()> {
+                *self.item.borrow_mut() = Some(*key);
+                Ok(())
+            }
+        }
+
+        fn file_store(tmp: &tempfile::TempDir, key: Option<[u8; MASTER_KEY_BYTES]>) -> FileStore {
+            let store = FileStore::new(tmp.path().join("vault").join("machine.key"));
+            if let Some(key) = key {
+                store.import(&key, false).unwrap();
+            }
+            store
+        }
+
+        #[test]
+        fn auto_file_fallback_survives_repeated_interaction_refusals() {
+            let tmp = tempfile::tempdir().unwrap();
+            let file = file_store(&tmp, Some([1; MASTER_KEY_BYTES]));
+            let keychain = FakeKeychain::failing_reads(ERR_SEC_INTERACTION_NOT_ALLOWED);
+            for create in [false, true, false, true] {
+                let key = load_auto_master_key_with(&keychain, Some(&file), create).unwrap();
+                assert_eq!(key.as_bytes(), &[1; MASTER_KEY_BYTES]);
+            }
+            assert_eq!(keychain.adds.get(), 0);
+        }
+
+        #[test]
+        fn auto_does_not_hide_denial_or_key_mismatch() {
+            let tmp = tempfile::tempdir().unwrap();
+            let file = file_store(&tmp, Some([1; MASTER_KEY_BYTES]));
+            for code in [ERR_SEC_AUTH_FAILED, ERR_SEC_USER_CANCELED] {
+                let err = load_auto_master_key_with(
+                    &FakeKeychain::failing_reads(code),
+                    Some(&file),
+                    false,
+                )
+                .err()
+                .unwrap();
+                assert_eq!(keychain_error_code(&err), Some(code));
+            }
+
+            let mismatched = FakeKeychain::holding([2; MASTER_KEY_BYTES]);
+            let err = load_auto_master_key_with(&mismatched, Some(&file), true)
+                .err()
+                .unwrap();
+            assert!(err.to_string().contains("differs"));
+        }
+
+        #[test]
+        fn auto_never_creates_a_replacement_key_on_keychain_errors() {
+            let tmp = tempfile::tempdir().unwrap();
+            let missing_file = file_store(&tmp, None);
+            for code in [ERR_SEC_INTERACTION_NOT_ALLOWED, ERR_SEC_AUTH_FAILED] {
+                let keychain = FakeKeychain::failing_reads(code);
+                assert!(load_auto_master_key_with(&keychain, Some(&missing_file), true).is_err());
+                assert_eq!(keychain.adds.get(), 0);
+            }
+            assert!(!missing_file.path().exists());
+
+            let empty = FakeKeychain::default();
+            let err = load_auto_master_key_with(&empty, Some(&missing_file), false)
+                .err()
+                .unwrap();
+            assert!(is_keychain_not_found(&err));
+            assert_eq!(empty.adds.get(), 0);
+            let created = load_auto_master_key_with(&empty, Some(&missing_file), true).unwrap();
+            assert_eq!(empty.item.borrow().unwrap(), *created.as_bytes());
+            assert_eq!(empty.adds.get(), 1);
+        }
+
+        #[test]
+        fn auto_migrates_an_existing_file_key_into_keychain() {
+            let tmp = tempfile::tempdir().unwrap();
+            let file = file_store(&tmp, Some([3; MASTER_KEY_BYTES]));
+            let keychain = FakeKeychain::default();
+            let key = load_auto_master_key_with(&keychain, Some(&file), false).unwrap();
+            assert_eq!(key.as_bytes(), &[3; MASTER_KEY_BYTES]);
+            assert_eq!(keychain.item.borrow().unwrap(), [3; MASTER_KEY_BYTES]);
+
+            let locked = FakeKeychain {
+                add_error: Some(ERR_SEC_INTERACTION_NOT_ALLOWED),
+                ..FakeKeychain::default()
+            };
+            let key = load_auto_master_key_with(&locked, Some(&file), true).unwrap();
+            assert_eq!(key.as_bytes(), &[3; MASTER_KEY_BYTES]);
+        }
+
+        #[test]
+        fn keychain_import_refuses_to_clobber_without_force() {
+            let keychain = FakeKeychain::holding([4; MASTER_KEY_BYTES]);
+            let err = import_keychain_key(&keychain, &[5; MASTER_KEY_BYTES], false)
+                .err()
+                .unwrap();
+            assert!(err.to_string().contains("already exists"));
+            import_keychain_key(&keychain, &[5; MASTER_KEY_BYTES], true).unwrap();
+            assert_eq!(keychain.item.borrow().unwrap(), [5; MASTER_KEY_BYTES]);
+        }
+
+        #[test]
+        fn background_calls_disable_keychain_ui_and_point_to_authorize() {
+            let allowed = SystemKeychain::Background
+                .call(|| Ok(SecKeychain::user_interaction_allowed()?))
+                .unwrap();
+            assert!(!allowed);
+            assert!(SecKeychain::user_interaction_allowed().unwrap());
+            let allowed = SystemKeychain::Authorize
+                .call(|| Ok(SecKeychain::user_interaction_allowed()?))
+                .unwrap();
+            assert!(allowed);
+            let err = SystemKeychain::Authorize
+                .call(|| -> anyhow::Result<()> {
+                    Err(keychain_error(ERR_SEC_INTERACTION_NOT_ALLOWED))
+                })
+                .unwrap_err();
+            assert!(format!("{err:#}").contains("desktop session"));
+
+            let err = SystemKeychain::Background
+                .call(|| -> anyhow::Result<()> {
+                    Err(keychain_error(ERR_SEC_INTERACTION_NOT_ALLOWED))
+                })
+                .unwrap_err();
+            assert!(format!("{err:#}").contains("avault key authorize"));
+            assert!(is_keychain_unavailable(&err));
+        }
+
+        fn counter() -> Arc<AtomicUsize> {
+            Arc::new(AtomicUsize::new(0))
+        }
+
+        fn counted<T>(
+            count: &Arc<AtomicUsize>,
+            result: impl FnOnce() -> anyhow::Result<T>,
+        ) -> impl FnOnce() -> anyhow::Result<T> {
+            let count = Arc::clone(count);
+            move || {
+                count.fetch_add(1, Ordering::SeqCst);
+                result()
+            }
+        }
+
+        fn cooldown_of(err: &anyhow::Error) -> u64 {
+            err.downcast_ref::<KeychainAuthorizationCooldown>()
+                .expect("expected a Keychain authorization cooldown")
+                .remaining_secs
+        }
+
+        /// The gate requires an owner-only directory; `tempfile` creates 0755 directories.
+        fn private_dir() -> tempfile::TempDir {
+            let tmp = tempfile::tempdir().unwrap();
+            fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            tmp
+        }
+
+        fn write_gate_record(dir: &Path, record: &str) {
+            let mut gate = open_keychain_authorization_gate(dir).unwrap();
+            gate.set_len(0).unwrap();
+            gate.write_all(record.as_bytes()).unwrap();
+        }
+
+        fn gate_record(dir: &Path) -> String {
+            fs::read_to_string(dir.join(KEYCHAIN_AUTHORIZATION_GATE_FILE)).unwrap()
+        }
+
+        /// A settable Unix clock, so cooldown tests never wait for real time.
+        #[derive(Clone)]
+        struct TestClock(Arc<AtomicU64>);
+
+        impl TestClock {
+            fn at(secs: u64) -> Self {
+                Self(Arc::new(AtomicU64::new(secs)))
+            }
+
+            fn set(&self, secs: u64) {
+                self.0.store(secs, Ordering::SeqCst);
+            }
+
+            fn reader(&self) -> impl Fn() -> anyhow::Result<u64> {
+                let secs = Arc::clone(&self.0);
+                move || Ok(secs.load(Ordering::SeqCst))
+            }
+        }
+
+        const T0: u64 = 1_800_000_000;
+        const WINDOW: u64 = KEYCHAIN_AUTHORIZATION_COOLDOWN_SECS;
+
+        /// One uncontended authorization attempt at the clock's current time.
+        fn attempt(
+            dir: &Path,
+            clock: &TestClock,
+            prompts: &Arc<AtomicUsize>,
+            prompt: impl FnOnce() -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            authorize_with_gate(
+                dir,
+                WAIT,
+                clock.reader(),
+                || {},
+                counted(prompts, prompt),
+                || unreachable!("nobody else holds the gate"),
+            )
+        }
+
+        #[test]
+        fn denied_authorization_starts_a_cooldown_without_another_prompt() {
+            let tmp = private_dir();
+            let clock = TestClock::at(T0);
+            let prompts = counter();
+            let err = attempt(tmp.path(), &clock, &prompts, || {
+                Err(keychain_error(ERR_SEC_USER_CANCELED))
+            })
+            .unwrap_err();
+            assert_eq!(keychain_error_code(&err), Some(ERR_SEC_USER_CANCELED));
+
+            clock.set(T0 + 30);
+            let err = attempt(tmp.path(), &clock, &prompts, || Ok(())).unwrap_err();
+            assert_eq!(cooldown_of(&err), WINDOW - 30);
+            assert_eq!(prompts.load(Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn cooldown_starts_when_the_user_answers_a_long_open_prompt() {
+            let tmp = private_dir();
+            let clock = TestClock::at(T0);
+            let prompts = counter();
+            let answering = clock.clone();
+            assert!(attempt(tmp.path(), &clock, &prompts, move || {
+                // The prompt stays open for longer than a whole window before it is denied.
+                answering.set(T0 + 500);
+                Err(keychain_error(ERR_SEC_AUTH_FAILED))
+            })
+            .is_err());
+            assert_eq!(gate_record(tmp.path()), (T0 + 500 + WINDOW).to_string());
+
+            clock.set(T0 + 501);
+            let err = attempt(tmp.path(), &clock, &prompts, || Ok(())).unwrap_err();
+            assert_eq!(cooldown_of(&err), WINDOW - 1);
+
+            clock.set(T0 + 500 + WINDOW);
+            attempt(tmp.path(), &clock, &prompts, || Ok(())).unwrap();
+            assert_eq!(gate_record(tmp.path()), "");
+            assert_eq!(prompts.load(Ordering::SeqCst), 2);
+        }
+
+        #[test]
+        fn only_denial_starts_a_cooldown_and_success_clears_stale_records() {
+            let tmp = private_dir();
+            let clock = TestClock::at(T0);
+            let prompts = counter();
+            assert!(attempt(tmp.path(), &clock, &prompts, || {
+                Err(keychain_error(ERR_SEC_INTERACTION_NOT_ALLOWED))
+            })
+            .is_err());
+            assert_eq!(gate_record(tmp.path()), "");
+
+            write_gate_record(tmp.path(), &(T0 - 1).to_string());
+            attempt(tmp.path(), &clock, &prompts, || Ok(())).unwrap();
+            assert_eq!(gate_record(tmp.path()), "");
+            assert_eq!(prompts.load(Ordering::SeqCst), 2);
+        }
+
+        #[test]
+        fn unreadable_cooldown_records_fail_safe_to_one_window() {
+            let tmp = private_dir();
+            let clock = TestClock::at(T0);
+            let prompts = counter();
+            for record in ["not-a-timestamp", "\u{fffd}", &"9".repeat(64)] {
+                write_gate_record(tmp.path(), record);
+                let err = attempt(tmp.path(), &clock, &prompts, || Ok(())).unwrap_err();
+                assert_eq!(cooldown_of(&err), WINDOW);
+                assert_eq!(gate_record(tmp.path()), (T0 + WINDOW).to_string());
+            }
+            assert_eq!(prompts.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn far_future_cooldown_is_persisted_as_one_window() {
+            let tmp = private_dir();
+            let clock = TestClock::at(T0);
+            let prompts = counter();
+            write_gate_record(tmp.path(), &(T0 + 10_000).to_string());
+            let err = attempt(tmp.path(), &clock, &prompts, || Ok(())).unwrap_err();
+            assert_eq!(cooldown_of(&err), WINDOW);
+            assert_eq!(gate_record(tmp.path()), (T0 + WINDOW).to_string());
+
+            // One window later the user can authorize again, not 10,000 seconds later.
+            clock.set(T0 + WINDOW);
+            attempt(tmp.path(), &clock, &prompts, || Ok(())).unwrap();
+            assert_eq!(prompts.load(Ordering::SeqCst), 1);
+        }
+
+        /// Start a leader whose prompt stays open until `release`, plus a second caller that
+        /// arrives while it is open. Returns the second caller's result and both counters.
+        fn overlapping_authorizations(leader_outcome: i32) -> (anyhow::Result<()>, usize, usize) {
+            let tmp = private_dir();
+            let dir = tmp.path().to_path_buf();
+            let (entered_tx, entered) = mpsc::channel();
+            let (release, release_rx) = mpsc::channel::<()>();
+            let leader = {
+                let dir = dir.clone();
+                thread::spawn(move || {
+                    authorize_with_gate(
+                        &dir,
+                        WAIT,
+                        unix_now_secs,
+                        || {},
+                        move || {
+                            entered_tx.send(()).unwrap();
+                            release_rx.recv_timeout(WAIT).unwrap();
+                            match leader_outcome {
+                                0 => Ok(()),
+                                code => Err(keychain_error(code)),
+                            }
+                        },
+                        || unreachable!("the leader never waits"),
+                    )
+                })
+            };
+            entered.recv_timeout(WAIT).unwrap();
+
+            let prompts = counter();
+            let coalesced = counter();
+            let (waiting_tx, waiting) = mpsc::channel();
+            let follower = {
+                let (prompts, coalesced) = (Arc::clone(&prompts), Arc::clone(&coalesced));
+                thread::spawn(move || {
+                    authorize_with_gate(
+                        &dir,
+                        WAIT,
+                        unix_now_secs,
+                        move || waiting_tx.send(()).unwrap(),
+                        counted(&prompts, || Ok(())),
+                        counted(&coalesced, || Ok(())),
+                    )
+                })
+            };
+            waiting.recv_timeout(WAIT).unwrap();
+            release.send(()).unwrap();
+            let _ = leader.join().unwrap();
+            let result = follower.join().unwrap();
+            drop(tmp);
+            (
+                result,
+                prompts.load(Ordering::SeqCst),
+                coalesced.load(Ordering::SeqCst),
+            )
+        }
+
+        #[test]
+        fn concurrent_authorizations_share_one_prompt() {
+            let (result, prompts, coalesced) = overlapping_authorizations(0);
+            result.unwrap();
+            assert_eq!((prompts, coalesced), (0, 1));
+        }
+
+        #[test]
+        fn a_caller_waiting_behind_a_denial_gets_the_cooldown() {
+            let (result, prompts, coalesced) = overlapping_authorizations(ERR_SEC_AUTH_FAILED);
+            assert!(cooldown_of(&result.unwrap_err()) > 0);
+            assert_eq!((prompts, coalesced), (0, 0));
+        }
+
+        #[test]
+        fn waiting_behind_an_open_prompt_is_bounded() {
+            let tmp = private_dir();
+            let holder = open_keychain_authorization_gate(tmp.path()).unwrap();
+            assert!(try_lock_keychain_authorization_gate(&holder).unwrap());
+            let calls = counter();
+            let err = authorize_with_gate(
+                tmp.path(),
+                Duration::from_millis(250),
+                unix_now_secs,
+                || {},
+                counted(&calls, || Ok(())),
+                counted(&calls, || Ok(())),
+            )
+            .unwrap_err();
+            assert!(err.downcast_ref::<KeychainAuthorizationBusy>().is_some());
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
+
+        /// Child-process half of the cross-process test; a no-op in normal test runs.
+        #[test]
+        fn gate_holder_process() {
+            let Some(dir) = env::var_os(GATE_HOLDER_ENV) else {
+                return;
+            };
+            let gate = open_keychain_authorization_gate(Path::new(&dir)).unwrap();
+            assert!(try_lock_keychain_authorization_gate(&gate).unwrap());
+            println!("{GATE_HELD}");
+            std::io::stdout().flush().unwrap();
+            let mut line = String::new();
+            let _ = std::io::stdin().read_line(&mut line);
+        }
+
+        #[test]
+        fn gate_serializes_processes_and_is_released_when_the_holder_crashes() {
+            let tmp = private_dir();
+            let mut holder = Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::keychain::gate_holder_process",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(GATE_HOLDER_ENV, tmp.path())
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let stdout = holder.stdout.take().unwrap();
+            let (held_tx, held) = mpsc::channel();
+            thread::spawn(move || {
+                for line in BufReader::new(stdout).lines() {
+                    // libtest prints the test name on the same line before test output.
+                    if line.unwrap().ends_with(GATE_HELD) {
+                        let _ = held_tx.send(());
+                    }
+                }
+            });
+            held.recv_timeout(WAIT)
+                .expect("holder process did not take the gate");
+
+            let calls = counter();
+            let busy = authorize_with_gate(
+                tmp.path(),
+                Duration::from_millis(250),
+                unix_now_secs,
+                || {},
+                counted(&calls, || Ok(())),
+                counted(&calls, || Ok(())),
+            )
+            .unwrap_err();
+            assert!(busy.downcast_ref::<KeychainAuthorizationBusy>().is_some());
+
+            let prompts = counter();
+            let coalesced = counter();
+            let (waiting_tx, waiting) = mpsc::channel();
+            let follower = {
+                let dir = tmp.path().to_path_buf();
+                let (prompts, coalesced) = (Arc::clone(&prompts), Arc::clone(&coalesced));
+                thread::spawn(move || {
+                    authorize_with_gate(
+                        &dir,
+                        WAIT,
+                        unix_now_secs,
+                        move || waiting_tx.send(()).unwrap(),
+                        counted(&prompts, || Ok(())),
+                        counted(&coalesced, || Ok(())),
+                    )
+                })
+            };
+            waiting.recv_timeout(WAIT).unwrap();
+            holder.kill().unwrap();
+            holder.wait().unwrap();
+            follower.join().unwrap().unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                (
+                    prompts.load(Ordering::SeqCst),
+                    coalesced.load(Ordering::SeqCst)
+                ),
+                (0, 1)
+            );
+        }
+
+        #[test]
+        fn gate_rejects_links_and_shared_permissions() {
+            let tmp = private_dir();
+            let gate_path = tmp.path().join(KEYCHAIN_AUTHORIZATION_GATE_FILE);
+            let target = tmp.path().join("target");
+            fs::write(&target, b"").unwrap();
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
+
+            std::os::unix::fs::symlink(&target, &gate_path).unwrap();
+            assert!(open_keychain_authorization_gate(tmp.path()).is_err());
+            fs::remove_file(&gate_path).unwrap();
+
+            fs::hard_link(&target, &gate_path).unwrap();
+            assert!(open_keychain_authorization_gate(tmp.path()).is_err());
+            fs::remove_file(&gate_path).unwrap();
+
+            fs::write(&gate_path, b"").unwrap();
+            fs::set_permissions(&gate_path, fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(open_keychain_authorization_gate(tmp.path()).is_err());
+            fs::remove_file(&gate_path).unwrap();
+
+            fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(open_keychain_authorization_gate(tmp.path()).is_err());
+            assert!(!gate_path.exists());
+            fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+            open_keychain_authorization_gate(tmp.path()).unwrap();
+        }
+
+        #[test]
+        fn gate_location_does_not_depend_on_home() {
+            let _guard = ENV_LOCK.lock().unwrap();
+            let previous_home = env::var_os("HOME");
+            let previous_avault_home = env::var_os("AVAULT_HOME");
+            let with_home = darwin_user_temp_dir().unwrap();
+            env::remove_var("HOME");
+            env::set_var("AVAULT_HOME", "/nonexistent/avault-home");
+            let without_home = darwin_user_temp_dir();
+            match previous_home {
+                Some(home) => env::set_var("HOME", home),
+                None => env::remove_var("HOME"),
+            }
+            match previous_avault_home {
+                Some(home) => env::set_var("AVAULT_HOME", home),
+                None => env::remove_var("AVAULT_HOME"),
+            }
+            assert_eq!(without_home.unwrap(), with_home);
+            validate_private_directory(&with_home).unwrap();
         }
     }
 

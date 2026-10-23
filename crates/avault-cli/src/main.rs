@@ -34,7 +34,9 @@ use std::path::PathBuf;
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
 use std::str::FromStr;
 #[cfg(unix)]
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(unix)]
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 #[cfg(unix)]
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -67,6 +69,8 @@ const AGENT_POLL_INTERVAL: Duration = Duration::from_millis(200);
 #[cfg(unix)]
 const MAX_AGENT_READ_TIMEOUTS: u8 = 30;
 #[cfg(unix)]
+const MAX_AGENT_CONNECTIONS: usize = 64;
+#[cfg(unix)]
 const MIN_APPROVAL_NONCE_BYTES: usize = 16;
 #[cfg(unix)]
 const MAX_APPROVAL_NONCE_BYTES: usize = 128;
@@ -85,6 +89,7 @@ USAGE:
     avault deliver inject < inject-request.json
     avault key export
     avault key import [--force]
+    avault key authorize
     avault pubkey
     avault sign < sign-request.json
     avault agent [--store auto|keychain|tpm|file|file-passphrase] [--unlock] [--socket PATH] [--idle-timeout-secs SECS]
@@ -94,6 +99,7 @@ P1 reads secret values, envelopes, and passphrases from stdin. Plaintext never b
 deliver fetch requires request.allowed_hosts before attaching a credential.
 auto uses macOS Keychain on macOS, Linux TPM when available, and the file store elsewhere.
 file-passphrase is opt-in. Its unlock passphrase is read from the first stdin line.
+Only `key authorize` may show macOS Keychain UI; run it when another command asks for it.
 ";
 
 fn main() -> ExitCode {
@@ -719,20 +725,10 @@ fn run_agent_child_with_opened_env(
     command: &[OsString],
     opened: Vec<OpenedSecret>,
     envelope_stdin: bool,
-    state: &Arc<Mutex<AgentState>>,
-    master_cache: &Arc<Mutex<AgentMasterCache>>,
 ) -> anyhow::Result<u8> {
     let mut child = spawn_agent_run_helper(command, opened, envelope_stdin)?;
-    loop {
-        purge_agent_state_and_cache(state, master_cache)?;
-        if let Some(status) = child
-            .try_wait()
-            .context("failed to wait for child command")?
-        {
-            return Ok(status_to_exit_code(status));
-        }
-        std::thread::sleep(AGENT_POLL_INTERVAL);
-    }
+    let status = child.wait().context("failed to wait for child command")?;
+    Ok(status_to_exit_code(status))
 }
 
 #[cfg(unix)]
@@ -1308,13 +1304,7 @@ fn deliver_inject_cmd(
     let input = read_json_input(input, "failed to read deliver inject JSON from stdin")?;
     let inject: InjectInput =
         serde_json::from_slice(input.as_slice()).context("deliver inject JSON is invalid")?;
-    if inject.secrets.is_empty() {
-        bail!("deliver inject requires at least one secret");
-    }
-    let format = inject.format.to_ascii_lowercase();
-    if format != "dotenv" && format != "json" {
-        bail!("deliver inject format is not implemented in P1.1");
-    }
+    let format = validate_inject_request(&inject.secrets, &inject.format)?;
 
     let mut opened = open_named_secrets(inject.secrets, &unlock)?;
     drop(unlock);
@@ -1327,6 +1317,18 @@ fn deliver_inject_cmd(
     rendered.zeroize();
     println!(r#"{{"ok":true}}"#);
     Ok(0)
+}
+
+/// Validate an inject request before opening anything and return its normalized format.
+fn validate_inject_request(secrets: &[NamedSecretInput], format: &str) -> anyhow::Result<String> {
+    if secrets.is_empty() {
+        bail!("deliver inject requires at least one secret");
+    }
+    let format = format.to_ascii_lowercase();
+    if format != "dotenv" && format != "json" {
+        bail!("deliver inject format is not implemented in P1.1");
+    }
+    Ok(format)
 }
 
 fn open_named_secrets(
@@ -1684,6 +1686,7 @@ fn key_cmd(args: &[OsString], config: &CliConfig, input: &mut impl Read) -> anyh
     match subcmd {
         "export" => key_export_cmd(config, input),
         "import" => key_import_cmd(&args[1..], config, input),
+        "authorize" => key_authorize_cmd(&args[1..], config, input),
         other => bail!("unknown key subcommand: {other}"),
     }
 }
@@ -1726,6 +1729,28 @@ fn key_import_cmd(
     import_master_with_unlock(&unlock, &key, force)?;
     drop(unlock);
     drop(key);
+    println!(r#"{{"ok":true}}"#);
+    Ok(0)
+}
+
+fn key_authorize_cmd(
+    args: &[OsString],
+    config: &CliConfig,
+    input: &mut impl Read,
+) -> anyhow::Result<u8> {
+    if !args.is_empty() {
+        bail!("key authorize takes no options");
+    }
+    match read_store_unlock(config, input)? {
+        StoreUnlock::Standard(backend) => avault_store::authorize_master_key(backend, || {
+            eprintln!(
+                "avault: another Keychain authorization is in progress; waiting for its outcome"
+            );
+        })?,
+        unlock @ StoreUnlock::FilePassphrase(_) => {
+            drop(load_existing_master_from_unlock(&unlock)?);
+        }
+    }
     println!(r#"{{"ok":true}}"#);
     Ok(0)
 }
@@ -2171,8 +2196,9 @@ impl AgentState {
     }
 
     fn record_activity(&mut self) {
-        self.last_activity = Instant::now();
+        // Expire first so activity can never revive grants that already went idle.
         self.purge();
+        self.last_activity = Instant::now();
     }
 
     fn purge(&mut self) {
@@ -2183,21 +2209,6 @@ impl AgentState {
         self.grants.retain(|_, grant| grant.expires_at > now);
         self.used_grant_nonces
             .retain(|_, expires_at| *expires_at > now);
-    }
-
-    fn purge_before_blocking(&mut self, max_block: Duration) {
-        self.purge();
-        let now = Instant::now();
-        let idle_age = now.duration_since(self.last_activity);
-        if idle_age
-            .checked_add(max_block)
-            .map_or(true, |age| age >= self.idle_timeout)
-        {
-            self.grants.clear();
-        }
-        let expiry_cutoff = now.checked_add(max_block).unwrap_or(now);
-        self.grants
-            .retain(|_, grant| grant.expires_at > expiry_cutoff);
     }
 
     fn get_live_grant(&self, scope: &GrantKey) -> anyhow::Result<&GrantEntry> {
@@ -2215,136 +2226,235 @@ impl AgentState {
         Ok(grant)
     }
 
-    fn ensure_grant_nonce_unused(&mut self, nonce: &[u8]) -> anyhow::Result<()> {
+    /// Publish a grant atomically with consuming its approval nonces and recording activity, so
+    /// maintenance can never purge a grant whose approvals were already spent. A grant that
+    /// expired while its DEKs were being opened is rejected without consuming anything.
+    fn publish_grant(
+        &mut self,
+        scope: GrantKey,
+        grant: GrantEntry,
+        nonces: Vec<(Vec<u8>, Instant)>,
+    ) -> anyhow::Result<()> {
         self.purge();
-        if self.used_grant_nonces.contains_key(nonce) {
+        let now = Instant::now();
+        // Opening the DEK blind boxes takes time; the TTL or approval deadline may have passed.
+        if grant.expires_at <= now {
+            bail!("grant expired before it was published");
+        }
+        if nonces
+            .iter()
+            .any(|(nonce, _)| self.used_grant_nonces.contains_key(nonce))
+        {
             bail!("grant approval was already used");
         }
+        self.used_grant_nonces.extend(nonces);
+        self.last_activity = now;
+        self.grants.insert(scope, grant);
         Ok(())
     }
+}
 
-    fn remember_grant_nonce(&mut self, nonce: Vec<u8>, expires_at: Instant) {
-        self.used_grant_nonces.insert(nonce, expires_at);
-    }
+/// Loads the standard master from the machine store for the resident agent.
+#[cfg(unix)]
+type AgentMasterLoader = Box<dyn Fn() -> anyhow::Result<MasterKey> + Send + Sync>;
 
-    fn snapshot_grant(&mut self, scope: &GrantKey) -> anyhow::Result<GrantEntry> {
-        self.purge();
-        Ok(self.get_live_grant(scope)?.clone())
-    }
+#[cfg(unix)]
+enum AgentMasterSource {
+    /// Unlocked once at startup with an operator passphrase. There is no re-unlock path, so the
+    /// key is held for the agent lifetime (DESIGN §13).
+    Unlocked(Arc<MasterKey>),
+    /// Loaded from the machine store on first standard-tier use and dropped after idle.
+    Store(AgentMasterLoader),
 }
 
 #[cfg(unix)]
-type AgentStandardMaster = Arc<MasterKey>;
+struct CachedMaster {
+    key: Arc<MasterKey>,
+    last_used: Instant,
+}
 
+/// The resident agent's standard master.
+///
+/// Requests that need it share one cached copy; concurrent cold loads share one store access.
+/// `cached` is held only for short bookkeeping and never across a load, so maintenance and
+/// requests that do not need the master never wait for a slow store.
 #[cfg(unix)]
 struct AgentMasterCache {
-    standard_backend: Option<Backend>,
-    master: Option<AgentStandardMaster>,
+    source: AgentMasterSource,
+    idle_timeout: Duration,
+    /// Read only inside the `cached` critical section (see `lock_cached`).
+    clock: AgentClock,
+    cached: Mutex<Option<CachedMaster>>,
+    loading: Mutex<()>,
 }
+
+#[cfg(unix)]
+type AgentClock = Box<dyn Fn() -> Instant + Send + Sync>;
 
 #[cfg(unix)]
 impl AgentMasterCache {
-    fn new(standard_backend: Option<Backend>, master: Option<MasterKey>) -> Self {
+    fn new(source: AgentMasterSource, idle_timeout: Duration) -> Self {
         Self {
-            standard_backend,
-            master: master.map(Arc::new),
+            source,
+            idle_timeout,
+            clock: Box::new(Instant::now),
+            cached: Mutex::new(None),
+            loading: Mutex::new(()),
         }
     }
 
-    fn load(&mut self) -> anyhow::Result<AgentStandardMaster> {
-        if let Some(master) = &self.master {
-            return Ok(Arc::clone(master));
+    /// Return the master for one crypto operation. Callers drop it as soon as they have opened
+    /// their envelopes.
+    fn get(&self) -> anyhow::Result<Arc<MasterKey>> {
+        let loader = match &self.source {
+            AgentMasterSource::Unlocked(master) => return Ok(Arc::clone(master)),
+            AgentMasterSource::Store(loader) => loader,
+        };
+        if let Some(master) = self.use_cached()? {
+            return Ok(master);
         }
-        let backend = self
-            .standard_backend
-            .context("agent cannot open standard-tier envelopes with this store")?;
-        let master = Arc::new(
-            avault_store::load_master_key(backend).context("failed to load standard master key")?,
-        );
-        self.master = Some(Arc::clone(&master));
+        let _loading = self.loading.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(master) = self.use_cached()? {
+            return Ok(master);
+        }
+        let master = Arc::new(loader().context("failed to load standard master key")?);
+        let (mut cached, now) = self.lock_cached()?;
+        *cached = Some(CachedMaster {
+            key: Arc::clone(&master),
+            last_used: now,
+        });
         Ok(master)
     }
 
-    fn purge_if_idle(&mut self, last_activity: Instant, idle_timeout: Duration) {
-        if Instant::now().duration_since(last_activity) >= idle_timeout {
-            self.master = None;
+    /// Drop a store-loaded master that has not been used for the idle timeout.
+    fn purge(&self) -> anyhow::Result<()> {
+        let (mut cached, now) = self.lock_cached()?;
+        self.expire(&mut cached, now);
+        Ok(())
+    }
+
+    fn use_cached(&self) -> anyhow::Result<Option<Arc<MasterKey>>> {
+        let (mut cached, now) = self.lock_cached()?;
+        self.expire(&mut cached, now);
+        Ok(cached.as_mut().map(|cached| {
+            cached.last_used = now;
+            Arc::clone(&cached.key)
+        }))
+    }
+
+    fn expire(&self, cached: &mut Option<CachedMaster>, now: Instant) {
+        if cached
+            .as_ref()
+            .is_some_and(|cached| now.duration_since(cached.last_used) >= self.idle_timeout)
+        {
+            *cached = None;
         }
+    }
+
+    /// Lock the cache, then read the clock inside the critical section. Updates are therefore
+    /// applied in time order: a stale reading can never overwrite a newer `last_used`.
+    fn lock_cached(&self) -> anyhow::Result<(MutexGuard<'_, Option<CachedMaster>>, Instant)> {
+        let cached = self
+            .cached
+            .lock()
+            .map_err(|_| anyhow!("agent master cache lock is poisoned"))?;
+        Ok((cached, (self.clock)()))
     }
 }
 
+/// State shared by the listener and every connection worker.
 #[cfg(unix)]
-fn purge_agent_state_and_cache(
-    state: &Arc<Mutex<AgentState>>,
-    master_cache: &Arc<Mutex<AgentMasterCache>>,
-) -> anyhow::Result<()> {
-    let (last_activity, idle_timeout) = {
-        let mut state = state
-            .lock()
-            .map_err(|_| anyhow!("agent state lock is poisoned"))?;
-        state.purge();
-        (state.last_activity, state.idle_timeout)
-    };
-    master_cache
-        .lock()
-        .map_err(|_| anyhow!("agent master cache lock is poisoned"))?
-        .purge_if_idle(last_activity, idle_timeout);
-    Ok(())
+struct AgentShared {
+    keypair: BlindBoxKeypair,
+    state: Mutex<AgentState>,
+    master: AgentMasterCache,
 }
 
 #[cfg(unix)]
-fn purge_agent_state_and_cache_best_effort(
-    state: &Arc<Mutex<AgentState>>,
-    master_cache: &Arc<Mutex<AgentMasterCache>>,
-) -> anyhow::Result<()> {
-    let (last_activity, idle_timeout) = {
-        let mut state = state
-            .lock()
-            .map_err(|_| anyhow!("agent state lock is poisoned"))?;
-        state.purge();
-        (state.last_activity, state.idle_timeout)
-    };
-    match master_cache.try_lock() {
-        Ok(mut cache) => cache.purge_if_idle(last_activity, idle_timeout),
-        Err(std::sync::TryLockError::WouldBlock) => {}
-        Err(std::sync::TryLockError::Poisoned(_)) => {
-            return Err(anyhow!("agent master cache lock is poisoned"));
+impl AgentShared {
+    fn new(keypair: BlindBoxKeypair, source: AgentMasterSource, idle_timeout: Duration) -> Self {
+        Self {
+            keypair,
+            state: Mutex::new(AgentState::new(idle_timeout)),
+            master: AgentMasterCache::new(source, idle_timeout),
         }
     }
-    Ok(())
+
+    fn state(&self) -> anyhow::Result<MutexGuard<'_, AgentState>> {
+        self.state
+            .lock()
+            .map_err(|_| anyhow!("agent state lock is poisoned"))
+    }
+
+    /// Periodic maintenance on the listener thread. Takes only short locks.
+    fn purge(&self) -> anyhow::Result<()> {
+        self.state()?.purge();
+        self.master.purge()
+    }
 }
 
+/// Open grant-covered material for one request.
+///
+/// Key handles exist only inside `open` and are dropped before this returns, so no DEK or master
+/// is held while the caller runs a child, fetches, or writes a file. The grant is checked before
+/// any master load, and activity is recorded only after a successful open, so invalid requests
+/// neither touch the machine store nor extend the idle window.
 #[cfg(unix)]
-fn snapshot_agent_keys(
-    state: &Arc<Mutex<AgentState>>,
-    master_cache: &Arc<Mutex<AgentMasterCache>>,
+fn open_with_grant<T>(
+    agent: &AgentShared,
     scope: &GrantKey,
     needs_standard_master: bool,
-) -> anyhow::Result<(GrantEntry, Option<AgentStandardMaster>)> {
-    {
-        let mut state = state
-            .lock()
-            .map_err(|_| anyhow!("agent state lock is poisoned"))?;
-        state.purge();
-        state.get_live_grant(scope)?;
-    }
-    let standard_master = if needs_standard_master {
-        Some(
-            master_cache
-                .lock()
-                .map_err(|_| anyhow!("agent master cache lock is poisoned"))?
-                .load()?,
-        )
+    open: impl FnOnce(&GrantEntry, Option<&MasterKey>) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    agent.state()?.get_live_grant(scope)?;
+    let master = if needs_standard_master {
+        Some(agent.master.get()?)
     } else {
         None
     };
-    let grant = {
-        let mut state = state
-            .lock()
-            .map_err(|_| anyhow!("agent state lock is poisoned"))?;
-        state.purge();
-        state.snapshot_grant(scope)?
-    };
-    Ok((grant, standard_master))
+    let grant = agent.state()?.get_live_grant(scope)?.clone();
+    let opened = open(&grant, master.as_deref());
+    drop(grant);
+    drop(master);
+    let opened = opened?;
+    agent.state()?.record_activity();
+    Ok(opened)
+}
+
+/// Bounds concurrently served connections so a burst cannot exhaust threads or descriptors.
+#[cfg(unix)]
+struct AgentAdmission {
+    active: AtomicUsize,
+    limit: usize,
+}
+
+#[cfg(unix)]
+struct AgentPermit(Arc<AgentAdmission>);
+
+#[cfg(unix)]
+impl AgentAdmission {
+    fn new(limit: usize) -> Arc<Self> {
+        Arc::new(Self {
+            active: AtomicUsize::new(0),
+            limit,
+        })
+    }
+
+    fn try_admit(self: &Arc<Self>) -> Option<AgentPermit> {
+        self.active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < self.limit).then_some(active + 1)
+            })
+            .ok()?;
+        Some(AgentPermit(Arc::clone(self)))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for AgentPermit {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 #[cfg(unix)]
@@ -2483,13 +2593,13 @@ struct AgentRunOutput {
 #[cfg(unix)]
 fn run_agent(options: AgentOptions, input: &mut impl Read) -> anyhow::Result<u8> {
     avault_store::harden_process_memory();
-    let (standard_backend, master) = if options.unlock {
+    let source = if options.unlock {
         let mut passphrase =
             read_passphrase_line(input).context("failed to read store passphrase from stdin")?;
         let master = avault_store::load_or_create_passphrase_master_key(passphrase.as_slice())
             .context("failed to unlock passphrase master key")?;
         passphrase.zeroize();
-        (None, Some(master))
+        AgentMasterSource::Unlocked(Arc::new(master))
     } else {
         let backend = match options.store {
             StoreSelection::Auto => Backend::Auto,
@@ -2500,47 +2610,98 @@ fn run_agent(options: AgentOptions, input: &mut impl Read) -> anyhow::Result<u8>
                 bail!("file-passphrase agent requires --unlock")
             }
         };
-        (Some(backend), None)
+        AgentMasterSource::Store(Box::new(move || avault_store::load_master_key(backend)))
     };
-    let keypair = Arc::new(avault_core::generate_blind_box_keypair());
+    let keypair = avault_core::generate_blind_box_keypair();
     let listener = bind_agent_socket(&options.socket_path)?;
     listener
         .set_nonblocking(true)
         .context("failed to configure agent socket")?;
-    let state = Arc::new(Mutex::new(AgentState::new(options.idle_timeout)));
-    let master_cache = Arc::new(Mutex::new(AgentMasterCache::new(standard_backend, master)));
+    let agent = Arc::new(AgentShared::new(keypair, source, options.idle_timeout));
+    let admission = AgentAdmission::new(MAX_AGENT_CONNECTIONS);
 
     loop {
-        purge_agent_state_and_cache_best_effort(&state, &master_cache)?;
-        let (stream, _) = match listener.accept() {
-            Ok(accepted) => accepted,
+        agent.purge()?;
+        match listener.accept() {
+            Ok((stream, _)) => {
+                dispatch_agent_connection(stream, &agent, &admission, spawn_agent_worker)
+            }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(AGENT_POLL_INTERVAL);
-                continue;
             }
-            Err(err) => return Err(err).context("failed to accept agent connection"),
-        };
-        let keypair = Arc::clone(&keypair);
-        let state = Arc::clone(&state);
-        let master_cache = Arc::clone(&master_cache);
-        std::thread::Builder::new()
-            .name("avault-agent-client".to_string())
-            .spawn(move || {
-                if let Err(err) = run_agent_connection(stream, keypair, state, master_cache) {
-                    eprintln!("avault agent connection: {err:#}");
-                }
-            })
-            .context("failed to spawn agent connection worker")?;
+            Err(err) => {
+                // Descriptor or memory exhaustion affects only the pending client; keep serving.
+                eprintln!("avault agent: failed to accept connection: {err}");
+                std::thread::sleep(AGENT_POLL_INTERVAL);
+            }
+        }
     }
 }
 
 #[cfg(unix)]
-fn run_agent_connection(
-    mut stream: UnixStream,
-    keypair: Arc<BlindBoxKeypair>,
-    state: Arc<Mutex<AgentState>>,
-    master_cache: Arc<Mutex<AgentMasterCache>>,
-) -> anyhow::Result<()> {
+type AgentWorker = Box<dyn FnOnce() + Send + 'static>;
+
+/// Hand one accepted connection to a worker, or refuse only that connection when the agent is
+/// at capacity or cannot start a worker. Never fails the listener.
+#[cfg(unix)]
+fn dispatch_agent_connection(
+    stream: UnixStream,
+    agent: &Arc<AgentShared>,
+    admission: &Arc<AgentAdmission>,
+    spawn: impl FnOnce(AgentWorker) -> io::Result<()>,
+) {
+    let Some(permit) = admission.try_admit() else {
+        reject_agent_connection(&stream, "agent is busy; retry later");
+        return;
+    };
+    let rejection = stream.try_clone().ok();
+    let agent = Arc::clone(agent);
+    let worker: AgentWorker = Box::new(move || {
+        let _permit = permit;
+        if let Err(err) = run_agent_connection(stream, &agent) {
+            eprintln!("avault agent connection: {err:#}");
+        }
+    });
+    if let Err(err) = spawn(worker) {
+        // `spawn` dropped the unstarted worker, releasing its permit and connection handle.
+        eprintln!("avault agent: failed to start connection worker: {err}");
+        if let Some(stream) = rejection {
+            reject_agent_connection(&stream, "agent could not start a worker; retry later");
+        }
+    }
+}
+
+#[cfg(unix)]
+fn spawn_agent_worker(worker: AgentWorker) -> io::Result<()> {
+    std::thread::Builder::new()
+        .name("avault-agent-client".to_string())
+        .spawn(worker)
+        .map(drop)
+}
+
+/// Best-effort refusal frame. One nonblocking write only: a client that does not read must never
+/// stall the listener.
+#[cfg(unix)]
+fn reject_agent_connection(stream: &UnixStream, message: &str) {
+    let Ok(body) = serde_json::to_vec(&AgentResponse::<serde_json::Value> {
+        ok: false,
+        result: None,
+        error: Some(message.to_string()),
+    }) else {
+        return;
+    };
+    let Ok(len) = u32::try_from(body.len()) else {
+        return;
+    };
+    let mut frame = len.to_be_bytes().to_vec();
+    frame.extend_from_slice(&body);
+    if stream.set_nonblocking(true).is_ok() {
+        let _ = (&*stream).write(&frame);
+    }
+}
+
+#[cfg(unix)]
+fn run_agent_connection(mut stream: UnixStream, agent: &AgentShared) -> anyhow::Result<()> {
     stream
         .set_nonblocking(true)
         .context("failed to configure agent connection")?;
@@ -2549,7 +2710,6 @@ fn run_agent_connection(
         err
     })?;
     loop {
-        purge_agent_state_and_cache(&state, &master_cache)?;
         let frame = match read_agent_frame(&mut stream) {
             Ok(Some(frame)) => frame,
             Ok(None) => return Ok(()),
@@ -2558,14 +2718,7 @@ fn run_agent_connection(
                 return Err(err);
             }
         };
-        let (response, refresh_activity) =
-            handle_agent_frame(frame.as_slice(), keypair.as_ref(), &state, &master_cache);
-        if refresh_activity {
-            let mut state = state
-                .lock()
-                .map_err(|_| anyhow!("agent state lock is poisoned"))?;
-            state.record_activity();
-        }
+        let response = handle_agent_frame(frame.as_slice(), agent);
         write_agent_json_frame(&mut stream, &response)?;
     }
 }
@@ -2663,47 +2816,31 @@ fn validate_agent_home_ancestors(parent: &Path) -> anyhow::Result<()> {
 }
 
 #[cfg(unix)]
-fn handle_agent_frame(
-    frame: &[u8],
-    keypair: &BlindBoxKeypair,
-    state: &Arc<Mutex<AgentState>>,
-    master_cache: &Arc<Mutex<AgentMasterCache>>,
-) -> (serde_json::Value, bool) {
-    match handle_agent_frame_inner(frame, keypair, state, master_cache) {
+fn handle_agent_frame(frame: &[u8], agent: &AgentShared) -> serde_json::Value {
+    match handle_agent_frame_inner(frame, agent) {
         Ok(response) => response,
-        Err(err) => (
-            serde_json::to_value(AgentResponse::<serde_json::Value> {
-                ok: false,
-                result: None,
-                error: Some(err.to_string()),
-            })
-            .expect("agent error response serializes"),
-            false,
-        ),
+        Err(err) => serde_json::to_value(AgentResponse::<serde_json::Value> {
+            ok: false,
+            result: None,
+            error: Some(agent_error_message(&err)),
+        })
+        .expect("agent error response serializes"),
     }
 }
 
 #[cfg(unix)]
 fn handle_agent_frame_inner(
     frame: &[u8],
-    keypair: &BlindBoxKeypair,
-    state: &Arc<Mutex<AgentState>>,
-    master_cache: &Arc<Mutex<AgentMasterCache>>,
-) -> anyhow::Result<(serde_json::Value, bool)> {
+    agent: &AgentShared,
+) -> anyhow::Result<serde_json::Value> {
     let request: AgentRequest =
         serde_json::from_slice(frame).context("agent frame JSON is invalid")?;
     match request {
-        AgentRequest::Pubkey => Ok((
-            agent_ok(PubkeyOutput {
-                public_key: keypair.public_key_b64(),
-                fingerprint: keypair.fingerprint_hex(),
-            })?,
-            false,
-        )),
+        AgentRequest::Pubkey => agent_ok(PubkeyOutput {
+            public_key: agent.keypair.public_key_b64(),
+            fingerprint: agent.keypair.fingerprint_hex(),
+        }),
         AgentRequest::Grant(request) => {
-            let mut state = state
-                .lock()
-                .map_err(|_| anyhow!("agent state lock is poisoned"))?;
             if request.deks.is_empty() {
                 bail!("grant requires at least one DEK");
             }
@@ -2728,7 +2865,6 @@ fn handle_agent_frame_inner(
                 validate_approval_not_expired(approval.expires_at_unix)?;
                 let approval_expires_at = approval_expiry_instant(approval.expires_at_unix)?;
                 grant_expires_at = grant_expires_at.min(approval_expires_at);
-                state.ensure_grant_nonce_unused(&approval.nonce)?;
                 if used_nonces.iter().any(|(nonce, _): &(Vec<u8>, Instant)| {
                     nonce.as_slice() == approval.nonce.as_slice()
                 }) {
@@ -2776,7 +2912,8 @@ fn handle_agent_frame_inner(
                 if deks.contains_key(&key) {
                     bail!("duplicate grant DEK name");
                 }
-                let opened = keypair
+                let opened = agent
+                    .keypair
                     .open(&dek.dek_blindbox, &context)
                     .context("DEK blind-box open failed")?;
                 let released_dek = zeroizing_vec_to_key32(opened, "released DEK")?;
@@ -2788,25 +2925,26 @@ fn handle_agent_frame_inner(
                 used_nonces.push((approval.nonce, approval_expires_at));
             }
             let granted = deks.len();
-            for (nonce, expires_at) in used_nonces {
-                state.remember_grant_nonce(nonce, expires_at);
-            }
-            state.grants.insert(
+            agent.state()?.publish_grant(
                 key,
                 GrantEntry {
                     expires_at: grant_expires_at,
                     deks,
                 },
-            );
-            Ok((agent_ok(AgentGrantOutput { granted, ttl_secs })?, true))
+                used_nonces,
+            )?;
+            agent_ok(AgentGrantOutput { granted, ttl_secs })
         }
         AgentRequest::Release(request) | AgentRequest::Revoke(request) => {
             let key = grant_key_from_scope(request)?;
-            let mut state = state
-                .lock()
-                .map_err(|_| anyhow!("agent state lock is poisoned"))?;
+            let mut state = agent.state()?;
+            state.purge();
             let released = state.grants.remove(&key).is_some();
-            Ok((agent_ok(AgentReleaseOutput { released })?, released))
+            if released {
+                state.record_activity();
+            }
+            drop(state);
+            agent_ok(AgentReleaseOutput { released })
         }
         AgentRequest::DeliverRun(request) => {
             let AgentRunDeliverRequest {
@@ -2823,17 +2961,13 @@ fn handle_agent_frame_inner(
             }
             reject_agent_env_one_shot_fields(&secrets)?;
             let scope = grant_key_from_id(grant_id)?;
-            let (grant, standard_master) = snapshot_agent_keys(
-                state,
-                master_cache,
-                &scope,
-                secrets.iter().any(|s| s.tier == SecretTier::Standard),
-            )?;
-            let opened = open_env_secrets_for_agent(secrets, &grant, standard_master.as_ref())?;
+            let needs_standard_master = secrets.iter().any(|s| s.tier == SecretTier::Standard);
+            let opened = open_with_grant(agent, &scope, needs_standard_master, |grant, master| {
+                open_env_secrets_for_agent(secrets, grant, master)
+            })?;
             let command: Vec<OsString> = command.into_iter().map(OsString::from).collect();
-            let exit_code =
-                run_agent_child_with_opened_env(&command, opened, true, state, master_cache)?;
-            Ok((agent_ok(AgentRunOutput { exit_code })?, true))
+            let exit_code = run_agent_child_with_opened_env(&command, opened, true)?;
+            agent_ok(AgentRunOutput { exit_code })
         }
         AgentRequest::DeliverFetch(request) => {
             let AgentFetchDeliverRequest {
@@ -2852,29 +2986,25 @@ fn handle_agent_frame_inner(
             };
             let (_url, is_loopback) = validate_fetch_input(&fetch)?;
             let scope = grant_key_from_id(grant_id)?;
-            let (grant, standard_master) = snapshot_agent_keys(
-                state,
-                master_cache,
+            let FetchInput {
+                name,
+                tier,
+                envelope,
+                request,
+                ..
+            } = fetch;
+            let mut secret = open_with_grant(
+                agent,
                 &scope,
-                fetch.tier == SecretTier::Standard,
+                tier == SecretTier::Standard,
+                |grant, master| {
+                    open_agent_secret(&name, tier, &envelope, grant, master).context("open failed")
+                },
             )?;
-            let mut secret = open_agent_secret(
-                &fetch.name,
-                fetch.tier,
-                &fetch.envelope,
-                &grant,
-                standard_master.as_ref(),
-            )
-            .context("open failed")?;
-            state
-                .lock()
-                .map_err(|_| anyhow!("agent state lock is poisoned"))?
-                .purge_before_blocking(Duration::from_secs(FETCH_TOTAL_TIMEOUT_SECS));
-            let output = execute_fetch_request(fetch.request, &mut secret, is_loopback)
+            let output = execute_fetch_request(request, &mut secret, is_loopback)
                 .context("fetch request failed")?;
             secret.zeroize();
-            purge_agent_state_and_cache(state, master_cache)?;
-            Ok((agent_ok(output)?, true))
+            agent_ok(output)
         }
         AgentRequest::DeliverInject(request) => {
             let AgentInjectDeliverRequest {
@@ -2885,40 +3015,45 @@ fn handle_agent_frame_inner(
                 _context: _,
             } = request;
             let scope = grant_key_from_id(grant_id)?;
-            let inject = InjectInput {
-                path,
-                format,
-                secrets,
-            };
-            reject_agent_named_one_shot_fields(&inject.secrets)?;
-            let (grant, standard_master) = snapshot_agent_keys(
-                state,
-                master_cache,
-                &scope,
-                inject
-                    .secrets
-                    .iter()
-                    .any(|s| s.tier == SecretTier::Standard),
-            )?;
-            write_inject_from_opened(inject, &grant, standard_master.as_ref())?;
-            Ok((agent_ok(serde_json::json!({ "ok": true }))?, true))
+            reject_agent_named_one_shot_fields(&secrets)?;
+            let format = validate_inject_request(&secrets, &format)?;
+            let needs_standard_master = secrets.iter().any(|s| s.tier == SecretTier::Standard);
+            let mut rendered =
+                open_with_grant(agent, &scope, needs_standard_master, |grant, master| {
+                    let mut opened = open_named_secrets_for_agent(secrets, grant, master)?;
+                    let rendered = render_inject_file(&opened, &format);
+                    opened.zeroize();
+                    rendered
+                })?;
+            avault_store::atomic_write_secret_file(&path, rendered.as_slice())
+                .context("failed to write inject file")?;
+            rendered.zeroize();
+            agent_ok(serde_json::json!({ "ok": true }))
         }
         AgentRequest::Sign(request) => {
-            let scope = grant_key_from_id(request.grant_id.clone())?;
+            let scope = grant_key_from_id(request.grant_id)?;
             let digest = decode_hex_32(&request.digest, "digest")?;
             let scheme = SignatureScheme::from_str(&request.scheme)?;
-            let grant = snapshot_agent_keys(state, master_cache, &scope, false)?.0;
-            let key_plaintext = open_signing_key_with_grant(
-                &request.name,
-                &request.key_envelope,
-                &request.scheme,
-                &digest,
-                &grant,
-            )?;
-            let output = sign_digest_with_key(scheme, &digest, key_plaintext)?;
-            Ok((agent_ok(output)?, true))
+            let key_plaintext = open_with_grant(agent, &scope, false, |grant, _| {
+                open_signing_key_with_grant(
+                    &request.name,
+                    &request.key_envelope,
+                    &request.scheme,
+                    &digest,
+                    grant,
+                )
+            })?;
+            agent_ok(sign_digest_with_key(scheme, &digest, key_plaintext)?)
         }
     }
+}
+
+/// The full cause chain, as the one-shot CLI prints it, so actionable causes such as the
+/// `avault key authorize` hint reach the caller. Errors describe what failed and never carry
+/// secret or key bytes.
+#[cfg(unix)]
+fn agent_error_message(err: &anyhow::Error) -> String {
+    format!("{err:#}")
 }
 
 #[cfg(unix)]
@@ -2948,7 +3083,7 @@ fn grant_key_from_id(grant_id: String) -> anyhow::Result<GrantKey> {
 fn open_env_secrets_for_agent(
     secrets: Vec<EnvSecretInput>,
     grant: &GrantEntry,
-    standard_master: Option<&AgentStandardMaster>,
+    standard_master: Option<&MasterKey>,
 ) -> anyhow::Result<Vec<OpenedSecret>> {
     let mut opened = Vec::with_capacity(secrets.len());
     let mut seen = BTreeSet::new();
@@ -2981,7 +3116,7 @@ fn open_env_secrets_for_agent(
 fn open_named_secrets_for_agent(
     secrets: Vec<NamedSecretInput>,
     grant: &GrantEntry,
-    standard_master: Option<&AgentStandardMaster>,
+    standard_master: Option<&MasterKey>,
 ) -> anyhow::Result<Vec<OpenedSecret>> {
     let mut opened = Vec::with_capacity(secrets.len());
     let mut seen = BTreeSet::new();
@@ -3020,7 +3155,7 @@ fn open_agent_secret(
     tier: SecretTier,
     envelope: &Sealed,
     grant: &GrantEntry,
-    standard_master: Option<&AgentStandardMaster>,
+    standard_master: Option<&MasterKey>,
 ) -> anyhow::Result<Zeroizing<Vec<u8>>> {
     match tier {
         SecretTier::Standard => {
@@ -3103,30 +3238,6 @@ fn open_signing_key_with_grant(
 }
 
 #[cfg(unix)]
-fn write_inject_from_opened(
-    inject: InjectInput,
-    grant: &GrantEntry,
-    standard_master: Option<&AgentStandardMaster>,
-) -> anyhow::Result<()> {
-    if inject.secrets.is_empty() {
-        bail!("deliver inject requires at least one secret");
-    }
-    let format = inject.format.to_ascii_lowercase();
-    if format != "dotenv" && format != "json" {
-        bail!("deliver inject format is not implemented in P1.1");
-    }
-    let mut opened = open_named_secrets_for_agent(inject.secrets, grant, standard_master)?;
-    let mut rendered = render_inject_file(&opened, &format)?;
-    opened.zeroize();
-    drop(opened);
-
-    avault_store::atomic_write_secret_file(&inject.path, rendered.as_slice())
-        .context("failed to write inject file")?;
-    rendered.zeroize();
-    Ok(())
-}
-
-#[cfg(unix)]
 fn read_agent_frame(stream: &mut UnixStream) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
     let mut len_buf = [0u8; 4];
     match read_exact_agent(stream, &mut len_buf) {
@@ -3184,7 +3295,7 @@ fn write_agent_error_frame(stream: &mut UnixStream, err: &anyhow::Error) -> anyh
         &AgentResponse::<serde_json::Value> {
             ok: false,
             result: None,
-            error: Some(err.to_string()),
+            error: Some(agent_error_message(err)),
         },
     )
 }
@@ -3368,16 +3479,701 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn idle_purge_drops_cached_standard_master() {
-        let master = MasterKey::from_bytes(&[0x42u8; avault_store::MASTER_KEY_BYTES]).unwrap();
-        let mut cache = AgentMasterCache::new(Some(Backend::File), Some(master));
-        assert!(cache.master.is_some());
-        cache.purge_if_idle(
-            Instant::now() - Duration::from_secs(2),
-            Duration::from_secs(1),
-        );
-        assert!(cache.master.is_none());
+    mod agent {
+        use super::*;
+        use std::net::TcpListener;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::mpsc;
+        use std::thread;
+
+        const WAIT: Duration = Duration::from_secs(10);
+
+        fn test_key(byte: u8) -> MasterKey {
+            MasterKey::from_bytes(&[byte; avault_store::MASTER_KEY_BYTES]).unwrap()
+        }
+
+        /// A store loader that counts calls and blocks each one until the test releases it.
+        struct GatedLoader {
+            loads: Arc<AtomicUsize>,
+            entered: mpsc::Receiver<()>,
+            release: mpsc::Sender<()>,
+        }
+
+        fn gated_loader(byte: u8) -> (AgentMasterSource, GatedLoader) {
+            let loads = Arc::new(AtomicUsize::new(0));
+            let (entered_tx, entered) = mpsc::channel();
+            let (release, release_rx) = mpsc::channel::<()>();
+            let release_rx = Mutex::new(release_rx);
+            let counter = Arc::clone(&loads);
+            let source = AgentMasterSource::Store(Box::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let _ = entered_tx.send(());
+                release_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(WAIT)
+                    .context("test loader was not released")?;
+                Ok(test_key(byte))
+            }));
+            (
+                source,
+                GatedLoader {
+                    loads,
+                    entered,
+                    release,
+                },
+            )
+        }
+
+        fn counting_loader(byte: u8) -> (AgentMasterSource, Arc<AtomicUsize>) {
+            let loads = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&loads);
+            let source = AgentMasterSource::Store(Box::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(test_key(byte))
+            }));
+            (source, loads)
+        }
+
+        /// Pretend the cached master was last used `age` ago.
+        fn age_cached_master(cache: &AgentMasterCache, age: Duration) {
+            cache.cached.lock().unwrap().as_mut().unwrap().last_used = Instant::now() - age;
+        }
+
+        fn agent_with(source: AgentMasterSource) -> Arc<AgentShared> {
+            Arc::new(AgentShared::new(
+                avault_core::generate_blind_box_keypair(),
+                source,
+                Duration::from_secs(60),
+            ))
+        }
+
+        fn deliver_key(name: &str) -> AgentDekKey {
+            AgentDekKey {
+                purpose: AgentDekPurpose::Deliver,
+                name: name.to_string(),
+                scheme: None,
+                digest_hex: None,
+            }
+        }
+
+        /// Install a live grant directly and return a weak handle to its DEK page.
+        fn install_grant(
+            agent: &AgentShared,
+            grant_id: &str,
+            name: &str,
+            dek: &[u8; 32],
+        ) -> std::sync::Weak<MasterKey> {
+            let dek = Arc::new(MasterKey::from_bytes(dek).unwrap());
+            let weak = Arc::downgrade(&dek);
+            let mut state = agent.state().unwrap();
+            state.grants.insert(
+                GrantKey {
+                    grant_id: grant_id.to_string(),
+                },
+                GrantEntry {
+                    expires_at: Instant::now() + Duration::from_secs(60),
+                    deks: HashMap::from([(deliver_key(name), dek)]),
+                },
+            );
+            state.last_activity = Instant::now();
+            weak
+        }
+
+        /// A protected-tier envelope as the browser seals it (legacy record AAD).
+        fn protected_envelope(name: &str, dek: &[u8; 32], value: &[u8]) -> serde_json::Value {
+            use aes_gcm::aead::{Aead, KeyInit, Payload};
+            let nonce = [0x11u8; 12];
+            let mut aad = name.as_bytes().to_vec();
+            aad.extend_from_slice(b"machine-aesgcm-v1");
+            aad.push(1);
+            let ciphertext = aes_gcm::Aes256Gcm::new(dek.into())
+                .encrypt(
+                    aes_gcm::Nonce::from_slice(&nonce),
+                    Payload {
+                        msg: value,
+                        aad: &aad,
+                    },
+                )
+                .unwrap();
+            serde_json::json!({
+                "ciphertext": B64.encode(ciphertext),
+                "nonce": B64.encode(nonce),
+                "wrap_meta": serde_json::json!({
+                    "v": 1,
+                    "scheme": "machine-aesgcm-v1",
+                    "wrapped_dek": "",
+                    "dek_nonce": ""
+                }).to_string()
+            })
+        }
+
+        fn standard_envelope(master: &MasterKey, name: &str, value: &[u8]) -> serde_json::Value {
+            serde_json::to_value(avault_core::seal(master.as_bytes(), name, value).unwrap())
+                .unwrap()
+        }
+
+        fn frame(agent: &AgentShared, request: serde_json::Value) -> serde_json::Value {
+            handle_agent_frame(&serde_json::to_vec(&request).unwrap(), agent)
+        }
+
+        #[test]
+        fn concurrent_cold_loads_share_one_store_access() {
+            let (source, loader) = gated_loader(0x41);
+            let cache = Arc::new(AgentMasterCache::new(source, Duration::from_secs(60)));
+            let first = {
+                let cache = Arc::clone(&cache);
+                thread::spawn(move || cache.get().unwrap())
+            };
+            loader.entered.recv_timeout(WAIT).unwrap();
+            let waiters = (0..4)
+                .map(|_| {
+                    let cache = Arc::clone(&cache);
+                    thread::spawn(move || cache.get().unwrap())
+                })
+                .collect::<Vec<_>>();
+            // Release more loads than one so a regression fails the count instead of hanging.
+            for _ in 0..5 {
+                loader.release.send(()).unwrap();
+            }
+
+            let first = first.join().unwrap();
+            for waiter in waiters {
+                assert!(Arc::ptr_eq(&first, &waiter.join().unwrap()));
+            }
+            assert_eq!(loader.loads.load(Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn cold_master_load_never_blocks_maintenance_or_unrelated_requests() {
+            let tmp = tempfile::tempdir().unwrap();
+            let (source, loader) = gated_loader(0x42);
+            let agent = agent_with(source);
+            let dek = [0x24u8; 32];
+            install_grant(&agent, "protected", "API_TOKEN", &dek);
+            install_grant(&agent, "other", "OTHER", &[0x25u8; 32]);
+            let loading = {
+                let agent = Arc::clone(&agent);
+                thread::spawn(move || agent.master.get().map(drop))
+            };
+            loader.entered.recv_timeout(WAIT).unwrap();
+
+            let (done_tx, done_rx) = mpsc::channel();
+            let inject_path = tmp.path().join("protected.env");
+            {
+                let agent = Arc::clone(&agent);
+                let inject_path = inject_path.clone();
+                thread::spawn(move || {
+                    agent.purge().unwrap();
+                    let pubkey = frame(&agent, serde_json::json!({"type": "pubkey"}));
+                    let inject = frame(
+                        &agent,
+                        serde_json::json!({
+                            "type": "deliver.inject",
+                            "grant_id": "protected",
+                            "path": inject_path,
+                            "secrets": [{
+                                "name": "API_TOKEN",
+                                "tier": "protected",
+                                "envelope": protected_envelope("API_TOKEN", &dek, b"value")
+                            }]
+                        }),
+                    );
+                    let revoke = frame(
+                        &agent,
+                        serde_json::json!({"type": "revoke", "grant_id": "other"}),
+                    );
+                    done_tx.send((pubkey, inject, revoke)).unwrap();
+                });
+            }
+            let (pubkey, inject, revoke) = done_rx
+                .recv_timeout(WAIT)
+                .expect("unrelated work waited for the standard master load");
+            assert_eq!(pubkey["ok"], true);
+            assert_eq!(inject["ok"], true, "{inject}");
+            assert_eq!(
+                fs::read_to_string(inject_path).unwrap(),
+                "API_TOKEN='value'\n"
+            );
+            assert_eq!(revoke["result"]["released"], true);
+
+            loader.release.send(()).unwrap();
+            loading.join().unwrap().unwrap();
+            assert_eq!(loader.loads.load(Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn idle_standard_master_is_dropped_and_never_revived() {
+            let (source, loads) = counting_loader(0x43);
+            let cache = AgentMasterCache::new(source, Duration::from_secs(1));
+            let master = cache.get().unwrap();
+            let page = Arc::downgrade(&master);
+            drop(master);
+            assert!(Arc::ptr_eq(&page.upgrade().unwrap(), &cache.get().unwrap()));
+            assert_eq!(loads.load(Ordering::SeqCst), 1);
+
+            // Maintenance drops a master whose last use is older than the idle timeout.
+            age_cached_master(&cache, Duration::from_secs(2));
+            cache.purge().unwrap();
+            assert!(page.upgrade().is_none());
+
+            // A use that finds a stale entry reloads instead of extending it.
+            let reloaded = cache.get().unwrap();
+            let stale_page = Arc::downgrade(&reloaded);
+            drop(reloaded);
+            age_cached_master(&cache, Duration::from_secs(2));
+            drop(cache.get().unwrap());
+            assert!(stale_page.upgrade().is_none());
+            assert_eq!(loads.load(Ordering::SeqCst), 3);
+        }
+
+        #[test]
+        fn unlocked_passphrase_master_survives_idle_maintenance() {
+            let master = Arc::new(test_key(0x44));
+            let page = Arc::downgrade(&master);
+            let cache = AgentMasterCache::new(
+                AgentMasterSource::Unlocked(master),
+                Duration::from_millis(1),
+            );
+            thread::sleep(Duration::from_millis(5));
+            cache.purge().unwrap();
+            assert!(Arc::ptr_eq(&page.upgrade().unwrap(), &cache.get().unwrap()));
+        }
+
+        #[test]
+        fn grant_publish_is_atomic_with_activity_and_rejects_replay() {
+            let mut state = AgentState::new(Duration::from_secs(1));
+            state.last_activity = Instant::now() - Duration::from_secs(5);
+            let scope = GrantKey {
+                grant_id: "fresh".to_string(),
+            };
+            let nonce = vec![7u8; 16];
+            let expires = Instant::now() + Duration::from_secs(60);
+            state
+                .publish_grant(
+                    scope.clone(),
+                    GrantEntry {
+                        expires_at: expires,
+                        deks: HashMap::new(),
+                    },
+                    vec![(nonce.clone(), expires)],
+                )
+                .unwrap();
+            // The stale idle clock was reset in the same critical section as the insert.
+            state.purge();
+            assert!(state.get_live_grant(&scope).is_ok());
+
+            let activity = state.last_activity;
+            let replay = state.publish_grant(
+                GrantKey {
+                    grant_id: "replay".to_string(),
+                },
+                GrantEntry {
+                    expires_at: expires,
+                    deks: HashMap::new(),
+                },
+                vec![(nonce, expires)],
+            );
+            assert!(replay.unwrap_err().to_string().contains("already used"));
+            assert_eq!(state.grants.len(), 1);
+            assert_eq!(state.last_activity, activity);
+        }
+
+        #[test]
+        fn cache_clock_is_read_only_inside_the_cache_lock() {
+            let reads = Arc::new(AtomicUsize::new(0));
+            let unlocked_reads = Arc::new(AtomicUsize::new(0));
+            let (source, _) = counting_loader(0x49);
+            let cache = Arc::new_cyclic(|this: &std::sync::Weak<AgentMasterCache>| {
+                let this = this.clone();
+                let (reads, unlocked_reads) = (Arc::clone(&reads), Arc::clone(&unlocked_reads));
+                let mut cache = AgentMasterCache::new(source, Duration::from_secs(60));
+                cache.clock = Box::new(move || {
+                    reads.fetch_add(1, Ordering::SeqCst);
+                    let cache = this.upgrade().unwrap();
+                    if cache.cached.try_lock().is_ok() {
+                        unlocked_reads.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Instant::now()
+                });
+                cache
+            });
+
+            // Cold load, cache hit, and maintenance, then a concurrent burst of all three.
+            drop(cache.get().unwrap());
+            drop(cache.get().unwrap());
+            cache.purge().unwrap();
+            let workers = (0..8)
+                .map(|index| {
+                    let cache = Arc::clone(&cache);
+                    thread::spawn(move || {
+                        for _ in 0..50 {
+                            if index % 2 == 0 {
+                                drop(cache.get().unwrap());
+                            } else {
+                                cache.purge().unwrap();
+                            }
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            for worker in workers {
+                worker.join().unwrap();
+            }
+
+            assert!(reads.load(Ordering::SeqCst) >= 3);
+            assert_eq!(unlocked_reads.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn grant_that_expired_while_opening_is_not_published() {
+            let mut state = AgentState::new(Duration::from_secs(60));
+            let activity = Instant::now() - Duration::from_secs(5);
+            state.last_activity = activity;
+            let nonce = vec![9u8; 16];
+            let err = state
+                .publish_grant(
+                    GrantKey {
+                        grant_id: "late".to_string(),
+                    },
+                    GrantEntry {
+                        expires_at: Instant::now() - Duration::from_millis(1),
+                        deks: HashMap::new(),
+                    },
+                    vec![(nonce, Instant::now() + Duration::from_secs(60))],
+                )
+                .unwrap_err();
+            assert!(err.to_string().contains("expired"));
+            assert!(state.grants.is_empty());
+            assert!(state.used_grant_nonces.is_empty());
+            assert_eq!(state.last_activity, activity);
+        }
+
+        #[test]
+        fn agent_errors_carry_the_full_cause_chain() {
+            let source = AgentMasterSource::Store(Box::new(|| {
+                Err(anyhow!("User interaction is not allowed.").context(
+                    "macOS Keychain needs a one-time authorization for avault; \
+                     run `avault key authorize` in a logged-in session",
+                ))
+            }));
+            let agent = agent_with(source);
+            install_grant(&agent, "standard", "UNUSED", &[0x28u8; 32]);
+            let response = frame(
+                &agent,
+                serde_json::json!({
+                    "type": "deliver.inject",
+                    "grant_id": "standard",
+                    "path": "/nonexistent/never-written.env",
+                    "secrets": [{
+                        "name": "API_TOKEN",
+                        "tier": "standard",
+                        "envelope": standard_envelope(&test_key(0x28), "API_TOKEN", b"x")
+                    }]
+                }),
+            );
+            assert_eq!(response["ok"], false);
+            let error = response["error"].as_str().unwrap();
+            assert!(
+                error.contains("failed to load standard master key"),
+                "{error}"
+            );
+            assert!(error.contains("run `avault key authorize`"), "{error}");
+            assert!(
+                error.contains("User interaction is not allowed."),
+                "{error}"
+            );
+        }
+
+        #[test]
+        fn agent_error_chain_does_not_echo_injected_secrets() {
+            let (source, _) = counting_loader(0x4a);
+            let agent = agent_with(source);
+            let dek = [0x29u8; 32];
+            install_grant(&agent, "fetch", "API_TOKEN", &dek);
+            let port = {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.local_addr().unwrap().port()
+            };
+            let response = frame(
+                &agent,
+                serde_json::json!({
+                    "type": "deliver.fetch",
+                    "grant_id": "fetch",
+                    "auth": {
+                        "name": "API_TOKEN",
+                        "tier": "protected",
+                        "envelope": protected_envelope("API_TOKEN", &dek, b"token-123")
+                    },
+                    "request": {
+                        "method": "GET",
+                        "url": format!("http://127.0.0.1:{port}/resource"),
+                        "allowed_hosts": ["127.0.0.1"],
+                        "inject": {"type": "query", "name": "api_key"}
+                    }
+                }),
+            );
+            assert_eq!(response["ok"], false);
+            let error = response["error"].as_str().unwrap();
+            assert!(error.contains("HTTP transport failed"), "{error}");
+            for leaked in ["token-123", "api_key", "/resource", &port.to_string()] {
+                assert!(!error.contains(leaked), "{error}");
+            }
+        }
+
+        #[test]
+        fn activity_does_not_revive_idle_grants() {
+            let mut state = AgentState::new(Duration::from_secs(1));
+            state.grants.insert(
+                GrantKey {
+                    grant_id: "idle".to_string(),
+                },
+                GrantEntry {
+                    expires_at: Instant::now() + Duration::from_secs(60),
+                    deks: HashMap::new(),
+                },
+            );
+            state.last_activity = Instant::now() - Duration::from_secs(2);
+            state.record_activity();
+            assert!(state.grants.is_empty());
+        }
+
+        #[test]
+        fn invalid_requests_do_not_extend_idle() {
+            let (source, loads) = counting_loader(0x45);
+            let agent = agent_with(source);
+            install_grant(&agent, "grant", "API_TOKEN", &[0x26u8; 32]);
+            let activity = Instant::now() - Duration::from_secs(30);
+            agent.state().unwrap().last_activity = activity;
+
+            let pubkey = frame(&agent, serde_json::json!({"type": "pubkey"}));
+            let missing = frame(
+                &agent,
+                serde_json::json!({
+                    "type": "deliver.inject",
+                    "grant_id": "missing",
+                    "path": "/nonexistent/never-written.env",
+                    "secrets": [{
+                        "name": "API_TOKEN",
+                        "tier": "standard",
+                        "envelope": protected_envelope("API_TOKEN", &[0u8; 32], b"x")
+                    }]
+                }),
+            );
+            let wrong_envelope = frame(
+                &agent,
+                serde_json::json!({
+                    "type": "deliver.inject",
+                    "grant_id": "grant",
+                    "path": "/nonexistent/never-written.env",
+                    "secrets": [{
+                        "name": "API_TOKEN",
+                        "tier": "protected",
+                        "envelope": protected_envelope("API_TOKEN", &[0u8; 32], b"x")
+                    }]
+                }),
+            );
+            assert_eq!(pubkey["ok"], true);
+            assert_eq!(missing["ok"], false);
+            assert_eq!(wrong_envelope["ok"], false);
+            assert_eq!(agent.state().unwrap().last_activity, activity);
+            // A request for a missing grant never reaches the machine store.
+            assert_eq!(loads.load(Ordering::SeqCst), 0);
+        }
+
+        /// Accepts `expected` HTTP requests, reports when all have arrived, and answers only
+        /// after the test releases them.
+        fn held_http_server(
+            expected: usize,
+        ) -> (
+            u16,
+            mpsc::Receiver<()>,
+            mpsc::Sender<()>,
+            thread::JoinHandle<()>,
+        ) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (arrived_tx, arrived) = mpsc::channel();
+            let (release, release_rx) = mpsc::channel::<()>();
+            let server = thread::spawn(move || {
+                let deadline = Instant::now() + WAIT;
+                let mut clients = Vec::new();
+                while clients.len() < expected {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream.set_nonblocking(false).unwrap();
+                            let mut buf = [0u8; 4096];
+                            let _ = stream.read(&mut buf).unwrap();
+                            clients.push(stream);
+                        }
+                        Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "requests were serialized");
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(err) => panic!("accept failed: {err}"),
+                    }
+                }
+                arrived_tx.send(()).unwrap();
+                release_rx.recv_timeout(WAIT).unwrap();
+                for mut stream in clients {
+                    stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                        .unwrap();
+                }
+            });
+            (port, arrived, release, server)
+        }
+
+        fn fetch_request(
+            grant_id: &str,
+            port: u16,
+            name: &str,
+            tier: &str,
+            envelope: serde_json::Value,
+        ) -> serde_json::Value {
+            serde_json::json!({
+                "type": "deliver.fetch",
+                "grant_id": grant_id,
+                "auth": {"name": name, "tier": tier, "envelope": envelope},
+                "request": {
+                    "method": "GET",
+                    "url": format!("http://127.0.0.1:{port}/resource"),
+                    "allowed_hosts": ["127.0.0.1"],
+                    "inject": {"type": "bearer"}
+                }
+            })
+        }
+
+        #[test]
+        fn fetches_overlap_and_hold_no_keys_during_network_io() {
+            let (source, loads) = counting_loader(0x46);
+            let agent = agent_with(source);
+            let dek = [0x27u8; 32];
+            let dek_page = install_grant(&agent, "fetch", "API_TOKEN", &dek);
+            let standard = standard_envelope(&test_key(0x46), "STANDARD_TOKEN", b"standard-token");
+            let (port, arrived, release, server) = held_http_server(2);
+
+            let requests = [
+                fetch_request(
+                    "fetch",
+                    port,
+                    "API_TOKEN",
+                    "protected",
+                    protected_envelope("API_TOKEN", &dek, b"protected-token"),
+                ),
+                fetch_request("fetch", port, "STANDARD_TOKEN", "standard", standard),
+            ];
+            let workers = requests
+                .into_iter()
+                .map(|request| {
+                    let agent = Arc::clone(&agent);
+                    thread::spawn(move || frame(&agent, request))
+                })
+                .collect::<Vec<_>>();
+            arrived.recv_timeout(WAIT).expect("fetches did not overlap");
+
+            // Both requests are inside network I/O. Neither holds a DEK or master handle, so
+            // revocation and idle expiry zeroize those pages now, not after the fetch returns.
+            let master_page =
+                Arc::downgrade(&agent.master.cached.lock().unwrap().as_ref().unwrap().key);
+            assert_eq!(master_page.strong_count(), 1);
+            let revoked = frame(
+                &agent,
+                serde_json::json!({"type": "revoke", "grant_id": "fetch"}),
+            );
+            assert_eq!(revoked["result"]["released"], true);
+            assert!(dek_page.upgrade().is_none());
+            age_cached_master(&agent.master, Duration::from_secs(120));
+            agent.purge().unwrap();
+            assert!(master_page.upgrade().is_none());
+
+            release.send(()).unwrap();
+            server.join().unwrap();
+            for worker in workers {
+                let response = worker.join().unwrap();
+                assert_eq!(response["ok"], true, "{response}");
+                assert_eq!(response["result"]["body"], "ok");
+            }
+            assert_eq!(loads.load(Ordering::SeqCst), 1);
+        }
+
+        #[test]
+        fn admission_is_bounded_and_permits_release() {
+            let admission = AgentAdmission::new(1);
+            let permit = admission.try_admit().unwrap();
+            assert!(admission.try_admit().is_none());
+            drop(permit);
+            assert!(admission.try_admit().is_some());
+        }
+
+        /// A connected pair whose client side cannot block the test forever.
+        fn connection_pair() -> (UnixStream, UnixStream) {
+            let (server, client) = UnixStream::pair().unwrap();
+            client.set_read_timeout(Some(WAIT)).unwrap();
+            (server, client)
+        }
+
+        fn read_refusal(client: &mut UnixStream) -> String {
+            let mut len = [0u8; 4];
+            client.read_exact(&mut len).unwrap();
+            let mut body = vec![0u8; u32::from_be_bytes(len) as usize];
+            client.read_exact(&mut body).unwrap();
+            let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(response["ok"], false);
+            response["error"].as_str().unwrap().to_string()
+        }
+
+        #[test]
+        fn saturated_or_failed_dispatch_refuses_only_that_connection() {
+            let (source, _) = counting_loader(0x47);
+            let agent = agent_with(source);
+
+            let admission = AgentAdmission::new(1);
+            let held = admission.try_admit().unwrap();
+            let (server, mut client) = connection_pair();
+            dispatch_agent_connection(server, &agent, &admission, |_| {
+                panic!("a saturated agent must not start a worker")
+            });
+            assert!(read_refusal(&mut client).contains("busy"));
+            drop(held);
+
+            let (server, mut client) = connection_pair();
+            dispatch_agent_connection(server, &agent, &admission, |worker| {
+                drop(worker);
+                Err(io::Error::new(io::ErrorKind::OutOfMemory, "no threads"))
+            });
+            assert!(read_refusal(&mut client).contains("retry"));
+            assert_eq!(admission.active.load(Ordering::SeqCst), 0);
+        }
+
+        #[test]
+        fn dispatched_worker_serves_the_connection_and_releases_its_permit() {
+            let (source, _) = counting_loader(0x48);
+            let agent = agent_with(source);
+            let admission = AgentAdmission::new(1);
+            let (server, mut client) = connection_pair();
+            let (worker_tx, worker_rx) = mpsc::channel();
+            dispatch_agent_connection(server, &agent, &admission, |worker| {
+                worker_tx.send(thread::spawn(worker)).unwrap();
+                Ok(())
+            });
+            assert_eq!(admission.active.load(Ordering::SeqCst), 1);
+            let request = serde_json::to_vec(&serde_json::json!({"type": "pubkey"})).unwrap();
+            client
+                .write_all(&(request.len() as u32).to_be_bytes())
+                .unwrap();
+            client.write_all(&request).unwrap();
+            let mut len = [0u8; 4];
+            client.read_exact(&mut len).unwrap();
+            let mut body = vec![0u8; u32::from_be_bytes(len) as usize];
+            client.read_exact(&mut body).unwrap();
+            let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(response["ok"], true);
+            drop(client);
+            worker_rx.recv().unwrap().join().unwrap();
+            assert_eq!(admission.active.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[cfg(unix)]

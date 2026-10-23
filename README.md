@@ -38,6 +38,7 @@ avault deliver fetch < fetch-request.json
 avault deliver inject < inject-request.json
 avault key export < passphrase.txt
 avault key import [--force] < import-request.json
+avault key authorize
 avault pubkey
 avault seal --name OPENAI_API_KEY --blind-box < blind-box.json
 avault sign < sign-request.json
@@ -63,10 +64,14 @@ exist but disagree, `auto` refuses to choose silently.
 
 The Keychain item intentionally has no user-presence / biometry access-control
 flag, so it stays suitable for headless standard-tier use after the OS session is
-unlocked. macOS may still ask once to allow a newly installed `avault` binary to
-access its Keychain item; that is the normal Keychain application-access prompt,
-not a per-use Touch ID / passcode policy. Select `--store file` (or
-`AVAULT_STORE=file`) to force the file store.
+unlocked. Every command and the resident agent access Keychain with user
+interaction disabled, so automation never raises a Keychain dialog. When macOS
+needs its one-time application-access approval (for example after installing or
+re-signing `avault`), commands fail with a hint to run `avault key authorize` in a
+logged-in session. That is the only command that may show the Keychain prompt:
+concurrent runs share one prompt, and a denied or cancelled prompt suppresses new
+prompts for 120 seconds. Select `--store file` (or `AVAULT_STORE=file`) to force
+the file store.
 
 On Linux, the TPM backend stores `$AVAULT_HOME/machine.tpm.json` (or
 `$HOME/.avibe/state/vault/machine.tpm.json`) containing only TPM2 public/private
@@ -215,7 +220,7 @@ legacy standard-tier rows.
 Like the `askill` dependency: ensured by `vibe runtime prepare`, resolved on `PATH`, shown in Settings · Dependencies. Two transports:
 
 - **CLI subprocess** — argv/JSON in, blobs via stdin, results via stdout.
-- **Resident agent** — unix socket at `~/.avibe/run/avault.sock` (0600), length-prefixed JSON, authorized by `SO_PEERCRED` / `LOCAL_PEERCRED` (no shared token).
+- **Resident agent** — unix socket at `~/.avibe/run/avault.sock` (0600), length-prefixed JSON, authorized by `SO_PEERCRED` / `LOCAL_PEERCRED` (no shared token). Connections are served concurrently (up to 64; extra connections get a `retry later` error), DEKs and the master are held only while envelopes are opened, and a machine-store master is cached only until the idle timeout.
 
 ## Layout
 
