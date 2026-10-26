@@ -76,6 +76,10 @@ jobs:
       - name: Build release binary
         run: cargo build --locked --release
 
+      - name: Check Keychain authorization contract
+        if: runner.os == 'macOS'
+        run: tests/macos-keychain-authorization.sh target/release/avault
+
       - name: Check Windows ARM64 target
         if: runner.os == 'Windows'
         run: cargo check --locked --workspace --target aarch64-pc-windows-msvc
