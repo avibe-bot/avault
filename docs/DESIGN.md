@@ -450,7 +450,7 @@ fresh in-memory receiver keypair that the browser pins/attests (§11.4).
 - **`file + passphrase` defends at-rest, not the running machine** — after the startup unlock the master is in memory; and it needs a passphrase per restart (trades unattended auto-restart for at-rest safety). For fully-unattended servers use TPM/KMS (§13).
 - **The resident agent (P2) widens exposure** vs the one-shot CLI (long-lived key in memory + a socket); mitigated by idle-timeout zeroize, idle-bounded master residency, mlock/no-dump, peer-cred auth (§12). The operator-unlocked `file + passphrase` master stays resident for the agent lifetime because it has no re-unlock path (§13).
 - **The Developer ID signing key is custody-critical.** Whoever holds it can sign a binary that reads the standard-tier master key without a prompt on every machine that approved avault's code identity (Appendix C · macOS code identity).
-- **Keychain authorization is verified against a fake Keychain backend, not the real one.** The gate, cooldown, coalescing, and non-interactive policy are unit-tested; the real application-access flow (how "Always Allow" persists across re-signed binaries, whether `key import --force` can modify an item without UI, and the no-desktop-session error) is a manual macOS check.
+- **Keychain authorization is mostly verified against a fake Keychain backend.** The gate, cooldown, coalescing, and non-interactive policy are unit-tested; CI checks only the authorization-required contract against a real temporary keychain. The rest of the real application-access flow (how "Always Allow" persists across re-signed binaries, whether `key import --force` can modify an item without UI, and the no-desktop-session error) is a manual macOS check.
 
 ---
 
@@ -758,6 +758,9 @@ or:
 { "ok": false, "error": "what failed, never secret bytes" }
 ```
 
+An error frame may also carry a stable `code` that callers act on; the only
+one today is `keychain_authorization_required` (Keychain authorization below).
+
 `pubkey` publishes the agent's fresh in-memory receiver keypair:
 
 ```json
@@ -1006,19 +1009,41 @@ processes triggering it at once, produces a storm of prompts the user did not
 ask for. So avault separates the two cases:
 
 - **Background (every verb, and the resident agent).** Keychain calls run with
-  user interaction disabled. If macOS needs approval, the call fails with
-  `errSecInteractionNotAllowed` and the hint `run avault key authorize in a
-  logged-in session`. The one-shot CLI prints the full cause chain, and the
-  resident agent returns it in the error frame, so the hint reaches the caller
-  on both transports. The typed Keychain status is preserved, so `auto` still
-  falls back to an existing file key exactly as for any unavailable Keychain;
-  a denied or cancelled authorization and a file/Keychain key mismatch are
-  never downgraded, and no error ever selects another backend or creates a
-  replacement key.
+  user interaction disabled. If macOS needs approval (or the keychain is
+  locked), the call fails with `errSecInteractionNotAllowed` or, as macOS 26
+  reports a binary it has not approved, `errSecAuthFailed`. No prompt was
+  shown, so neither is the user's answer: both mean authorization is required.
+  The error carries the hint `run avault key authorize in a logged-in session`
+  and the authorization-required code below. The one-shot CLI prints the full
+  cause chain, and the resident agent returns it in the error frame. The typed
+  Keychain status is preserved, so store policy does not change: `auto` falls
+  back to an existing file key on `errSecInteractionNotAllowed` exactly as for
+  any unavailable Keychain, and never on `errSecAuthFailed`. A file/Keychain
+  key mismatch is never downgraded, and no error ever selects another backend
+  or creates a replacement key.
 - **Explicit (`avault key authorize`).** The only verb that lets macOS show
   its prompt. It reads the existing key (for `auto`, the same policy as a
   background load, including file-key migration) and never generates a key.
-  Callers must invoke it only in response to a user action.
+  Callers must invoke it only in response to a user action. Here
+  `errSecAuthFailed` follows a prompt, so it is a refusal or a failed
+  authentication and starts the cooldown below.
+
+**Authorization-required contract.** Callers recognize the condition by its
+code, never by message text:
+
+| Transport | Signal |
+| --- | --- |
+| One-shot CLI | exit status `77`; stderr still carries the cause chain and hint |
+| Resident agent | error frame `{"ok": false, "error": "...", "code": "keychain_authorization_required"}` |
+
+Only this condition exits `77` or sets `code`. Every other avault failure
+exits `70` and omits `code`, so callers ignore codes they do not know. The
+expected response is a one-time "Authorize avault" action that runs
+`avault key authorize`, then a retry. One-shot `deliver run` otherwise exits
+with the child's status, so there a `77` is ambiguous with a child that exits
+`77` itself; the agent's `code` is not. CI checks the contract against a real
+temporary keychain (`tests/macos-keychain-authorization.sh`): a binary with a
+different code identity fails without a prompt and exits `77` with the hint.
 
 Explicit authorizations are serialized through a per-user gate: an advisory
 `flock` on `keychain-authorization.lock` in `bot.avibe.avault/` under the
@@ -1066,8 +1091,9 @@ are permanent: changing either makes every approval stale.
 - **One-time migration from ad-hoc releases.** On a machine that ran ad-hoc
   releases, the existing item does not yet trust the Developer ID DR. The first
   Developer ID release meets it like any re-signed binary: background calls
-  fail without a prompt, and the user approves once through
-  `avault key authorize` (Keychain authorization, above). Later releases read
+  fail without a prompt and report `keychain_authorization_required`, and the
+  user approves once through `avault key authorize` (Keychain authorization,
+  above). Later releases read
   the key without UI. The item and the key do not change; only the item's
   access gains the new identity. A first install creates the item from a
   Developer ID binary and needs no migration.

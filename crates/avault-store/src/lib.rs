@@ -142,9 +142,6 @@ const ERR_SEC_USER_CANCELED: i32 = -128;
 #[cfg(target_os = "macos")]
 const ERR_SEC_AUTH_FAILED: i32 = -25293;
 #[cfg(target_os = "macos")]
-const KEYCHAIN_AUTHORIZE_HINT: &str = "macOS Keychain needs a one-time authorization for avault; \
-     run `avault key authorize` in a logged-in session";
-#[cfg(target_os = "macos")]
 const KEYCHAIN_SESSION_HINT: &str =
     "macOS can show the Keychain authorization prompt only in a logged-in desktop session";
 #[cfg(target_os = "macos")]
@@ -159,6 +156,28 @@ const KEYCHAIN_AUTHORIZATION_DIR: &str = "bot.avibe.avault";
 const KEYCHAIN_AUTHORIZATION_GATE_FILE: &str = "keychain-authorization.lock";
 #[cfg(target_os = "macos")]
 const MAX_KEYCHAIN_COOLDOWN_RECORD_BYTES: u64 = 32;
+
+/// macOS Keychain needs the user to authorize this binary before a background call can read the
+/// master key. Background Keychain calls attach it to the error they fail with, so callers can
+/// recognize the condition without parsing message text; see [`is_keychain_authorization_required`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeychainAuthorizationRequired;
+
+impl std::fmt::Display for KeychainAuthorizationRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "macOS Keychain needs a one-time authorization for avault; \
+             run `avault key authorize` in a logged-in session",
+        )
+    }
+}
+
+/// Whether `err`, however much context callers added, means that macOS Keychain needs
+/// `avault key authorize` before background calls can read the master key.
+pub fn is_keychain_authorization_required(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<KeychainAuthorizationRequired>()
+        .is_some()
+}
 
 /// Selected master-key storage backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1480,13 +1499,7 @@ impl SystemKeychain {
                 let _no_ui = SecKeychain::disable_user_interaction()
                     .map_err(anyhow::Error::from)
                     .context("failed to disable Keychain user interaction")?;
-                call().map_err(|err| {
-                    if keychain_error_code(&err) == Some(ERR_SEC_INTERACTION_NOT_ALLOWED) {
-                        err.context(KEYCHAIN_AUTHORIZE_HINT)
-                    } else {
-                        err
-                    }
-                })
+                call().map_err(background_keychain_error)
             }
             Self::Authorize => call().map_err(|err| {
                 if keychain_error_code(&err) == Some(ERR_SEC_INTERACTION_NOT_ALLOWED) {
@@ -1496,6 +1509,21 @@ impl SystemKeychain {
                 }
             }),
         }
+    }
+}
+
+/// Mark the errors of a call that ran with Keychain UI disabled. Depending on the macOS release,
+/// an item that needs the user's approval for this binary (or a locked keychain) fails with
+/// `errSecInteractionNotAllowed` or `errSecAuthFailed`. No prompt was shown, so neither can be a
+/// user's answer: both mean `avault key authorize` is required. The Keychain status stays in the
+/// chain, so store policy keyed on it is unchanged.
+#[cfg(target_os = "macos")]
+fn background_keychain_error(err: anyhow::Error) -> anyhow::Error {
+    match keychain_error_code(&err) {
+        Some(ERR_SEC_INTERACTION_NOT_ALLOWED | ERR_SEC_AUTH_FAILED) => {
+            err.context(KeychainAuthorizationRequired)
+        }
+        _ => err,
     }
 }
 
@@ -3002,6 +3030,8 @@ mod tests {
             item: RefCell<Option<[u8; MASTER_KEY_BYTES]>>,
             read_error: Option<i32>,
             add_error: Option<i32>,
+            /// Shape errors as a call with Keychain UI disabled does.
+            background: bool,
             adds: Cell<usize>,
         }
 
@@ -3019,12 +3049,24 @@ mod tests {
                     ..Self::default()
                 }
             }
+
+            fn failing_background_reads(code: i32) -> Self {
+                Self {
+                    background: true,
+                    ..Self::failing_reads(code)
+                }
+            }
         }
 
         impl KeychainBackend for FakeKeychain {
             fn read(&self) -> anyhow::Result<MasterKey> {
                 if let Some(code) = self.read_error {
-                    return Err(keychain_error(code));
+                    let err = keychain_error(code);
+                    return Err(if self.background {
+                        background_keychain_error(err)
+                    } else {
+                        err
+                    });
                 }
                 match *self.item.borrow() {
                     Some(key) => MasterKey::from_bytes(&key),
@@ -3090,6 +3132,38 @@ mod tests {
                 .err()
                 .unwrap();
             assert!(err.to_string().contains("differs"));
+        }
+
+        #[test]
+        fn auto_fallback_is_unchanged_by_authorization_marking() {
+            for code in [ERR_SEC_INTERACTION_NOT_ALLOWED, ERR_SEC_AUTH_FAILED] {
+                for create in [false, true] {
+                    let tmp = tempfile::tempdir().unwrap();
+                    let file = file_store(&tmp, Some([1; MASTER_KEY_BYTES]));
+                    let keychain = FakeKeychain::failing_background_reads(code);
+                    let result = load_auto_master_key_with(&keychain, Some(&file), create);
+                    if code == ERR_SEC_INTERACTION_NOT_ALLOWED {
+                        // An unavailable Keychain still falls back to the existing file key.
+                        assert_eq!(result.unwrap().as_bytes(), &[1; MASTER_KEY_BYTES]);
+                    } else {
+                        // errSecAuthFailed is still never downgraded to the file key.
+                        let err = result.err().unwrap();
+                        assert_eq!(keychain_error_code(&err), Some(code));
+                        assert!(is_keychain_authorization_required(&err));
+                    }
+                    assert_eq!(keychain.adds.get(), 0);
+
+                    let empty = tempfile::tempdir().unwrap();
+                    let missing_file = file_store(&empty, None);
+                    let err = load_auto_master_key_with(&keychain, Some(&missing_file), create)
+                        .err()
+                        .unwrap();
+                    assert_eq!(keychain_error_code(&err), Some(code));
+                    assert!(is_keychain_authorization_required(&err));
+                    assert_eq!(keychain.adds.get(), 0);
+                    assert!(!missing_file.path().exists());
+                }
+            }
         }
 
         #[test]
@@ -3167,6 +3241,43 @@ mod tests {
                 .unwrap_err();
             assert!(format!("{err:#}").contains("avault key authorize"));
             assert!(is_keychain_unavailable(&err));
+        }
+
+        #[test]
+        fn background_auth_failures_require_authorization() {
+            for code in [ERR_SEC_INTERACTION_NOT_ALLOWED, ERR_SEC_AUTH_FAILED] {
+                let err = SystemKeychain::Background
+                    .call(|| -> anyhow::Result<()> { Err(keychain_error(code)) })
+                    .unwrap_err()
+                    .context("failed to read master key from Keychain")
+                    .context("failed to load standard master key");
+                assert!(is_keychain_authorization_required(&err), "{code}");
+                assert_eq!(keychain_error_code(&err), Some(code));
+                assert!(
+                    format!("{err:#}")
+                        .contains("run `avault key authorize` in a logged-in session"),
+                    "{err:#}"
+                );
+            }
+            for code in [
+                ERR_SEC_ITEM_NOT_FOUND,
+                ERR_SEC_USER_CANCELED,
+                ERR_SEC_NOT_AVAILABLE,
+            ] {
+                let err = SystemKeychain::Background
+                    .call(|| -> anyhow::Result<()> { Err(keychain_error(code)) })
+                    .unwrap_err();
+                assert!(!is_keychain_authorization_required(&err), "{code}");
+            }
+        }
+
+        #[test]
+        fn interactive_auth_failure_stays_a_refusal() {
+            let err = SystemKeychain::Authorize
+                .call(|| -> anyhow::Result<()> { Err(keychain_error(ERR_SEC_AUTH_FAILED)) })
+                .unwrap_err();
+            assert!(!is_keychain_authorization_required(&err));
+            assert!(is_keychain_denial(&err));
         }
 
         fn counter() -> Arc<AtomicUsize> {
@@ -3285,6 +3396,25 @@ mod tests {
             attempt(tmp.path(), &clock, &prompts, || Ok(())).unwrap();
             assert_eq!(gate_record(tmp.path()), "");
             assert_eq!(prompts.load(Ordering::SeqCst), 2);
+        }
+
+        #[test]
+        fn interactive_auth_failure_starts_a_cooldown() {
+            let tmp = private_dir();
+            let clock = TestClock::at(T0);
+            let prompts = counter();
+            let err = attempt(tmp.path(), &clock, &prompts, || {
+                SystemKeychain::Authorize.call(|| Err(keychain_error(ERR_SEC_AUTH_FAILED)))
+            })
+            .unwrap_err();
+            assert_eq!(keychain_error_code(&err), Some(ERR_SEC_AUTH_FAILED));
+            assert!(!is_keychain_authorization_required(&err));
+            assert_eq!(gate_record(tmp.path()), (T0 + WINDOW).to_string());
+
+            clock.set(T0 + 1);
+            let err = attempt(tmp.path(), &clock, &prompts, || Ok(())).unwrap_err();
+            assert_eq!(cooldown_of(&err), WINDOW - 1);
+            assert_eq!(prompts.load(Ordering::SeqCst), 1);
         }
 
         #[test]

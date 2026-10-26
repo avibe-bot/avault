@@ -99,16 +99,38 @@ P1 reads secret values, envelopes, and passphrases from stdin. Plaintext never b
 deliver fetch requires request.allowed_hosts before attaching a credential.
 auto uses macOS Keychain on macOS, Linux TPM when available, and the file store elsewhere.
 file-passphrase is opt-in. Its unlock passphrase is read from the first stdin line.
-Only `key authorize` may show macOS Keychain UI; run it when another command asks for it.
+Only `key authorize` may show macOS Keychain UI; run it when another command asks for it
+with exit status 77 (keychain_authorization_required).
 ";
+
+/// Error code for "macOS Keychain needs `avault key authorize`". The one-shot CLI exits with
+/// [`EXIT_KEYCHAIN_AUTHORIZATION_REQUIRED`] and the resident agent puts it in the error frame's
+/// `code`, so callers act on it without parsing message text (DESIGN Appendix C).
+const KEYCHAIN_AUTHORIZATION_REQUIRED: &str = "keychain_authorization_required";
+/// One-shot exit status for [`KEYCHAIN_AUTHORIZATION_REQUIRED`] (`EX_NOPERM`).
+const EXIT_KEYCHAIN_AUTHORIZATION_REQUIRED: u8 = 77;
+/// One-shot exit status for every other avault failure (`EX_SOFTWARE`).
+const EXIT_FAILURE: u8 = 70;
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
         Ok(code) => ExitCode::from(code),
         Err(err) => {
             eprintln!("avault: {err:#}");
-            ExitCode::from(70)
+            ExitCode::from(error_exit_status(&err))
         }
+    }
+}
+
+/// The stable code of an error that callers are expected to act on, if it has one.
+fn error_code(err: &anyhow::Error) -> Option<&'static str> {
+    avault_store::is_keychain_authorization_required(err).then_some(KEYCHAIN_AUTHORIZATION_REQUIRED)
+}
+
+fn error_exit_status(err: &anyhow::Error) -> u8 {
+    match error_code(err) {
+        Some(KEYCHAIN_AUTHORIZATION_REQUIRED) => EXIT_KEYCHAIN_AUTHORIZATION_REQUIRED,
+        _ => EXIT_FAILURE,
     }
 }
 
@@ -2576,6 +2598,9 @@ struct AgentResponse<T: Serialize> {
     result: Option<T>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// The error's stable code (see [`error_code`]); absent for errors without one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'static str>,
 }
 
 #[cfg(unix)]
@@ -2694,6 +2719,7 @@ fn reject_agent_connection(stream: &UnixStream, message: &str) {
         ok: false,
         result: None,
         error: Some(message.to_string()),
+        code: None,
     }) else {
         return;
     };
@@ -2826,12 +2852,8 @@ fn validate_agent_home_ancestors(parent: &Path) -> anyhow::Result<()> {
 fn handle_agent_frame(frame: &[u8], agent: &AgentShared) -> serde_json::Value {
     match handle_agent_frame_inner(frame, agent) {
         Ok(response) => response,
-        Err(err) => serde_json::to_value(AgentResponse::<serde_json::Value> {
-            ok: false,
-            result: None,
-            error: Some(agent_error_message(&err)),
-        })
-        .expect("agent error response serializes"),
+        Err(err) => serde_json::to_value(agent_error_response(&err))
+            .expect("agent error response serializes"),
     }
 }
 
@@ -3064,11 +3086,22 @@ fn agent_error_message(err: &anyhow::Error) -> String {
 }
 
 #[cfg(unix)]
+fn agent_error_response(err: &anyhow::Error) -> AgentResponse<serde_json::Value> {
+    AgentResponse {
+        ok: false,
+        result: None,
+        error: Some(agent_error_message(err)),
+        code: error_code(err),
+    }
+}
+
+#[cfg(unix)]
 fn agent_ok<T: Serialize>(result: T) -> anyhow::Result<serde_json::Value> {
     serde_json::to_value(AgentResponse {
         ok: true,
         result: Some(result),
         error: None,
+        code: None,
     })
     .context("failed to encode agent response")
 }
@@ -3297,14 +3330,7 @@ fn write_agent_json_frame<T: Serialize>(stream: &mut UnixStream, value: &T) -> a
 
 #[cfg(unix)]
 fn write_agent_error_frame(stream: &mut UnixStream, err: &anyhow::Error) -> anyhow::Result<()> {
-    write_agent_json_frame(
-        stream,
-        &AgentResponse::<serde_json::Value> {
-            ok: false,
-            result: None,
-            error: Some(agent_error_message(err)),
-        },
-    )
+    write_agent_json_frame(stream, &agent_error_response(err))
 }
 
 #[cfg(unix)]
@@ -3483,6 +3509,21 @@ mod tests {
         let needles = [Zeroizing::new(b"a".to_vec())];
 
         assert!(redact_fetch_body(&mut body, &needles).is_err());
+    }
+
+    #[test]
+    fn keychain_authorization_required_has_its_own_exit_status() {
+        let err = anyhow!("The user name or passphrase you entered is not correct.")
+            .context(avault_store::KeychainAuthorizationRequired)
+            .context("failed to read master key from Keychain")
+            .context("failed to load standard master key");
+        assert_eq!(error_code(&err), Some("keychain_authorization_required"));
+        assert_eq!(error_exit_status(&err), 77);
+
+        let err = anyhow!("macOS Keychain needs a one-time authorization for avault")
+            .context("failed to load standard master key");
+        assert_eq!(error_code(&err), None);
+        assert_eq!(error_exit_status(&err), 70);
     }
 
     #[cfg(unix)]
@@ -3859,10 +3900,8 @@ mod tests {
         #[test]
         fn agent_errors_carry_the_full_cause_chain() {
             let source = AgentMasterSource::Store(Box::new(|| {
-                Err(anyhow!("User interaction is not allowed.").context(
-                    "macOS Keychain needs a one-time authorization for avault; \
-                     run `avault key authorize` in a logged-in session",
-                ))
+                Err(anyhow!("User interaction is not allowed.")
+                    .context(avault_store::KeychainAuthorizationRequired))
             }));
             let agent = agent_with(source);
             install_grant(&agent, "standard", "UNUSED", &[0x28u8; 32]);
@@ -3890,6 +3929,30 @@ mod tests {
                 error.contains("User interaction is not allowed."),
                 "{error}"
             );
+            assert_eq!(response["code"], "keychain_authorization_required");
+        }
+
+        #[test]
+        fn agent_errors_without_a_code_omit_it() {
+            let source =
+                AgentMasterSource::Store(Box::new(|| Err(anyhow!("master key file is missing"))));
+            let agent = agent_with(source);
+            install_grant(&agent, "standard", "UNUSED", &[0x28u8; 32]);
+            let response = frame(
+                &agent,
+                serde_json::json!({
+                    "type": "deliver.inject",
+                    "grant_id": "standard",
+                    "path": "/nonexistent/never-written.env",
+                    "secrets": [{
+                        "name": "API_TOKEN",
+                        "tier": "standard",
+                        "envelope": standard_envelope(&test_key(0x28), "API_TOKEN", b"x")
+                    }]
+                }),
+            );
+            assert_eq!(response["ok"], false);
+            assert!(response.get("code").is_none(), "{response}");
         }
 
         #[test]

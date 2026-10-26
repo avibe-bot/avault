@@ -68,7 +68,9 @@ unlocked. Every command and the resident agent access Keychain with user
 interaction disabled, so automation never raises a Keychain dialog. When macOS
 needs its one-time application-access approval (for example after installing or
 re-signing `avault`), commands fail with a hint to run `avault key authorize` in a
-logged-in session. That is the only command that may show the Keychain prompt:
+logged-in session; the one-shot CLI exits with status 77 and resident-agent error
+frames carry `"code": "keychain_authorization_required"`, so callers need not
+parse the message. That is the only command that may show the Keychain prompt:
 concurrent runs share one prompt, and a denied or cancelled prompt suppresses new
 prompts for 120 seconds. macOS releases are Developer ID signed with a fixed
 code identity, so after one authorization later upgrades need none. Select
