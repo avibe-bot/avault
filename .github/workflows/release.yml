@@ -199,9 +199,14 @@ jobs:
           if-no-files-found: error
 
   macos-artifact:
-    name: Prepare ${{ matrix.target_name }} artifact
+    name: Sign ${{ matrix.target_name }} artifact
+    # Signing runs on macOS 26, the release that exports the Developer ID .p12;
+    # older runners (macos-14) cannot import a .p12 re-encrypted by OpenSSL 3. One
+    # runner per architecture lets the signed binary run natively before publish.
     runs-on: ${{ matrix.os }}
     needs: build
+    environment: apple-signing
+    timeout-minutes: 90
     permissions:
       contents: read
     strategy:
@@ -209,13 +214,19 @@ jobs:
       matrix:
         include:
           - target_name: macos-arm64
-            os: macos-14
-            binary: avault
+            os: macos-26
           - target_name: macos-x64
-            os: macos-15-intel
-            binary: avault
+            os: macos-26-intel
+    env:
+      # Permanent: Keychain approvals bind to this identifier and the Team ID.
+      CODESIGN_IDENTIFIER: bot.avibe.avault
 
     steps:
+      - name: Check out repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
       - name: Download unsigned macOS artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -235,92 +246,177 @@ jobs:
           mkdir -p "dist/${asset}"
           tar -C "dist/${asset}" -xzf "unsigned-macos/${asset}.tar.gz"
 
-      - name: Check macOS signing secrets
-        id: macos_signing_secrets
+      - name: Require Apple signing secrets
         env:
-          APPLE_CODESIGN_CERTIFICATE_P12: ${{ secrets.APPLE_CODESIGN_CERTIFICATE_P12 }}
-          APPLE_CODESIGN_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CODESIGN_CERTIFICATE_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
         shell: bash
         run: |
           set -euo pipefail
-          if [[ -n "${APPLE_CODESIGN_CERTIFICATE_P12}" &&
-                -n "${APPLE_CODESIGN_CERTIFICATE_PASSWORD}" &&
-                -n "${APPLE_SIGNING_IDENTITY}" &&
-                -n "${APPLE_ID}" &&
-                -n "${APPLE_TEAM_ID}" &&
-                -n "${APPLE_APP_SPECIFIC_PASSWORD}" ]]; then
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "available=false" >> "$GITHUB_OUTPUT"
+          # There is no unsigned fallback: a missing or partial credential set
+          # fails the release instead of publishing a lesser macOS artifact.
+          missing=""
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
+                      APPLE_TEAM_ID APPLE_API_KEY APPLE_API_ISSUER APPLE_API_PRIVATE_KEY; do
+            if [[ -z "${!name}" ]]; then
+              missing="${missing} ${name}"
+            fi
+          done
+          if [[ -n "$missing" ]]; then
+            echo "::error::macOS artifacts must be Developer ID signed and notarized; missing apple-signing environment secrets:${missing}"
+            exit 1
+          fi
+          if [[ ! "$APPLE_TEAM_ID" =~ ^[A-Z0-9]{10}$ ]]; then
+            echo "::error::APPLE_TEAM_ID must be the 10-character Apple Team ID."
+            exit 1
+          fi
+          if [[ "$APPLE_SIGNING_IDENTITY" != "Developer ID Application: "*" (${APPLE_TEAM_ID})" ]]; then
+            echo "::error::APPLE_SIGNING_IDENTITY must be 'Developer ID Application: <name> (<APPLE_TEAM_ID>)'."
+            exit 1
+          fi
+          if [[ "$APPLE_API_PRIVATE_KEY" != *"-----BEGIN PRIVATE KEY-----"* ]]; then
+            echo "::error::APPLE_API_PRIVATE_KEY must be the raw text of the AuthKey_<key id>.p8 file."
+            exit 1
           fi
 
-      - name: Sign and notarize macOS binary
-        if: steps.macos_signing_secrets.outputs.available == 'true'
+      - name: Import Developer ID certificate
+        # A Keychain prompt would hang this step and signing; fail fast instead.
+        timeout-minutes: 10
         env:
-          APPLE_CODESIGN_CERTIFICATE_P12: ${{ secrets.APPLE_CODESIGN_CERTIFICATE_P12 }}
-          APPLE_CODESIGN_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CODESIGN_CERTIFICATE_PASSWORD }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
         shell: bash
         run: |
           set -euo pipefail
-
-          # TODO: Supply Apple Developer ID Application certs/secrets in the repo
-          # before relying on signed macOS artifacts in production. This separate
-          # fresh runner keeps Apple secrets out of the build job and intentionally
-          # skips signing when the APPLE_* secrets are absent.
-          version="${GITHUB_REF_NAME#v}"
-          asset="avault-${version}-${{ matrix.target_name }}"
-          binary_path="dist/${asset}/${{ matrix.binary }}"
+          umask 077
+          keychain="$RUNNER_TEMP/avault-signing.keychain-db"
+          certificate="$RUNNER_TEMP/avault-signing.p12"
           keychain_password="$(uuidgen)"
-          keychain_path="$RUNNER_TEMP/avault-signing.keychain-db"
-          security create-keychain -p "$keychain_password" "$keychain_path"
-          security set-keychain-settings -lut 21600 "$keychain_path"
-          security unlock-keychain -p "$keychain_password" "$keychain_path"
-          security list-keychains -d user -s "$keychain_path"
-          security default-keychain -d user -s "$keychain_path"
-          python3 - <<'PY'
-          import base64
-          import os
-          from pathlib import Path
+          if ! printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$certificate"; then
+            echo "::error::APPLE_CERTIFICATE is not valid base64; store the output of: base64 -i DeveloperID.p12"
+            exit 1
+          fi
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          if ! security import "$certificate" -k "$keychain" -f pkcs12 \
+              -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign; then
+            echo "::error::Could not import APPLE_CERTIFICATE (security error above). Check APPLE_CERTIFICATE_PASSWORD, and that APPLE_CERTIFICATE is the base64 of the Developer ID Application .p12 exported with its private key."
+            exit 1
+          fi
+          rm -f "$certificate"
+          # Let codesign use the private key without a Keychain prompt.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+            -k "$keychain_password" "$keychain" > /dev/null
+          # codesign finds the identity's certificate chain through the search list.
+          search_list=()
+          while IFS= read -r path; do
+            search_list+=("$path")
+          done < <(security list-keychains -d user | sed -e 's/^[[:space:]]*"//' -e 's/"$//')
+          security list-keychains -d user -s "$keychain" ${search_list[@]+"${search_list[@]}"}
+          identities="$(security find-identity -v -p codesigning "$keychain")"
+          if ! grep -Fq "\"${APPLE_SIGNING_IDENTITY}\"" <<<"$identities"; then
+            echo "::error::APPLE_CERTIFICATE holds no valid code-signing identity named APPLE_SIGNING_IDENTITY. Identities in the .p12:"
+            security find-identity -p codesigning "$keychain"
+            exit 1
+          fi
 
-          Path(os.environ["RUNNER_TEMP"], "certificate.p12").write_bytes(
-              base64.b64decode(os.environ["APPLE_CODESIGN_CERTIFICATE_P12"])
-          )
-          PY
-          security import "$RUNNER_TEMP/certificate.p12" \
-            -k "$keychain_path" \
-            -P "$APPLE_CODESIGN_CERTIFICATE_PASSWORD" \
-            -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple: -s \
-            -k "$keychain_password" "$keychain_path"
-
+      - name: Sign macOS binary
+        timeout-minutes: 10
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
           codesign \
             --force \
             --timestamp \
             --options runtime \
+            --identifier "$CODESIGN_IDENTIFIER" \
+            --keychain "$RUNNER_TEMP/avault-signing.keychain-db" \
             --sign "$APPLE_SIGNING_IDENTITY" \
-            "$binary_path"
+            "dist/avault-${version}-${{ matrix.target_name }}/avault"
 
-          ditto -c -k --keepParent \
-            "$binary_path" \
-            "$RUNNER_TEMP/avault-notarize.zip"
+      - name: Verify code identity
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          build-support/verify-macos-codesign.sh \
+            "dist/avault-${version}-${{ matrix.target_name }}/avault" \
+            "$CODESIGN_IDENTIFIER" \
+            "$APPLE_TEAM_ID"
 
-          xcrun notarytool submit "$RUNNER_TEMP/avault-notarize.zip" \
-            --apple-id "$APPLE_ID" \
-            --team-id "$APPLE_TEAM_ID" \
-            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
-            --wait
+      - name: Notarize macOS binary
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          api_key="$RUNNER_TEMP/avault-notary-key.p8"
+          archive="$RUNNER_TEMP/avault-notarize.zip"
+          result="$RUNNER_TEMP/avault-notary-result.json"
+          # The subshell's umask creates the key file as mode 600.
+          (umask 077 && printf '%s\n' "$APPLE_API_PRIVATE_KEY" > "$api_key")
+          notary_auth=(--key "$api_key" --key-id "$APPLE_API_KEY" --issuer "$APPLE_API_ISSUER")
+          # notarytool takes a zip. A bare Mach-O cannot be stapled; Gatekeeper
+          # looks its ticket up online.
+          ditto -c -k --keepParent "dist/avault-${version}-${{ matrix.target_name }}/avault" "$archive"
+          submit_status=0
+          xcrun notarytool submit "$archive" "${notary_auth[@]}" \
+            --wait --timeout 1h --output-format json > "$result" || submit_status=$?
+          cat "$result"
+          # Anything but a JSON status of Accepted, including no JSON at all,
+          # fails the release.
+          if ! status="$(plutil -extract status raw -o - "$result" 2>/dev/null)"; then
+            status=""
+          fi
+          if [[ "$status" != "Accepted" ]]; then
+            echo "::error::Notarization finished with status '${status:-unknown}' (notarytool exit ${submit_status})."
+            if submission_id="$(plutil -extract id raw -o - "$result" 2>/dev/null)"; then
+              xcrun notarytool log "$submission_id" "${notary_auth[@]}" || true
+            fi
+            exit 1
+          fi
 
-      - name: Report unsigned macOS artifact
-        if: steps.macos_signing_secrets.outputs.available == 'false'
-        run: echo "::notice::APPLE_* secrets are incomplete; publishing unsigned macOS artifact."
+      - name: Remove signing material
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/avault-signing.keychain-db"
+          # delete-keychain also drops the keychain from the user search list.
+          if [[ -e "$keychain" ]]; then
+            security delete-keychain "$keychain"
+          fi
+          rm -f \
+            "$RUNNER_TEMP/avault-signing.p12" \
+            "$RUNNER_TEMP/avault-notary-key.p8" \
+            "$RUNNER_TEMP/avault-notarize.zip" \
+            "$RUNNER_TEMP/avault-notary-result.json"
+
+      - name: Run signed binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          reported="$("dist/avault-${version}-${{ matrix.target_name }}/avault" --version)"
+          if [[ "$reported" != "avault ${version}" ]]; then
+            echo "::error::Signed binary reported '${reported}', expected 'avault ${version}'."
+            exit 1
+          fi
 
       - name: Package macOS artifact
         shell: bash
@@ -329,7 +425,7 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           asset="avault-${version}-${{ matrix.target_name }}"
           mkdir -p dist-final
-          tar -C "dist/${asset}" -czf "dist-final/${asset}.tar.gz" "${{ matrix.binary }}"
+          tar -C "dist/${asset}" -czf "dist-final/${asset}.tar.gz" avault
           (
             cd dist-final
             shasum -a 256 "${asset}.tar.gz" > "${asset}.tar.gz.sha256"

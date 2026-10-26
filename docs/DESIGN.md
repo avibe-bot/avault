@@ -361,7 +361,7 @@ The blind box assumes the browser gets `avault`'s **genuine** public key. A full
 - `resolve_cli_path("avault")` on `PATH`; config `agents.avault.cli_path`.
 - `avault_status()` → installed / version / path, shown as a Settings · Dependencies card.
 
-**Distribution — decided: a real manifest-pinned release pipeline (not `askill`'s `curl | sh`).** A custody binary is version-sensitive (client/agent must match), so it ships like Show Runtime: per-platform prebuilt `avault` binaries attached to the avibe release, **version-pinned by a manifest**; `vibe runtime prepare` downloads the right platform asset, verifies its checksum, and installs it. Build the full delivery path **stub-first** (wire avibe → download → `PATH` → Settings card against the current stub binary), then implement the crypto behind it — no throwaway dev installer. Targets: `macos-arm64` + `linux-x64` first; **macOS code-signing / notarization is an explicit pipeline sub-task**. The avault repo owns building/releasing the binaries; avibe pins the compatible version.
+**Distribution — decided: a real manifest-pinned release pipeline (not `askill`'s `curl | sh`).** A custody binary is version-sensitive (client/agent must match), so it ships like Show Runtime: per-platform prebuilt `avault` binaries attached to the avibe release, **version-pinned by a manifest**; `vibe runtime prepare` downloads the right platform asset, verifies its checksum, and installs it. Build the full delivery path **stub-first** (wire avibe → download → `PATH` → Settings card against the current stub binary), then implement the crypto behind it — no throwaway dev installer. Targets: `macos-arm64` + `linux-x64` first; macOS releases are Developer ID signed and notarized under a fixed code identity (Appendix C · macOS code identity). The avault repo owns building/releasing the binaries; avibe pins the compatible version.
 
 **Two run modes (same binary) — and which is safer:**
 
@@ -449,6 +449,7 @@ fresh in-memory receiver keypair that the browser pins/attests (§11.4).
 - **secp256k1 is not hardware-backed** on Apple SE / passkeys — software key + hardware unlock factor; true hardware custody needs an external wallet (§8.3).
 - **`file + passphrase` defends at-rest, not the running machine** — after the startup unlock the master is in memory; and it needs a passphrase per restart (trades unattended auto-restart for at-rest safety). For fully-unattended servers use TPM/KMS (§13).
 - **The resident agent (P2) widens exposure** vs the one-shot CLI (long-lived key in memory + a socket); mitigated by idle-timeout zeroize, idle-bounded master residency, mlock/no-dump, peer-cred auth (§12). The operator-unlocked `file + passphrase` master stays resident for the agent lifetime because it has no re-unlock path (§13).
+- **The Developer ID signing key is custody-critical.** Whoever holds it can sign a binary that reads the standard-tier master key without a prompt on every machine that approved avault's code identity (Appendix C · macOS code identity).
 - **Keychain authorization is verified against a fake Keychain backend, not the real one.** The gate, cooldown, coalescing, and non-interactive policy are unit-tested; the real application-access flow (how "Always Allow" persists across re-signed binaries, whether `key import --force` can modify an item without UI, and the no-desktop-session error) is a manual macOS check.
 
 ---
@@ -1039,6 +1040,56 @@ releases the lock when the holder exits or crashes.
   one window from now, is rewritten to exactly one window from now. Bad
   metadata can therefore suppress prompts for at most one window, and never
   re-enables them early.
+
+### macOS code identity
+
+Keychain decides which programs may read the master-key item by code identity.
+The item's access list records the designated requirement (DR) of every binary
+the user approved, and its partition list records the signer: `teamid:<TEAM>`
+for an Apple-issued certificate, `cdhash:<hash>` for an ad-hoc signature. An
+ad-hoc DR is the binary's own cdhash, so every ad-hoc release was a new program
+to Keychain and needed approval again.
+
+macOS releases are therefore Developer ID signed with hardened runtime,
+notarized, and carry exactly this DR (`docs/RELEASING.md` describes how the
+release workflow enforces it):
+
+```text
+designated => identifier "bot.avibe.avault" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = <TEAM_ID>
+```
+
+The DR names the code identifier and the Team, not a hash or a certificate, so
+every later release, including one signed by a renewed certificate of the same
+Team, satisfies an approval the user already gave. The identifier and the Team
+are permanent: changing either makes every approval stale.
+
+- **One-time migration from ad-hoc releases.** On a machine that ran ad-hoc
+  releases, the existing item does not yet trust the Developer ID DR. The first
+  Developer ID release meets it like any re-signed binary: background calls
+  fail without a prompt, and the user approves once through
+  `avault key authorize` (Keychain authorization, above). Later releases read
+  the key without UI. The item and the key do not change; only the item's
+  access gains the new identity. A first install creates the item from a
+  Developer ID binary and needs no migration.
+- **The signing key is custody-critical.** Any binary with this identifier,
+  signed by a Developer ID certificate of this Team, satisfies the DR;
+  notarization is not part of it. Whoever holds the Developer ID private key
+  can therefore sign a binary that reads the standard-tier master key without a
+  prompt on every machine that approved the DR. This does not move the
+  standard tier's boundary, which is already the OS account (§4.1): it still
+  needs code running as the user. It does hand Keychain's application gate to
+  the key holder, so no policy the genuine binary enforces binds them. In CI
+  the `.p12` and its password exist only in the tag-restricted `apple-signing`
+  environment. Treat every copy as custody material, and a leak as a custody
+  incident, not only a release incident. Protected-tier secrets are
+  unaffected: avault holds no key that opens them.
+- **Hardened runtime.** It needs no entitlements: Keychain access, `mlock`,
+  crash-dump hardening, child processes, HTTPS, and the agent socket behave as
+  before. dyld drops `DYLD_*` variables from avault's own environment, so
+  `deliver run` children on macOS never inherit them. Keeping them would take
+  the `allow-dyld-environment-variables` entitlement, which weakens the custody
+  process's own protection against code injection; avault does not request
+  it.
 
 ### Authentication — who may call avault
 
