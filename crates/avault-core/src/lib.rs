@@ -32,7 +32,7 @@ pub use blind_box::{
 pub use signing::{
     LocalSignerProvider, SignatureResult, SignatureScheme, SignerProvider,
     SIGN_SCHEME_ECDSA_SECP256K1_DER, SIGN_SCHEME_ECDSA_SECP256K1_RECOVERABLE,
-    SIGN_SCHEME_SCHNORR_SECP256K1_BIP340,
+    SIGN_SCHEME_SCHNORR_SECP256K1_BIP340, SIGN_SCHEME_SCHNORR_SECP256K1_BIP341_KEYPATH,
 };
 
 /// Wrap-meta scheme tag used by the P0 Python standard-tier envelope.

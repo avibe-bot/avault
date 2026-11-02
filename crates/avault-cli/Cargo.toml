@@ -28,6 +28,7 @@ hex.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+k256.workspace = true
 aes-gcm.workspace = true
 hpke.workspace = true
 sha2.workspace = true

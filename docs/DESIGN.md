@@ -267,7 +267,10 @@ choose a named secp256k1 output scheme. Phase A implements:
 
 - `ecdsa-secp256k1-recoverable` for ETH-style signatures (`r || s` plus recovery id).
 - `ecdsa-secp256k1-der` for BTC legacy/SegWit DER signatures.
-- `schnorr-secp256k1-bip340` for BTC Taproot.
+- `schnorr-secp256k1-bip340` for raw BIP340 compatibility (unchanged).
+- `schnorr-secp256k1-bip341-keypath` for BIP86 key-path signing of the existing
+  empty-script-tree Taproot output keys. No merkle-root field or script-tree signing is
+  supported by this additive scheme.
 
 Standard-tier signing unwraps a signing-key envelope with the machine master key.
 Protected-tier signing opens a browser-released DEK blind box, uses that DEK to
@@ -411,7 +414,7 @@ This is an internal store selection inside `avault`, not an Avibe-level plugin l
 | **P0** | Python standard tier: DB + envelope + delivery + `$<NAME>` (#631) | superseded by P1 |
 | **P1 / P1.1** | `avault-core` + CLI + cross-platform file store; Rust takes standard-tier seal/open + `deliver run`/`fetch`/`inject`; `vibe runtime prepare` ensure + Dependencies card. Closes the memory-hygiene gap. | done |
 | **P2 — the final trust model, in one shot (no P3)** | Delivered as one reviewed avault re-submission after the unreviewed Phase A/B merges were reverted; nothing ships as a half-released transition state. | in review |
-| · **Phase A** | HPKE blind-box `open` / `open_with_dek`, `pubkey`, `seal --blind-box`, secp256k1 digest signing (`ecdsa-secp256k1-recoverable` = ETH, `ecdsa-secp256k1-der` = BTC legacy/SegWit, `schnorr-secp256k1-bip340` = BTC Taproot), `SignerProvider` seam, pinned JSON contracts (Appendix C). | in review |
+| · **Phase A** | HPKE blind-box `open` / `open_with_dek`, `pubkey`, `seal --blind-box`, secp256k1 digest signing (`ecdsa-secp256k1-recoverable` = ETH, `ecdsa-secp256k1-der` = BTC legacy/SegWit, `schnorr-secp256k1-bip340` = raw BIP340 compatibility, `schnorr-secp256k1-bip341-keypath` = BIP86 empty-tree key path), `SignerProvider` seam, pinned JSON contracts (Appendix C). | in review |
 | · **Phase B** | Resident agent: unix socket + `SO_PEERCRED` / `LOCAL_PEERCRED`, fresh in-memory receiver keypair, grant-id DEK-cache (strict TTL + idle-zeroize), signing oracle; protected-tier `deliver` (browser-released DEK blind box). | in review |
 | · **Phase C** | `file + passphrase` master store (passphrase-wrapped master, unlock once at startup). | in review |
 | · **avibe + browser** | Same one-shot P2, separate tracks. Python: protected create/resolve, blind-box create relay, grant-id approvals, approval / secure-input cards, signing relay. Browser: HPKE seal, VMK/DEK with passkey-PRF + password, browser ETH/BTC signing. | in progress |
@@ -636,7 +639,8 @@ Supported `scheme` values:
 |---|---|---|---|
 | `ecdsa-secp256k1-recoverable` | exactly 32 bytes, caller-computed | hex 64-byte `r || s`, low-S normalized | integer `0..3` |
 | `ecdsa-secp256k1-der` | exactly 32 bytes, caller-computed | hex DER-encoded ECDSA signature | `null` |
-| `schnorr-secp256k1-bip340` | exactly 32 bytes, caller-computed | hex 64-byte BIP340 Schnorr signature | `null` |
+| `schnorr-secp256k1-bip340` | exactly 32 bytes, caller-computed | hex 64-byte raw BIP340 Schnorr signature | `null` |
+| `schnorr-secp256k1-bip341-keypath` | exactly 32 bytes, caller-computed | hex 64-byte BIP86 key-path Schnorr signature for the empty script tree | `null` |
 
 Output:
 
@@ -647,11 +651,12 @@ Output:
 }
 ```
 
-Known-answer fixtures for HPKE open and all three signing schemes live in
-`tests/vectors/p2_core_crypto.json`; browser `@noble/curves` tests should assert
-the same vectors. Production Schnorr signing uses fresh auxiliary randomness;
-the fixture records `schnorr_aux_rand_hex` only to make the cross-implementation
-test deterministic.
+Known-answer fixtures for HPKE open, the legacy signing schemes, the additive BIP86
+key-path scheme, and the official BIP341/BIP86 parity coverage live in
+`tests/vectors/` and `tests/vectors/p2_core_crypto.json`; browser
+`@noble/curves` tests should assert the same scheme identifiers and vectors.
+Production Schnorr signing uses fresh auxiliary randomness; deterministic fixtures use
+an explicit all-zero auxiliary value only for test-vector comparison.
 
 ### P1.1 CLI delivery schemas
 

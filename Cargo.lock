@@ -79,6 +79,7 @@ dependencies = [
  "base64",
  "hex",
  "hpke",
+ "k256",
  "serde",
  "serde_json",
  "sha2",

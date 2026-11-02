@@ -766,6 +766,122 @@ fn sign_matches_shared_vectors_for_all_schemes() {
 }
 
 #[test]
+fn one_shot_signs_raw_bip340_and_bip341_keypath_against_distinct_keys() {
+    let home = tempfile::tempdir().unwrap();
+    write_p0_master(&home.path().join("vault"));
+    let vectors: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tests/vectors/bip341_wallet_test_vectors.json"
+    ))
+    .unwrap();
+    let input = &vectors["keyPathSpending"][0]["inputSpending"][0];
+    let private_key = hex::decode(input["given"]["internalPrivkey"].as_str().unwrap()).unwrap();
+    let digest = input["intermediary"]["sigHash"].as_str().unwrap();
+    let internal_x = input["intermediary"]["internalPubkey"].as_str().unwrap();
+    let output_x = vectors["scriptPubKey"][0]["intermediary"]["tweakedPubkey"]
+        .as_str()
+        .unwrap();
+    let key_envelope = seal_secret(&home.path().join("vault"), "TAPROOT_KEY", &private_key);
+    let run_sign = |scheme: &str| {
+        let request = json!({
+            "name": "TAPROOT_KEY",
+            "key_envelope": key_envelope,
+            "digest": digest,
+            "scheme": scheme
+        });
+        let mut sign = avault()
+            .arg("sign")
+            .env("AVAULT_HOME", home.path().join("vault"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        sign.stdin
+            .as_mut()
+            .unwrap()
+            .write_all(request.to_string().as_bytes())
+            .unwrap();
+        let output = sign.wait_with_output().unwrap();
+        assert!(output.status.success());
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+
+    let digest_bytes: [u8; 32] = hex::decode(digest).unwrap().try_into().unwrap();
+    let internal_verifier =
+        k256::schnorr::VerifyingKey::from_bytes(&hex::decode(internal_x).unwrap()).unwrap();
+    let output_verifier =
+        k256::schnorr::VerifyingKey::from_bytes(&hex::decode(output_x).unwrap()).unwrap();
+
+    let raw = run_sign("schnorr-secp256k1-bip340");
+    let raw_signature = k256::schnorr::Signature::try_from(
+        hex::decode(raw["signature"].as_str().unwrap())
+            .unwrap()
+            .as_slice(),
+    )
+    .unwrap();
+    k256::schnorr::signature::hazmat::PrehashVerifier::verify_prehash(
+        &internal_verifier,
+        &digest_bytes,
+        &raw_signature,
+    )
+    .unwrap();
+    assert!(
+        k256::schnorr::signature::hazmat::PrehashVerifier::verify_prehash(
+            &output_verifier,
+            &digest_bytes,
+            &raw_signature,
+        )
+        .is_err()
+    );
+
+    let keypath = run_sign("schnorr-secp256k1-bip341-keypath");
+    assert_eq!(keypath["recovery_id"], serde_json::Value::Null);
+    let keypath_signature = k256::schnorr::Signature::try_from(
+        hex::decode(keypath["signature"].as_str().unwrap())
+            .unwrap()
+            .as_slice(),
+    )
+    .unwrap();
+    k256::schnorr::signature::hazmat::PrehashVerifier::verify_prehash(
+        &output_verifier,
+        &digest_bytes,
+        &keypath_signature,
+    )
+    .unwrap();
+}
+
+#[test]
+fn one_shot_sign_rejects_unsupported_taproot_tree_options() {
+    let home = tempfile::tempdir().unwrap();
+    write_p0_master(&home.path().join("vault"));
+    let vector = p2_vectors();
+    let signing = &vector["signing"];
+    let private_key = hex::decode(signing["private_key_hex"].as_str().unwrap()).unwrap();
+    let key_envelope = seal_secret(&home.path().join("vault"), "TREE_KEY", &private_key);
+    let request = json!({
+        "name": "TREE_KEY",
+        "key_envelope": key_envelope,
+        "digest": signing["digest_hex"],
+        "scheme": "schnorr-secp256k1-bip341-keypath",
+        "merkle_root": ""
+    });
+    let mut sign = avault()
+        .arg("sign")
+        .env("AVAULT_HOME", home.path().join("vault"))
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    sign.stdin
+        .as_mut()
+        .unwrap()
+        .write_all(request.to_string().as_bytes())
+        .unwrap();
+    let output = sign.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(70));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unknown field"));
+}
+
+#[test]
 fn one_shot_sign_rejects_protected_dek_blindbox() {
     let home = tempfile::tempdir().unwrap();
     write_p0_master(&home.path().join("vault"));
@@ -2203,6 +2319,89 @@ fn agent_signs_with_cached_dek_grant() {
     );
     assert_eq!(replayed["ok"], false);
     assert!(replayed["error"].as_str().unwrap().contains("grant"));
+
+    let _ = agent.kill();
+    let _ = agent.wait();
+}
+
+#[test]
+fn agent_signs_bip341_keypath_for_odd_internal_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("run").join("avault.sock");
+    let mut agent = spawn_agent(&socket, 60);
+    let mut stream = connect_agent(&socket);
+    let pubkey = agent_request(&mut stream, json!({"type": "pubkey"}));
+    let public_key = pubkey["result"]["public_key"].as_str().unwrap();
+    let private_key =
+        hex::decode("41f41d69260df4cf277826a9b65a3717e4eeddbeedf637f212ca096576479361").unwrap();
+    let digest = [0x42u8; 32];
+    let scheme = "schnorr-secp256k1-bip341-keypath";
+    let dek = [0x61u8; 32];
+    let approval_nonce = b"agent-taproot-01";
+    let approval_expires_at = future_expiry();
+    let grant = agent_request(
+        &mut stream,
+        json!({
+            "type": "grant",
+            "grant_id": "taproot-sign-test",
+            "purpose": "sign",
+            "ttl_secs": 60,
+            "deks": [
+                {
+                    "name": "TAPROOT_KEY",
+                    "scheme": scheme,
+                    "digest": hex::encode(digest),
+                    "dek_blindbox": fixed_blind_box(
+                        public_key,
+                        &dek,
+                        &aad_agent_sign(
+                            "taproot-sign-test",
+                            "TAPROOT_KEY",
+                            scheme,
+                            &digest,
+                            TestGrantApproval {
+                                nonce: approval_nonce,
+                                expires_at: approval_expires_at,
+                                ttl_secs: 60
+                            }
+                        )
+                    ),
+                    "approval": approval_json(approval_nonce, approval_expires_at)
+                }
+            ]
+        }),
+    );
+    assert_eq!(grant["ok"], true);
+    let key_envelope = envelope_encrypted_with_dek("TAPROOT_KEY", &dek, &private_key);
+    let response = agent_request(
+        &mut stream,
+        json!({
+            "type": "sign",
+            "grant_id": "taproot-sign-test",
+            "name": "TAPROOT_KEY",
+            "key_envelope": key_envelope,
+            "digest": hex::encode(digest),
+            "scheme": scheme
+        }),
+    );
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["result"]["recovery_id"], serde_json::Value::Null);
+    let signature = k256::schnorr::Signature::try_from(
+        hex::decode(response["result"]["signature"].as_str().unwrap())
+            .unwrap()
+            .as_slice(),
+    )
+    .unwrap();
+    let output_verifier = k256::schnorr::VerifyingKey::from_bytes(
+        &hex::decode("a60869f0dbcf1dc659c9cecbaf8050135ea9e8cdc487053f1dc6880949dc684c").unwrap(),
+    )
+    .unwrap();
+    k256::schnorr::signature::hazmat::PrehashVerifier::verify_prehash(
+        &output_verifier,
+        &digest,
+        &signature,
+    )
+    .unwrap();
 
     let _ = agent.kill();
     let _ = agent.wait();

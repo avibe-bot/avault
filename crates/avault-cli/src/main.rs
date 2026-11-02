@@ -375,6 +375,7 @@ fn pubkey_cmd(args: &[OsString], config: &CliConfig, input: &mut impl Read) -> a
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SignInput {
     name: String,
     key_envelope: Sealed,
