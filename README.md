@@ -210,10 +210,13 @@ that master-derived key is for blind-box create only, not protected DEK release.
 }
 ```
 
-Supported schemes are `ecdsa-secp256k1-recoverable`, `ecdsa-secp256k1-der`, and
-`schnorr-secp256k1-bip340`. Output is `{"signature":"<hex>","recovery_id":0|null}`.
+Supported schemes are `ecdsa-secp256k1-recoverable`, `ecdsa-secp256k1-der`,
+`schnorr-secp256k1-bip340` (raw BIP340, unchanged), and
+`schnorr-secp256k1-bip341-keypath` (BIP86 key-path signing for the existing
+empty-script-tree Taproot output keys). Output is `{"signature":"<hex>","recovery_id":0|null}`.
 avault signs exactly the caller-provided digest; chain-specific sighash construction
-stays outside avault. One-shot `sign` is standard-tier only and rejects
+stays outside avault. The key-path scheme applies `TapTweak(P.x)` inside Rust and
+rejects unsupported tree options rather than silently ignoring them. One-shot `sign` is standard-tier only and rejects
 `dek_blindbox` / `approval`; protected signing goes through the resident agent.
 Protected DEK opens are AAD-only; the P0 empty-AAD read fallback applies only to
 legacy standard-tier rows.
