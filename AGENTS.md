@@ -50,7 +50,11 @@ and gets back ciphertext/results.
 ## 4. Interface & transport
 
 Narrow verb set: `pubkey`, `seal`, `deliver` (run/fetch/inject), `sign`, `key export|import`,
-and `agent` (resident: adds `grant`/`release` DEK-cache). Full contract in DESIGN Appendix C.
+`verify`, and `agent` (resident: adds `grant`/`release` DEK-cache). Full contract in DESIGN
+Appendix C.
+
+`verify` is the one keyless verb: it checks a public signature against a public key and
+digest, and must never select, unlock, or read a store.
 
 - **CLI (P1):** control via argv/JSON; bulk blobs (blind boxes, ciphertext) via **stdin**
   (keep them out of argv so they don't show in `ps`); results via **stdout** JSON.

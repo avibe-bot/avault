@@ -47,6 +47,8 @@ const MAX_STDIN_SECRET_BYTES: usize = 1024 * 1024;
 const MAX_STDIN_ENVELOPE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_STDIN_PASSPHRASE_BYTES: usize = 64 * 1024;
 const STDIN_READ_CHUNK_BYTES: usize = 8192;
+/// A `verify` request is a few hundred bytes: three short hex strings and a scheme name.
+const MAX_VERIFY_REQUEST_BYTES: usize = 4096;
 #[cfg(unix)]
 const MAX_AGENT_FRAME_BYTES: usize = 2 * 1024 * 1024;
 #[cfg(unix)]
@@ -92,6 +94,7 @@ USAGE:
     avault key authorize
     avault pubkey
     avault sign < sign-request.json
+    avault verify < verify-request.json
     avault agent [--store auto|keychain|tpm|file|file-passphrase] [--unlock] [--socket PATH] [--idle-timeout-secs SECS]
     avault version
 
@@ -101,6 +104,16 @@ auto uses macOS Keychain on macOS, Linux TPM when available, and the file store 
 file-passphrase is opt-in. Its unlock passphrase is read from the first stdin line.
 Only `key authorize` may show macOS Keychain UI; run it when another command asks for it
 with exit status 77 (keychain_authorization_required).
+
+verify checks a public signature and is keyless: it reads no key, store, or passphrase
+(--store and AVAULT_STORE are parsed but never used) and returns no private material.
+stdin is one JSON request:
+    {\"scheme\":\"ecdsa-secp256k1-der\",\"public_key\":\"<hex SEC1 point, 33 or 65 bytes>\",
+     \"digest\":\"<hex, exactly 32 bytes>\",\"signature\":\"<hex DER ECDSA signature>\"}
+stdout is {\"valid\":true} with exit status 0, or {\"valid\":false} with exit status 1 when the
+request is well formed but the signature does not verify. A malformed request exits 70.
+It says only whether the signature matches; trusting the key and computing the digest are
+the caller's job.
 ";
 
 /// Error code for "macOS Keychain needs `avault key authorize`". The one-shot CLI exits with
@@ -111,6 +124,9 @@ const KEYCHAIN_AUTHORIZATION_REQUIRED: &str = "keychain_authorization_required";
 const EXIT_KEYCHAIN_AUTHORIZATION_REQUIRED: u8 = 77;
 /// One-shot exit status for every other avault failure (`EX_SOFTWARE`).
 const EXIT_FAILURE: u8 = 70;
+/// `verify` exit status for a well-formed request whose signature does not verify. Exit
+/// status 0 therefore always means "verified", also for a caller that never reads stdout.
+const EXIT_VERIFY_INVALID: u8 = 1;
 
 fn main() -> ExitCode {
     match run(env::args_os().skip(1).collect()) {
@@ -158,6 +174,8 @@ fn run(args: Vec<OsString>) -> anyhow::Result<u8> {
         "key" => key_cmd(&args[1..], &config, &mut stdin),
         "pubkey" => pubkey_cmd(&args[1..], &config, &mut stdin),
         "sign" => sign_cmd(&args[1..], &config, &mut stdin),
+        // Keyless: `verify` is not given the store selection, so it cannot reach a store.
+        "verify" => verify_cmd(&args[1..], &mut stdin),
         "agent" => agent_cmd(&args[1..], &config, &mut stdin),
         #[cfg(unix)]
         "__agent-run-helper" => agent_run_helper_cmd(&args[1..], &mut stdin),
@@ -432,6 +450,82 @@ fn sign_digest_with_key(
         signature: hex::encode(result.signature),
         recovery_id: result.recovery_id,
     })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VerifyInput {
+    scheme: String,
+    public_key: String,
+    digest: String,
+    signature: String,
+}
+
+#[derive(Debug, Serialize)]
+struct VerifyOutput {
+    valid: bool,
+}
+
+/// `avault verify`: check a public signature against a public key and digest.
+///
+/// Keyless by construction: it takes no [`CliConfig`], so it never selects, unlocks, or
+/// reads a store, and never reads a store passphrase from stdin. Its errors never repeat
+/// request bytes, so input sent here by mistake cannot reach stderr.
+fn verify_cmd(args: &[OsString], input: &mut impl Read) -> anyhow::Result<u8> {
+    if !args.is_empty() {
+        bail!("verify reads its JSON request from stdin and takes no options");
+    }
+    let request = read_zeroizing_to_cap(input, MAX_VERIFY_REQUEST_BYTES).map_err(|err| {
+        if err.is::<io::Error>() {
+            err.context("failed to read verify JSON from stdin")
+        } else {
+            anyhow!("verify JSON exceeds the supported size limit")
+        }
+    })?;
+    let valid = verify_request(request.as_slice())?;
+    drop(request);
+    serde_json::to_writer(io::stdout(), &VerifyOutput { valid })
+        .context("failed to write verify JSON")?;
+    println!();
+    Ok(if valid { 0 } else { EXIT_VERIFY_INVALID })
+}
+
+fn verify_request(input: &[u8]) -> anyhow::Result<bool> {
+    let request: VerifyInput = serde_json::from_slice(input).map_err(|err| {
+        // serde_json messages can quote request content, so report only the failure class
+        // and where it was detected.
+        let class = match err.classify() {
+            serde_json::error::Category::Syntax => "malformed JSON",
+            serde_json::error::Category::Eof => "empty or truncated JSON",
+            serde_json::error::Category::Data => {
+                "unexpected shape (a missing, unknown, duplicate, or non-string field)"
+            }
+            serde_json::error::Category::Io => "unreadable JSON",
+        };
+        anyhow!(
+            "verify JSON is invalid: {class} at line {} column {}",
+            err.line(),
+            err.column()
+        )
+    })?;
+    if request.scheme != avault_core::SIGN_SCHEME_ECDSA_SECP256K1_DER {
+        bail!(
+            "unsupported verification scheme: verify accepts only {}",
+            avault_core::SIGN_SCHEME_ECDSA_SECP256K1_DER
+        );
+    }
+    let public_key = decode_verify_hex(&request.public_key, "public_key")?;
+    let digest: [u8; 32] = decode_verify_hex(&request.digest, "digest")?
+        .try_into()
+        .map_err(|_| anyhow!("digest must be exactly 32 bytes of hex"))?;
+    let signature = decode_verify_hex(&request.signature, "signature")?;
+    avault_core::verify_ecdsa_secp256k1_der(&public_key, &digest, &signature)
+}
+
+/// Decode a `verify` hex field. The `hex` error names the offending character, so it is
+/// dropped: the message says which field is malformed, never what it contained.
+fn decode_verify_hex(text: &str, label: &str) -> anyhow::Result<Vec<u8>> {
+    hex::decode(text).map_err(|_| anyhow!("{label} is not valid hex"))
 }
 
 fn decode_hex_32(text: &str, label: &str) -> anyhow::Result<[u8; 32]> {

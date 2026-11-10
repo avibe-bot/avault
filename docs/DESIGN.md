@@ -453,6 +453,7 @@ fresh in-memory receiver keypair that the browser pins/attests (§11.4).
 - **`file + passphrase` defends at-rest, not the running machine** — after the startup unlock the master is in memory; and it needs a passphrase per restart (trades unattended auto-restart for at-rest safety). For fully-unattended servers use TPM/KMS (§13).
 - **The resident agent (P2) widens exposure** vs the one-shot CLI (long-lived key in memory + a socket); mitigated by idle-timeout zeroize, idle-bounded master residency, mlock/no-dump, peer-cred auth (§12). The operator-unlocked `file + passphrase` master stays resident for the agent lifetime because it has no re-unlock path (§13).
 - **The Developer ID signing key is custody-critical.** Whoever holds it can sign a binary that reads the standard-tier master key without a prompt on every machine that approved avault's code identity (Appendix C · macOS code identity).
+- **`verify` proves a signature, not trust.** It says only that a signature matches a public key and a digest. A caller that takes the key or the digest from the publisher, or whose pinned key's private half leaks, is not protected by it (Appendix C · Public signature verification).
 - **Keychain authorization is mostly verified against a fake Keychain backend.** The gate, cooldown, coalescing, and non-interactive policy are unit-tested; CI checks only the authorization-required contract against a real temporary keychain. The rest of the real application-access flow (how "Always Allow" persists across re-signed binaries, whether `key import --force` can modify an item without UI, and the no-desktop-session error) is a manual macOS check.
 
 ---
@@ -483,6 +484,7 @@ Concrete, implementation-ready values for every step.
 | Password KDF | scrypt `N=2^15, r=8, p=1` → 256-bit KEK |
 | Passkey factor | WebAuthn PRF extension (CTAP2 `hmac-secret`) → 32 B → KEK |
 | Signing | ECDSA / secp256k1 · EIP-155 / EIP-1559 · keccak256 digest |
+| Public signature verification | ECDSA / secp256k1 · DER · low-S only · caller-computed 32-byte digest · no key material |
 | Browser libs | `@noble/curves`, `@noble/hashes`, WebCrypto |
 | Rust libs | `aes-gcm`, `hkdf`, `hpke`, `x25519-dalek`, `k256`, `zeroize`, `subtle` |
 | Resident-agent auth | `SO_PEERCRED` (Linux) / `LOCAL_PEERCRED` (macOS) on the unix socket |
@@ -505,6 +507,7 @@ These are starting recommendations, not frozen choices — items #2 (envelope) a
 | `seal` | blind box (the value) + name/scheme | envelope `{ciphertext, nonce, wrap_meta}` | standard-tier create: open box → wrap DEK under master → return ciphertext (never plaintext). The CLI plaintext-stdin path remains for local `set` / fd passthrough. |
 | `deliver` | envelope + mode (`run` / `fetch` / `inject`) | exit code / response body / written file | one-shot standard-tier delivery uses the master key; protected delivery uses resident-agent grants, never inline DEK boxes |
 | `sign` | key envelope + name + 32-byte digest + scheme | signature (public) | one-shot standard-tier signing; protected signing uses resident-agent grants. The private key never leaves `avault` |
+| `verify` | public key + 32-byte digest + DER signature + scheme, all public | `{"valid": true}` / `{"valid": false}` | keyless check of a signature someone else produced (Avibe's signed Model Hub engine index). Touches no store and no key |
 | `key export` / `key import` | passphrase (stdin; if `--store file-passphrase`, first stdin line unlocks the store) | encrypted backup / ok | back up, migrate, restore the master key |
 | `key authorize` | — (if `--store file-passphrase`, first stdin line unlocks the store) | ok | the only verb that may show macOS Keychain UI: lets the user grant this binary access to the existing master key. Never creates a key; on other stores it only verifies the key loads |
 
@@ -513,6 +516,9 @@ verbs. Phase B adds the resident agent transport plus `grant` / `release`: cache
 grant's DEK-set for a TTL so repeated uses in-window skip re-unlock. Signing is
 chain-agnostic: callers provide the exact 32-byte digest/sighash and select the
 signature encoding.
+
+`verify` is the one verb that handles no secret: its inputs and its output are public,
+and it never reaches a store (Public signature verification, below).
 
 ### Phase A blind-box and signing schemas
 
@@ -657,6 +663,86 @@ key-path scheme, and the official BIP341/BIP86 parity coverage live in
 `@noble/curves` tests should assert the same scheme identifiers and vectors.
 Production Schnorr signing uses fresh auxiliary randomness; deterministic fixtures use
 an explicit all-zero auxiliary value only for test-vector comparison.
+
+### Public signature verification (`verify`)
+
+`verify` answers one question about public data: does this signature match this public
+key and this digest? It exists for Avibe's signed Model Hub engine index: Avibe pins the
+index's public key, hashes the index payload it downloaded, and asks avault whether the
+publisher's signature matches, so Avibe needs no crypto stack of its own. The Avibe side
+of this contract is `avibe/docs/plans/model-hub-engine-channel.md`.
+
+It is the only keyless verb. Every input is public and the output is one boolean, so the
+custody invariant is untouched: nothing secret goes in, and nothing secret can come out.
+
+- **No store.** `verify` never selects, unlocks, creates, or reads a master-key store: no
+  Keychain, TPM, key file, or passphrase, and no private-key operation. It gives the same
+  answer on a machine that has no master key, and never creates one. The global `--store`
+  option and `AVAULT_STORE` are parsed as for every command, so an unknown backend name
+  is still an error, and then not used. With `file-passphrase` selected, `verify` still
+  reads no passphrase line: the request is the whole of stdin.
+- **Noninteractive.** It never prompts, so it never reports
+  `keychain_authorization_required`.
+- **One-shot CLI only.** The resident agent has no `verify` frame; verification needs
+  none of its state.
+
+`avault verify` takes no options and reads one JSON object from stdin, at most 4096 bytes:
+
+```json
+{
+  "scheme": "ecdsa-secp256k1-der",
+  "public_key": "<hex SEC1 public key>",
+  "digest": "<hex 32-byte digest>",
+  "signature": "<hex DER signature>"
+}
+```
+
+All four fields are required strings; unknown and repeated fields are rejected. Hex is
+lowercase or uppercase, with no `0x` prefix and no whitespace.
+
+| Field | Accepted |
+|---|---|
+| `scheme` | exactly `ecdsa-secp256k1-der`. Every other value is an error, including the other signing schemes: `verify` never infers an algorithm from the input |
+| `public_key` | a SEC1 point on the secp256k1 curve: 33 bytes compressed (tag `02` / `03`) or 65 bytes uncompressed (tag `04`). The identity, compact (`05`), hybrid (`06` / `07`), x-only, and untagged forms are errors |
+| `digest` | exactly 32 bytes, computed by the caller. avault uses it as given and never hashes it again |
+| `signature` | a strict DER `SEQUENCE { INTEGER r, INTEGER s }` of at most 72 bytes, with `r` and `s` in `1..n-1`. Trailing bytes, non-minimal lengths or integers, and raw 64-byte `r \|\| s` are errors |
+
+Result:
+
+| Outcome | stdout | Exit status |
+|---|---|---|
+| The signature verifies | `{"valid":true}` | `0` |
+| The request is well formed, but the signature does not verify | `{"valid":false}` | `1` |
+| The request is malformed | nothing; stderr says what failed | `70` |
+
+- **Exit status `0` always means verified**, so a caller that checks only the status
+  fails closed. `1` with `{"valid":false}` follows `deliver fetch`, which also reports a
+  completed request with a negative result as `1`; `70` is the ordinary avault failure.
+- **Low-S only.** A signature whose `s` is above `n/2` is well formed but gets
+  `{"valid":false}`. Each signature therefore has one accepted form and cannot be
+  rewritten into a second valid one. avault's `ecdsa-secp256k1-der` signer always emits
+  low-S; any other signer must normalize `s`.
+- **Errors carry no request bytes.** A failure names the field, or the kind of JSON error
+  and its position, never the content. Input sent by mistake, such as a store passphrase
+  line, cannot reach stderr.
+
+`verify` checks the mathematics only. These decisions stay with the caller:
+
+- **Which key to trust.** The caller pins the public key and supplies it itself. A key
+  fetched from the same place as the signature proves nothing.
+- **What the digest covers.** The caller hashes the exact bytes it is about to rely on,
+  under its own fixed domain prefix. A digest supplied by the publisher proves nothing
+  about any content: for any public key, anyone can construct a digest and a signature
+  that verify together without the private key, as long as they need not name the bytes
+  behind the digest.
+- **Freshness.** Replay, rollback, and expiry belong to the signed content and the
+  caller's policy.
+
+Known-answer cases live in `tests/vectors/verify_ecdsa_secp256k1_der.json`, and the avault
+core and CLI tests both run every case. They cover the shared signing vector under both
+key encodings, an RFC 6979 vector, a digest built from a domain prefix and a payload,
+modified digests and signatures, the high-S form, and each malformed key and signature
+above. Avibe's tests should assert the same cases.
 
 ### P1.1 CLI delivery schemas
 
