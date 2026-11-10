@@ -15,6 +15,7 @@ pub const SIGN_SCHEME_ECDSA_SECP256K1_RECOVERABLE: &str = "ecdsa-secp256k1-recov
 pub const SIGN_SCHEME_ECDSA_SECP256K1_DER: &str = "ecdsa-secp256k1-der";
 pub const SIGN_SCHEME_SCHNORR_SECP256K1_BIP340: &str = "schnorr-secp256k1-bip340";
 pub const SIGN_SCHEME_SCHNORR_SECP256K1_BIP341_KEYPATH: &str = "schnorr-secp256k1-bip341-keypath";
+pub const SIGN_SCHEME_ED25519: &str = "ed25519";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SignatureScheme {
@@ -22,6 +23,7 @@ pub enum SignatureScheme {
     EcdsaSecp256k1Der,
     SchnorrSecp256k1Bip340,
     SchnorrSecp256k1Bip341Keypath,
+    Ed25519,
 }
 
 impl SignatureScheme {
@@ -31,6 +33,7 @@ impl SignatureScheme {
             Self::EcdsaSecp256k1Der => SIGN_SCHEME_ECDSA_SECP256K1_DER,
             Self::SchnorrSecp256k1Bip340 => SIGN_SCHEME_SCHNORR_SECP256K1_BIP340,
             Self::SchnorrSecp256k1Bip341Keypath => SIGN_SCHEME_SCHNORR_SECP256K1_BIP341_KEYPATH,
+            Self::Ed25519 => SIGN_SCHEME_ED25519,
         }
     }
 }
@@ -44,6 +47,7 @@ impl FromStr for SignatureScheme {
             SIGN_SCHEME_ECDSA_SECP256K1_DER => Ok(Self::EcdsaSecp256k1Der),
             SIGN_SCHEME_SCHNORR_SECP256K1_BIP340 => Ok(Self::SchnorrSecp256k1Bip340),
             SIGN_SCHEME_SCHNORR_SECP256K1_BIP341_KEYPATH => Ok(Self::SchnorrSecp256k1Bip341Keypath),
+            SIGN_SCHEME_ED25519 => Ok(Self::Ed25519),
             _ => bail!("unsupported signing scheme"),
         }
     }
@@ -67,6 +71,25 @@ pub trait SignerProvider {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LocalSignerProvider;
 
+impl LocalSignerProvider {
+    /// Sign exact message bytes for the Ed25519 scheme.
+    pub fn sign_message(
+        &self,
+        scheme: SignatureScheme,
+        private_key: &Zeroizing<[u8; KEY_BYTES]>,
+        message: &[u8],
+    ) -> anyhow::Result<SignatureResult> {
+        if scheme != SignatureScheme::Ed25519 {
+            bail!("raw message signing is only supported for ed25519");
+        }
+        let signature = crate::sign_ed25519(private_key, message)?;
+        Ok(SignatureResult {
+            signature,
+            recovery_id: None,
+        })
+    }
+}
+
 impl SignerProvider for LocalSignerProvider {
     fn sign_digest(
         &self,
@@ -75,6 +98,9 @@ impl SignerProvider for LocalSignerProvider {
         digest: &[u8; KEY_BYTES],
     ) -> anyhow::Result<SignatureResult> {
         match scheme {
+            SignatureScheme::Ed25519 => {
+                bail!("ed25519 requires raw message bytes; use --message-hex")
+            }
             SignatureScheme::EcdsaSecp256k1Recoverable => {
                 sign_ecdsa_recoverable(private_key, digest)
             }
@@ -283,7 +309,10 @@ mod tests {
             SignatureScheme::from_str(SIGN_SCHEME_SCHNORR_SECP256K1_BIP341_KEYPATH).unwrap(),
             SignatureScheme::SchnorrSecp256k1Bip341Keypath
         );
-        assert!(SignatureScheme::from_str("ed25519").is_err());
+        assert_eq!(
+            SignatureScheme::from_str(SIGN_SCHEME_ED25519).unwrap(),
+            SignatureScheme::Ed25519
+        );
     }
 
     #[test]
@@ -603,6 +632,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ed25519_message_signing_uses_exact_bytes() {
+        let key = Zeroizing::new([7u8; KEY_BYTES]);
+        let message = b"serialized Solana message";
+        let result = LocalSignerProvider
+            .sign_message(SignatureScheme::Ed25519, &key, message)
+            .unwrap();
+        assert_eq!(result.signature.len(), 64);
+        assert_eq!(result.recovery_id, None);
+        assert!(LocalSignerProvider
+            .sign_digest(SignatureScheme::Ed25519, &key, &[0u8; KEY_BYTES])
+            .is_err());
+    }
     #[test]
     fn rejects_invalid_private_key() {
         let key = Zeroizing::new([0u8; KEY_BYTES]);

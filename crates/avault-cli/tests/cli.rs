@@ -4385,6 +4385,165 @@ fn python_aad_reference_opens_rust_envelope_and_rust_opens_python_envelope() {
     assert!(deliver.wait().unwrap().success());
 }
 
+#[test]
+fn solana_keypair_generation_import_and_exact_message_signing() {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+    let home = tempfile::tempdir().unwrap();
+    let vault_home = home.path().join("vault");
+    let generated = avault()
+        .arg("keypair")
+        .arg("generate")
+        .arg("--name")
+        .arg("SOLANA_GENERATED")
+        .arg("--curve")
+        .arg("ed25519")
+        .env("AVAULT_HOME", &vault_home)
+        .output()
+        .unwrap();
+    assert!(
+        generated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let generated: serde_json::Value = serde_json::from_slice(&generated.stdout).unwrap();
+    assert_eq!(generated["curve"], "ed25519");
+    assert_eq!(generated["chain"], "solana");
+    assert_eq!(generated["public_key"].as_str().unwrap().len(), 64);
+    assert!(!generated["address"].as_str().unwrap().is_empty());
+    assert!(generated["envelope"]["ciphertext"].as_str().unwrap().len() > 20);
+
+    let seed = [7u8; 32];
+    let public_key = avault_core::ed25519_public_key(&seed);
+    let mut secret = Vec::from(seed);
+    secret.extend_from_slice(&public_key);
+    let secret_json = serde_json::to_vec(&secret).unwrap();
+    let imported_json = avault()
+        .arg("keypair")
+        .arg("import")
+        .arg("--name")
+        .arg("SOLANA_IMPORTED_JSON")
+        .arg("--curve")
+        .arg("ed25519")
+        .arg("--format")
+        .arg("solana-cli-json")
+        .env("AVAULT_HOME", &vault_home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut imported_json = imported_json;
+    imported_json
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(&secret_json)
+        .unwrap();
+    let imported_json = imported_json.wait_with_output().unwrap();
+    assert!(imported_json.status.success());
+    let imported_json: serde_json::Value = serde_json::from_slice(&imported_json.stdout).unwrap();
+    assert_eq!(imported_json["public_key"], hex::encode(public_key));
+    assert_eq!(
+        imported_json["address"],
+        bs58::encode(public_key).into_string()
+    );
+
+    let secret_base58 = bs58::encode(&secret).into_string();
+    let imported_base58 = avault()
+        .arg("keypair")
+        .arg("import")
+        .arg("--name")
+        .arg("SOLANA_IMPORTED_BASE58")
+        .arg("--curve")
+        .arg("ed25519")
+        .arg("--format")
+        .arg("base58-secret")
+        .env("AVAULT_HOME", &vault_home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut imported_base58 = imported_base58;
+    imported_base58
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(secret_base58.as_bytes())
+        .unwrap();
+    let imported_base58 = imported_base58.wait_with_output().unwrap();
+    assert!(imported_base58.status.success());
+    let imported_base58: serde_json::Value =
+        serde_json::from_slice(&imported_base58.stdout).unwrap();
+    assert_eq!(imported_base58["public_key"], hex::encode(public_key));
+
+    let message = b"serialized Solana message bytes";
+    let signed = avault()
+        .arg("sign")
+        .env("AVAULT_HOME", &vault_home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut signed = signed;
+    signed
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(
+            &serde_json::to_vec(&json!({
+                "name": "SOLANA_GENERATED",
+                "key_envelope": generated["envelope"].clone(),
+                "scheme": "ed25519",
+                "message_hex": hex::encode(message),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    let signed = signed.wait_with_output().unwrap();
+    assert!(
+        signed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&signed.stderr)
+    );
+    let signed: serde_json::Value = serde_json::from_slice(&signed.stdout).unwrap();
+    let signature =
+        Signature::from_slice(&hex::decode(signed["signature"].as_str().unwrap()).unwrap())
+            .unwrap();
+    let public_key = hex::decode(generated["public_key"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    VerifyingKey::from_bytes(&public_key)
+        .unwrap()
+        .verify(message, &signature)
+        .unwrap();
+
+    let bad = avault()
+        .arg("sign")
+        .env("AVAULT_HOME", &vault_home)
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut bad = bad;
+    bad.stdin
+        .as_mut()
+        .unwrap()
+        .write_all(
+            &serde_json::to_vec(&json!({
+                "name": "SOLANA_GENERATED",
+                "key_envelope": generated["envelope"].clone(),
+                "scheme": "ed25519",
+                "digest": "00".repeat(32),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    let bad = bad.wait_with_output().unwrap();
+    assert!(!bad.status.success());
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("--message-hex"));
+}
+
 const PYTHON_AAD_REFERENCE: &str = r#"
 import base64, json, os, sys
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM

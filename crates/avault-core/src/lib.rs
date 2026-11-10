@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 mod blind_box;
+mod ed25519;
 mod signing;
 mod verifying;
 
@@ -33,9 +34,15 @@ pub use blind_box::{
     derive_blind_box_keypair_from_master, generate_blind_box_keypair, BlindBox, BlindBoxContext,
     BlindBoxKeypair, BLIND_BOX_AAD_DOMAIN, BLIND_BOX_HPKE_INFO, BLIND_BOX_SCHEME,
 };
+pub use ed25519::{
+    ed25519_public_key, generate_ed25519_keypair, import_solana_base58, import_solana_cli_json,
+    import_solana_secret_key, sign_ed25519, solana_address, Ed25519Keypair,
+    ED25519_PUBLIC_KEY_BYTES, ED25519_SEED_BYTES, MAX_ED25519_MESSAGE_BYTES,
+    SOLANA_SECRET_KEY_BYTES,
+};
 pub use signing::{
     LocalSignerProvider, SignatureResult, SignatureScheme, SignerProvider,
-    SIGN_SCHEME_ECDSA_SECP256K1_DER, SIGN_SCHEME_ECDSA_SECP256K1_RECOVERABLE,
+    SIGN_SCHEME_ECDSA_SECP256K1_DER, SIGN_SCHEME_ECDSA_SECP256K1_RECOVERABLE, SIGN_SCHEME_ED25519,
     SIGN_SCHEME_SCHNORR_SECP256K1_BIP340, SIGN_SCHEME_SCHNORR_SECP256K1_BIP341_KEYPATH,
 };
 pub use verifying::verify_ecdsa_secp256k1_der;

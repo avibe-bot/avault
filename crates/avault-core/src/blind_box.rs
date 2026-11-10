@@ -63,6 +63,11 @@ impl BlindBoxContext {
         Self::new(BLIND_BOX_PURPOSE_SEAL, name)
     }
 
+    /// Context for a standard Ed25519/Solana keypair import.
+    pub fn keypair_import(name: &str, curve: &str, format: &str) -> Self {
+        Self::new("keypair-import", name).with_scheme(&format!("{curve}:{format}"))
+    }
+
     /// Context for an agent grant that caches a delivery DEK under a grant id.
     pub fn agent_deliver(grant_id: &str, name: &str) -> Self {
         Self::new(BLIND_BOX_PURPOSE_AGENT_DELIVER, name).with_grant_id(grant_id)
@@ -95,6 +100,11 @@ impl BlindBoxContext {
 
     fn with_grant_id(mut self, grant_id: &str) -> Self {
         self.grant_id = Some(grant_id.to_string());
+        self
+    }
+
+    fn with_scheme(mut self, scheme: &str) -> Self {
+        self.sign_scheme = Some(scheme.to_string());
         self
     }
 

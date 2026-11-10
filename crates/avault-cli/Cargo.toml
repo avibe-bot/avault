@@ -32,3 +32,5 @@ k256.workspace = true
 aes-gcm.workspace = true
 hpke.workspace = true
 sha2.workspace = true
+ed25519-dalek.workspace = true
+bs58.workspace = true

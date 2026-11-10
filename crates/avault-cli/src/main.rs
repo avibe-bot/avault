@@ -92,6 +92,8 @@ USAGE:
     avault key export
     avault key import [--force]
     avault key authorize
+    avault keypair generate --name NAME --curve ed25519
+    avault keypair import --name NAME --curve ed25519 --format solana-cli-json|base58-secret [--blind-box]
     avault pubkey
     avault sign < sign-request.json
     avault verify < verify-request.json
@@ -172,6 +174,7 @@ fn run(args: Vec<OsString>) -> anyhow::Result<u8> {
         "seal" => seal_cmd(&args[1..], &config, &mut stdin),
         "deliver" => deliver_cmd(&args[1..], &config, &mut stdin),
         "key" => key_cmd(&args[1..], &config, &mut stdin),
+        "keypair" => keypair_cmd(&args[1..], &config, &mut stdin),
         "pubkey" => pubkey_cmd(&args[1..], &config, &mut stdin),
         "sign" => sign_cmd(&args[1..], &config, &mut stdin),
         // Keyless: `verify` is not given the store selection, so it cannot reach a store.
@@ -397,7 +400,10 @@ fn pubkey_cmd(args: &[OsString], config: &CliConfig, input: &mut impl Read) -> a
 struct SignInput {
     name: String,
     key_envelope: Sealed,
-    digest: String,
+    #[serde(default)]
+    digest: Option<String>,
+    #[serde(default)]
+    message_hex: Option<String>,
     scheme: String,
     #[serde(default)]
     dek_blindbox: Option<BlindBox>,
@@ -419,8 +425,26 @@ fn sign_cmd(args: &[OsString], config: &CliConfig, input: &mut impl Read) -> any
     let input = read_json_input(input, "failed to read sign JSON from stdin")?;
     let request: SignInput =
         serde_json::from_slice(input.as_slice()).context("sign JSON is invalid")?;
-    let digest = decode_hex_32(&request.digest, "digest")?;
     let scheme = SignatureScheme::from_str(&request.scheme)?;
+    let (digest, message) = match scheme {
+        SignatureScheme::Ed25519 => {
+            if request.digest.is_some() {
+                bail!("--digest is not valid for ed25519; use --message-hex");
+            }
+            let message_hex = request
+                .message_hex
+                .as_deref()
+                .context("ed25519 requires message_hex")?;
+            (None, Some(decode_hex_message(message_hex)?))
+        }
+        _ => {
+            if request.message_hex.is_some() {
+                bail!("message_hex is only valid for ed25519");
+            }
+            let digest = request.digest.as_deref().context("digest is required")?;
+            (Some(decode_hex_32(digest, "digest")?), None)
+        }
+    };
 
     reject_one_shot_protected_fields(request.dek_blindbox.as_ref(), request.approval.as_ref())?;
     let master = load_existing_master_from_unlock(&unlock)?;
@@ -428,7 +452,11 @@ fn sign_cmd(args: &[OsString], config: &CliConfig, input: &mut impl Read) -> any
         .context("key envelope open failed")?;
     drop(master);
     drop(unlock);
-    let output = sign_digest_with_key(scheme, &digest, key_plaintext)?;
+    let output = match (digest, message) {
+        (Some(digest), None) => sign_digest_with_key(scheme, &digest, key_plaintext)?,
+        (None, Some(message)) => sign_message_with_key(scheme, &message, key_plaintext)?,
+        _ => unreachable!("scheme input validation must select one signing input"),
+    };
     serde_json::to_writer(io::stdout(), &output).context("failed to write signature JSON")?;
     println!();
     Ok(0)
@@ -526,6 +554,32 @@ fn verify_request(input: &[u8]) -> anyhow::Result<bool> {
 /// dropped: the message says which field is malformed, never what it contained.
 fn decode_verify_hex(text: &str, label: &str) -> anyhow::Result<Vec<u8>> {
     hex::decode(text).map_err(|_| anyhow!("{label} is not valid hex"))
+}
+
+fn sign_message_with_key(
+    scheme: SignatureScheme,
+    message: &[u8],
+    key_plaintext: Zeroizing<Vec<u8>>,
+) -> anyhow::Result<SignOutput> {
+    let mut private_key = zeroizing_vec_to_key32(key_plaintext, "signing key")?;
+    let signer = LocalSignerProvider;
+    let result = signer
+        .sign_message(scheme, &private_key, message)
+        .context("signing failed")?;
+    private_key.zeroize();
+    drop(private_key);
+    Ok(SignOutput {
+        signature: hex::encode(result.signature),
+        recovery_id: result.recovery_id,
+    })
+}
+
+fn decode_hex_message(text: &str) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+    let bytes = hex::decode(text).context("message_hex is not valid hex")?;
+    if bytes.len() > avault_core::MAX_ED25519_MESSAGE_BYTES {
+        bail!("message_hex exceeds the 1 MiB limit");
+    }
+    Ok(Zeroizing::new(bytes))
 }
 
 fn decode_hex_32(text: &str, label: &str) -> anyhow::Result<[u8; 32]> {
@@ -1808,6 +1862,196 @@ fn key_cmd(args: &[OsString], config: &CliConfig, input: &mut impl Read) -> anyh
     }
 }
 
+fn keypair_cmd(args: &[OsString], config: &CliConfig, input: &mut impl Read) -> anyhow::Result<u8> {
+    let Some(subcmd) = args.first().and_then(|s| s.to_str()) else {
+        bail!("missing keypair subcommand");
+    };
+    match subcmd {
+        "generate" => keypair_generate_cmd(&args[1..], config, input),
+        "import" => keypair_import_cmd(&args[1..], config, input),
+        other => bail!("unknown keypair subcommand: {other}"),
+    }
+}
+
+#[derive(Debug)]
+struct KeypairOptions {
+    name: String,
+    curve: String,
+    format: Option<String>,
+    blind_box: bool,
+}
+
+fn parse_keypair_options(args: &[OsString]) -> anyhow::Result<KeypairOptions> {
+    let mut name = None;
+    let mut curve = None;
+    let mut format = None;
+    let mut blind_box = false;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index]
+            .to_str()
+            .context("keypair options must be valid UTF-8")?;
+        match flag {
+            "--name" => {
+                if name.is_some() {
+                    bail!("--name was provided more than once");
+                }
+                name = Some(
+                    args.get(index + 1)
+                        .and_then(|value| value.to_str())
+                        .context("--name requires a value")?
+                        .to_string(),
+                );
+                index += 2;
+            }
+            "--curve" => {
+                if curve.is_some() {
+                    bail!("--curve was provided more than once");
+                }
+                curve = Some(
+                    args.get(index + 1)
+                        .and_then(|value| value.to_str())
+                        .context("--curve requires a value")?
+                        .to_string(),
+                );
+                index += 2;
+            }
+            "--format" => {
+                if format.is_some() {
+                    bail!("--format was provided more than once");
+                }
+                format = Some(
+                    args.get(index + 1)
+                        .and_then(|value| value.to_str())
+                        .context("--format requires a value")?
+                        .to_string(),
+                );
+                index += 2;
+            }
+            "--blind-box" => {
+                if blind_box {
+                    bail!("--blind-box was provided more than once");
+                }
+                blind_box = true;
+                index += 1;
+            }
+            other => bail!("unknown keypair option: {other}"),
+        }
+    }
+    Ok(KeypairOptions {
+        name: name.context("--name is required")?,
+        curve: curve.context("--curve is required")?,
+        format,
+        blind_box,
+    })
+}
+
+#[derive(Debug, Serialize)]
+struct KeypairOutput {
+    envelope: Sealed,
+    curve: String,
+    chain: String,
+    public_key: String,
+    address: String,
+}
+
+fn keypair_generate_cmd(
+    args: &[OsString],
+    config: &CliConfig,
+    input: &mut impl Read,
+) -> anyhow::Result<u8> {
+    let options = parse_keypair_options(args)?;
+    if options.curve != "ed25519" {
+        bail!("unsupported keypair curve");
+    }
+    if options.format.is_some() || options.blind_box {
+        bail!("keypair generate does not accept --format or --blind-box");
+    }
+    let unlock = read_store_unlock(config, input)?;
+    let master = load_or_create_master_from_unlock(&unlock)?;
+    let keypair = avault_core::generate_ed25519_keypair();
+    let public_key = keypair.public_key();
+    let address = keypair.address();
+    let seed = keypair.into_seed();
+    let envelope = avault_core::seal(master.as_bytes(), &options.name, seed.as_ref())
+        .context("keypair envelope seal failed")?;
+    drop(master);
+    drop(unlock);
+    let output = KeypairOutput {
+        envelope,
+        curve: "ed25519".to_string(),
+        chain: "solana".to_string(),
+        public_key: hex::encode(public_key),
+        address,
+    };
+    serde_json::to_writer(io::stdout(), &output).context("failed to write keypair JSON")?;
+    println!();
+    Ok(0)
+}
+
+fn keypair_import_cmd(
+    args: &[OsString],
+    config: &CliConfig,
+    input: &mut impl Read,
+) -> anyhow::Result<u8> {
+    let options = parse_keypair_options(args)?;
+    if options.curve != "ed25519" {
+        bail!("unsupported keypair curve");
+    }
+    let format = options.format.context("--format is required")?;
+    if !matches!(format.as_str(), "solana-cli-json" | "base58-secret") {
+        bail!("unsupported Solana keypair import format");
+    }
+    let unlock = read_store_unlock(config, input)?;
+    let mut raw_input = read_stdin_zeroizing_from(input)
+        .context("failed to read Solana keypair import from stdin")?;
+    let master = if options.blind_box {
+        let blind_box: BlindBox = serde_json::from_slice(raw_input.as_slice())
+            .context("keypair blind-box JSON is invalid")?;
+        let master = load_existing_master_from_unlock(&unlock)?;
+        let receiver = avault_core::derive_blind_box_keypair_from_master(master.as_bytes());
+        let opened = receiver
+            .open(
+                &blind_box,
+                &BlindBoxContext::keypair_import(&options.name, "ed25519", &format),
+            )
+            .context("keypair blind-box open failed")?;
+        raw_input.zeroize();
+        raw_input = opened;
+        master
+    } else {
+        load_or_create_master_from_unlock(&unlock)?
+    };
+    let keypair = match format.as_str() {
+        "solana-cli-json" => avault_core::import_solana_cli_json(raw_input.as_slice()),
+        "base58-secret" => {
+            let text = std::str::from_utf8(raw_input.as_slice())
+                .context("base58 Solana secret key must be UTF-8")?;
+            avault_core::import_solana_base58(text)
+        }
+        _ => unreachable!("format validated above"),
+    }
+    .context("Solana keypair import failed")?;
+    raw_input.zeroize();
+    let public_key = keypair.public_key();
+    let address = keypair.address();
+    let seed = keypair.into_seed();
+    let envelope = avault_core::seal(master.as_bytes(), &options.name, seed.as_ref())
+        .context("keypair envelope seal failed")?;
+    drop(master);
+    drop(unlock);
+    let output = KeypairOutput {
+        envelope,
+        curve: "ed25519".to_string(),
+        chain: "solana".to_string(),
+        public_key: hex::encode(public_key),
+        address,
+    };
+    serde_json::to_writer(io::stdout(), &output).context("failed to write keypair JSON")?;
+    println!();
+    Ok(0)
+}
+
 fn key_export_cmd(config: &CliConfig, input: &mut impl Read) -> anyhow::Result<u8> {
     let unlock = read_store_unlock(config, input)?;
     let mut passphrase =
@@ -3015,6 +3259,12 @@ fn handle_agent_frame_inner(
                     }
                     AgentDekPurpose::Sign => {
                         let scheme = dek.scheme.context("sign grant DEK requires scheme")?;
+                        let parsed_scheme = SignatureScheme::from_str(&scheme)?;
+                        if parsed_scheme == SignatureScheme::Ed25519 {
+                            bail!(
+                                "protected ed25519 signing is not supported yet; use standard sign"
+                            );
+                        }
                         let digest_hex = dek.digest.context("sign grant DEK requires digest")?;
                         let digest = decode_hex_32(&digest_hex, "digest")?;
                         let digest_key_hex = hex::encode(digest);
@@ -3156,8 +3406,11 @@ fn handle_agent_frame_inner(
         }
         AgentRequest::Sign(request) => {
             let scope = grant_key_from_id(request.grant_id)?;
-            let digest = decode_hex_32(&request.digest, "digest")?;
             let scheme = SignatureScheme::from_str(&request.scheme)?;
+            if scheme == SignatureScheme::Ed25519 {
+                bail!("protected ed25519 signing is not supported yet; use standard sign");
+            }
+            let digest = decode_hex_32(&request.digest, "digest")?;
             let key_plaintext = open_with_grant(agent, &scope, false, |grant, _| {
                 open_signing_key_with_grant(
                     &request.name,
