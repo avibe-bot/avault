@@ -463,6 +463,34 @@ mod tests {
     }
 
     #[test]
+    fn keypair_import_context_binds_curve_and_format() {
+        let keypair = derive_blind_box_keypair_from_master(&MASTER_KEY);
+        let context = BlindBoxContext::keypair_import("SOLANA_KEY", "ed25519", "base58-secret");
+        let blind_box = seal_blind_box_for_tests(
+            &keypair.public_key_b64(),
+            b"base58 secret",
+            [0x43u8; KEY_BYTES],
+            &context,
+        )
+        .unwrap();
+        assert_eq!(
+            keypair.open(&blind_box, &context).unwrap().as_slice(),
+            b"base58 secret"
+        );
+        assert!(keypair
+            .open(
+                &blind_box,
+                &BlindBoxContext::keypair_import("SOLANA_KEY", "ed25519", "solana-cli-json"),
+            )
+            .is_err());
+        assert!(keypair
+            .open(
+                &blind_box,
+                &BlindBoxContext::keypair_import("SOLANA_KEY", "secp256k1", "base58-secret"),
+            )
+            .is_err());
+    }
+    #[test]
     fn rejects_wrong_blind_box_context() {
         let keypair = derive_blind_box_keypair_from_master(&MASTER_KEY);
         let context = BlindBoxContext::agent_sign(
