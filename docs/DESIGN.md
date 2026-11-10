@@ -75,7 +75,7 @@ Forking it means inheriting the macOS shell we would rip out, while still rebuil
 - Cross-platform (macOS / Linux / headless), local-first.
 - Two explicit trust roots selectable per secret.
 - Integrate as a `vibe runtime prepare` dependency, mirroring `askill`.
-- An ETH-first signer with a path to hardware/external signers.
+- An ETH/BTC-first signer with exact-message Ed25519/Solana support and a path to hardware/external signers.
 
 **Non-goals (now)**
 
@@ -414,20 +414,21 @@ This is an internal store selection inside `avault`, not an Avibe-level plugin l
 | **P0** | Python standard tier: DB + envelope + delivery + `$<NAME>` (#631) | superseded by P1 |
 | **P1 / P1.1** | `avault-core` + CLI + cross-platform file store; Rust takes standard-tier seal/open + `deliver run`/`fetch`/`inject`; `vibe runtime prepare` ensure + Dependencies card. Closes the memory-hygiene gap. | done |
 | **P2 — the final trust model, in one shot (no P3)** | Delivered as one reviewed avault re-submission after the unreviewed Phase A/B merges were reverted; nothing ships as a half-released transition state. | in review |
-| · **Phase A** | HPKE blind-box `open` / `open_with_dek`, `pubkey`, `seal --blind-box`, secp256k1 digest signing (`ecdsa-secp256k1-recoverable` = ETH, `ecdsa-secp256k1-der` = BTC legacy/SegWit, `schnorr-secp256k1-bip340` = raw BIP340 compatibility, `schnorr-secp256k1-bip341-keypath` = BIP86 empty-tree key path), `SignerProvider` seam, pinned JSON contracts (Appendix C). | in review |
+| · **Phase A** | HPKE blind-box `open` / `open_with_dek`, `pubkey`, `seal --blind-box`, standard Ed25519/Solana keypair generation/import and exact-message signing, secp256k1 digest signing (`ecdsa-secp256k1-recoverable` = ETH, `ecdsa-secp256k1-der` = BTC legacy/SegWit, `schnorr-secp256k1-bip340` = raw BIP340 compatibility, `schnorr-secp256k1-bip341-keypath` = BIP86 empty-tree key path), `SignerProvider` seam, pinned JSON contracts (Appendix C). | in review |
 | · **Phase B** | Resident agent: unix socket + `SO_PEERCRED` / `LOCAL_PEERCRED`, fresh in-memory receiver keypair, grant-id DEK-cache (strict TTL + idle-zeroize), signing oracle; protected-tier `deliver` (browser-released DEK blind box). | in review |
 | · **Phase C** | `file + passphrase` master store (passphrase-wrapped master, unlock once at startup). | in review |
 | · **avibe + browser** | Same one-shot P2, separate tracks. Python: protected create/resolve, blind-box create relay, grant-id approvals, approval / secure-input cards, signing relay. Browser: HPKE seal, VMK/DEK with passkey-PRF + password, browser ETH/BTC signing. | in progress |
-| **Plugin seams** (not a phase) | Additional hardware stores (Secure Enclave / TPM / KMS), external signers (hardware wallet / WalletConnect), MPC, and other curves (e.g. ed25519) — drop in behind the `KeyStore` / `SignerProvider` traits when the need or hardware is real. Adding one is a plugin, never a migration or a released transition. | as needed |
+| **Plugin seams** (not a phase) | Additional hardware stores (Secure Enclave / TPM / KMS), external signers (hardware wallet / WalletConnect), MPC, and curves other than the now-supported secp256k1/Ed25519 families — drop in behind the `KeyStore` / `SignerProvider` traits when the need or hardware is real. Adding one is a plugin, never a migration or a released transition. | as needed |
 
 **P2 is the entire final Vaults trust model, built in one shot — there is no separate P3
 and no half-released transition state.** It lands as reviewable sub-phases (avault A/B/C
 plus the avibe Python and browser tracks) that compose into the final design. The
 standard-create transient-plaintext-in-Python residual (§11.3) is eliminated by the
-blind-box create path (Phase A). Curves this round are **secp256k1** (ETH + BTC); ed25519
-is a direct local add when a chain needs it, not a plugin. The one-shot CLI derives its
-blind-box receiver key from the master (HKDF, domain-separated); the resident agent uses a
-fresh in-memory receiver keypair that the browser pins/attests (§11.4).
+blind-box create path (Phase A). Curves this round are **secp256k1** (ETH + BTC) and **Ed25519**
+(Solana standard tier); protected Solana creation/signing remains out until a trusted
+transaction context exists. The one-shot CLI derives its blind-box receiver key from the
+master (HKDF, domain-separated); the resident agent uses a fresh in-memory receiver keypair
+that the browser pins/attests (§11.4).
 
 ---
 
@@ -506,16 +507,13 @@ These are starting recommendations, not frozen choices — items #2 (envelope) a
 | `pubkey` | — | X25519 public key + fingerprint | one-shot `pubkey` supports blind-box create; protected DEK release uses the resident agent's ephemeral `pubkey` frame |
 | `seal` | blind box (the value) + name/scheme | envelope `{ciphertext, nonce, wrap_meta}` | standard-tier create: open box → wrap DEK under master → return ciphertext (never plaintext). The CLI plaintext-stdin path remains for local `set` / fd passthrough. |
 | `deliver` | envelope + mode (`run` / `fetch` / `inject`) | exit code / response body / written file | one-shot standard-tier delivery uses the master key; protected delivery uses resident-agent grants, never inline DEK boxes |
-| `sign` | key envelope + name + 32-byte digest + scheme | signature (public) | one-shot standard-tier signing; protected signing uses resident-agent grants. The private key never leaves `avault` |
+| `keypair generate` / `keypair import` | curve + name; import bytes or blind box | sealed key envelope + public metadata | standard-tier key creation/import; v1 supports `ed25519` / Solana only, with no export or protected-tier creation |
+| `sign` | key envelope + name + digest or exact message + scheme | signature (public) | one-shot standard-tier signing; protected signing uses resident-agent grants for supported secp256k1 schemes. The private key never leaves `avault` |
 | `verify` | public key + 32-byte digest + DER signature + scheme, all public | `{"valid": true}` / `{"valid": false}` | keyless check of a signature someone else produced (Avibe's signed Model Hub engine index). Touches no store and no key |
 | `key export` / `key import` | passphrase (stdin; if `--store file-passphrase`, first stdin line unlocks the store) | encrypted backup / ok | back up, migrate, restore the master key |
 | `key authorize` | — (if `--store file-passphrase`, first stdin line unlocks the store) | ok | the only verb that may show macOS Keychain UI: lets the user grant this binary access to the existing master key. Never creates a key; on other stores it only verifies the key loads |
 
-Phase A implements the core blind-box opener and secp256k1 signer plus one-shot CLI
-verbs. Phase B adds the resident agent transport plus `grant` / `release`: cache a
-grant's DEK-set for a TTL so repeated uses in-window skip re-unlock. Signing is
-chain-agnostic: callers provide the exact 32-byte digest/sighash and select the
-signature encoding.
+Phase A implements the core blind-box opener, standard Ed25519/Solana keypair generation/import, and one-shot CLI verbs. Phase B adds the resident agent transport plus `grant` / `release`: cache a grant's DEK-set for a TTL so repeated uses in-window skip re-unlock. Signing is chain-agnostic: callers provide the exact 32-byte digest/sighash for secp256k1, or exact serialized message bytes for Ed25519; protected Ed25519/Solana signing is rejected until a trusted transaction context exists.
 
 `verify` is the one verb that handles no secret: its inputs and its output are public,
 and it never reaches a store (Public signature verification, below).
@@ -570,11 +568,15 @@ master-derived and therefore not ephemeral. Current `purpose` and
 | Operation | `purpose` | Required AAD context | `operation_hash` fields |
 |---|---|---|---|
 | `seal --blind-box` | `seal` | `name` | empty |
+| keypair import | `keypair-import` | `name`, `curve`, `format` | empty |
 | agent delivery grant | `agent-deliver` | `grant_id`, `name`, approval, `ttl_secs` | `"agent-deliver"`, name, `ttl_secs_u64_be` |
 | agent signing grant | `agent-sign` | `grant_id`, `name`, `sign_scheme`, `digest`, approval, `ttl_secs` | `"agent-sign"`, scheme, raw 32-byte digest, `ttl_secs_u64_be` |
 
-These values and example AAD bytes are pinned in
-`tests/vectors/p2_core_crypto.json`.
+For `keypair-import`, `curve` and `format` occupy the existing `sign_scheme`
+field as the UTF-8 string `ed25519:solana-cli-json` or `ed25519:base58-secret`;
+no new AAD fields are appended. `grant_id`, the reserved field, `digest`,
+approval fields, and `operation_hash` are empty. These values and example AAD
+bytes are pinned in `tests/vectors/p2_core_crypto.json`.
 
 `pubkey` emits:
 
@@ -593,6 +595,30 @@ HKDF and drops it after each operation. The derived private key is still never
 written or returned; the public key is stable for that master key and is only for
 the blind-box create path. Protected-tier DEK releases must use the resident
 agent's ephemeral `pubkey` frame.
+
+`keypair generate --name NAME --curve ed25519` creates a standard-tier Solana
+keypair, seals the 32-byte seed under the machine master, and returns only:
+
+```json
+{
+  "envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." },
+  "curve": "ed25519",
+  "chain": "solana",
+  "public_key": "<64 lowercase hex characters>",
+  "address": "<base58 Solana address>"
+}
+```
+
+`keypair import --name NAME --curve ed25519 --format solana-cli-json|base58-secret`
+accepts exactly 64 bytes in Solana CLI JSON or a base58 string decoding to the
+same 64-byte seed+public-key secret. The JSON input is bounded to 4096 bytes;
+the trimmed base58 input is bounded to 88 characters before decoding. Both
+decoders write directly to a fixed-size zeroizing buffer, including on partial
+parse failure. The trailing public key must match the seed-derived public key.
+With `--blind-box`, the input is HPKE-sealed and the
+AAD binds the name, curve, and format; plaintext secret bytes never leave
+`avault`. Mnemonics, derivation paths, raw 32-byte user imports, other curves,
+and export are rejected. Protected Solana key creation is not supported.
 
 `seal --name NAME --blind-box` reads a blind box from stdin:
 
@@ -623,19 +649,25 @@ envelopes authenticate value ciphertext with AAD
 
 ```json
 {
-  "name": "ETH_SIGNING_KEY",
+  "name": "SOLANA_SIGNING_KEY",
   "key_envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." },
-  "digest": "<lowercase or uppercase hex 32-byte digest>",
-  "scheme": "ecdsa-secp256k1-recoverable"
+  "message_hex": "<lowercase or uppercase hex serialized Solana message>",
+  "scheme": "ed25519"
 }
 ```
 
-`name` is required because it is the AAD name for `key_envelope`; omitting it would
+For existing secp256k1 schemes the request instead contains `digest` with an
+exactly 32-byte hex digest. `ed25519` requires `message_hex` and rejects
+`digest` with a hint to use `message_hex`; the bytes are signed directly and
+are never hashed or truncated. The message is bounded to 1 MiB at the CLI/core
+boundary. `name` is required because it is the AAD name for `key_envelope`; omitting it would
 remove the envelope transplant protection. One-shot `sign` is standard-tier only:
 it unwraps the key envelope with the machine master key and rejects
 `dek_blindbox` / `approval` fields. Protected signing uses the resident agent's
-`grant` + `sign` frames; protected DEK opens require the browser's protected-record
-v2 JSON AAD reconstructed from `wrap_meta.record_meta`, `scheme`, and `v` (with a
+`grant` + `sign` frames for supported secp256k1 schemes; protected Ed25519/Solana
+signing is rejected before a request is opened until a trusted transaction context
+exists. Protected DEK opens require the browser's protected-record v2 JSON AAD
+reconstructed from `wrap_meta.record_meta`, `scheme`, and `v` (with a
 legacy `name || "machine-aesgcm-v1" || 0x01` fallback for pre-v2 envelopes) and
 never take the P0 empty-AAD read-compatibility fallback.
 
@@ -647,6 +679,7 @@ Supported `scheme` values:
 | `ecdsa-secp256k1-der` | exactly 32 bytes, caller-computed | hex DER-encoded ECDSA signature | `null` |
 | `schnorr-secp256k1-bip340` | exactly 32 bytes, caller-computed | hex 64-byte raw BIP340 Schnorr signature | `null` |
 | `schnorr-secp256k1-bip341-keypath` | exactly 32 bytes, caller-computed | hex 64-byte BIP86 key-path Schnorr signature for the empty script tree | `null` |
+| `ed25519` | exact serialized message bytes in `message_hex`, maximum 1 MiB | hex 64-byte pure Ed25519 signature | `null` |
 
 Output:
 

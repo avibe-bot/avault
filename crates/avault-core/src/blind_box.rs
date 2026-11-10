@@ -63,6 +63,11 @@ impl BlindBoxContext {
         Self::new(BLIND_BOX_PURPOSE_SEAL, name)
     }
 
+    /// Context for a standard Ed25519/Solana keypair import.
+    pub fn keypair_import(name: &str, curve: &str, format: &str) -> Self {
+        Self::new("keypair-import", name).with_scheme(&format!("{curve}:{format}"))
+    }
+
     /// Context for an agent grant that caches a delivery DEK under a grant id.
     pub fn agent_deliver(grant_id: &str, name: &str) -> Self {
         Self::new(BLIND_BOX_PURPOSE_AGENT_DELIVER, name).with_grant_id(grant_id)
@@ -95,6 +100,11 @@ impl BlindBoxContext {
 
     fn with_grant_id(mut self, grant_id: &str) -> Self {
         self.grant_id = Some(grant_id.to_string());
+        self
+    }
+
+    fn with_scheme(mut self, scheme: &str) -> Self {
+        self.sign_scheme = Some(scheme.to_string());
         self
     }
 
@@ -404,6 +414,12 @@ mod tests {
                         hex::decode(digest_hex).unwrap().try_into().unwrap();
                     BlindBoxContext::agent_sign(grant_id, name, sign_scheme, &digest)
                 }
+                "keypair-import" => {
+                    let (curve, format) = sign_scheme
+                        .split_once(':')
+                        .expect("keypair-import sign_scheme must contain curve and format");
+                    BlindBoxContext::keypair_import(name, curve, format)
+                }
                 _ => panic!("unexpected blind-box AAD vector purpose"),
             };
             if let Some(nonce_hex) = case["approval_nonce_hex"]
@@ -450,6 +466,62 @@ mod tests {
             }
             assert_eq!(hex::encode(context.aad_bytes()), case["aad_hex"]);
         }
+    }
+
+    #[test]
+    fn keypair_import_context_binds_curve_and_format() {
+        let keypair = derive_blind_box_keypair_from_master(&MASTER_KEY);
+        let context = BlindBoxContext::keypair_import("SOLANA_KEY", "ed25519", "base58-secret");
+        let blind_box = seal_blind_box_for_tests(
+            &keypair.public_key_b64(),
+            b"base58 secret",
+            [0x43u8; KEY_BYTES],
+            &context,
+        )
+        .unwrap();
+        assert_eq!(
+            keypair.open(&blind_box, &context).unwrap().as_slice(),
+            b"base58 secret"
+        );
+        assert!(keypair
+            .open(
+                &blind_box,
+                &BlindBoxContext::keypair_import("SOLANA_KEY", "ed25519", "solana-cli-json"),
+            )
+            .is_err());
+        assert!(keypair
+            .open(
+                &blind_box,
+                &BlindBoxContext::keypair_import("SOLANA_KEY", "secp256k1", "base58-secret"),
+            )
+            .is_err());
+    }
+    #[test]
+    fn opens_known_answer_keypair_import_blind_box_vector() {
+        let vector: serde_json::Value =
+            serde_json::from_str(include_str!("../../../tests/vectors/p2_core_crypto.json"))
+                .unwrap();
+        let blind = &vector["keypair_import_blind_box"];
+        assert_eq!(blind["scheme"], BLIND_BOX_SCHEME);
+        assert_eq!(
+            blind["hpke_info_utf8"],
+            std::str::from_utf8(BLIND_BOX_HPKE_INFO).unwrap()
+        );
+        assert_eq!(blind["aad_domain_utf8"], "avault:blind-box:aad:v1");
+        let master_key = hex::decode(blind["master_key_hex"].as_str().unwrap()).unwrap();
+        let master_key: [u8; KEY_BYTES] = master_key.try_into().unwrap();
+        let keypair = derive_blind_box_keypair_from_master(&master_key);
+        assert_eq!(keypair.public_key_b64(), blind["public_key"]);
+        assert_eq!(keypair.fingerprint_hex(), blind["fingerprint"]);
+        let blind_box: BlindBox = serde_json::from_value(blind["box"].clone()).unwrap();
+        let context = BlindBoxContext::keypair_import(
+            blind["context"]["name"].as_str().unwrap(),
+            blind["context"]["curve"].as_str().unwrap(),
+            blind["context"]["format"].as_str().unwrap(),
+        );
+        assert_eq!(hex::encode(context.aad_bytes()), blind["aad_hex"]);
+        let opened = keypair.open(&blind_box, &context).unwrap();
+        assert_eq!(hex::encode(opened.as_slice()), blind["plaintext_hex"]);
     }
 
     #[test]

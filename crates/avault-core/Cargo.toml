@@ -23,6 +23,8 @@ scrypt.workspace = true
 hpke.workspace = true
 x25519-dalek.workspace = true
 k256.workspace = true
+ed25519-dalek.workspace = true
+bs58.workspace = true
 hex.workspace = true
 
 [dev-dependencies]
