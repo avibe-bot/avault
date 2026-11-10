@@ -11,6 +11,9 @@
 //!
 //! Invariant: plaintext only flows *in*; this crate returns ciphertext, signatures, or
 //! `Zeroizing` buffers that the caller delivers — it never hands plaintext back to Python.
+//!
+//! `verifying` is the one keyless path: it checks a public signature against a public key
+//! and digest and returns only whether it verifies.
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
@@ -24,6 +27,7 @@ use zeroize::Zeroizing;
 
 mod blind_box;
 mod signing;
+mod verifying;
 
 pub use blind_box::{
     derive_blind_box_keypair_from_master, generate_blind_box_keypair, BlindBox, BlindBoxContext,
@@ -34,6 +38,7 @@ pub use signing::{
     SIGN_SCHEME_ECDSA_SECP256K1_DER, SIGN_SCHEME_ECDSA_SECP256K1_RECOVERABLE,
     SIGN_SCHEME_SCHNORR_SECP256K1_BIP340, SIGN_SCHEME_SCHNORR_SECP256K1_BIP341_KEYPATH,
 };
+pub use verifying::verify_ecdsa_secp256k1_der;
 
 /// Wrap-meta scheme tag used by the P0 Python standard-tier envelope.
 pub const WRAP_SCHEME: &str = "machine-aesgcm-v1";
