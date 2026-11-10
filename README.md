@@ -41,6 +41,9 @@ avault key import [--force] < import-request.json
 avault key authorize
 avault pubkey
 avault seal --name OPENAI_API_KEY --blind-box < blind-box.json
+avault keypair generate --name CHANNEL_SIGNING_KEY --curve secp256k1
+avault keypair generate --name SOLANA_SIGNING_KEY --curve ed25519
+avault keypair import --name SOLANA_SIGNING_KEY --curve ed25519 --format solana-cli-json < solana-key.json
 avault sign < sign-request.json
 avault verify < verify-request.json
 ```
@@ -199,6 +202,34 @@ single-use until their approval expiry.
 The one-shot CLI derives the receiver keypair from the local master key so `pubkey`
 and `seal --blind-box` work across processes without persisting a new private key;
 that master-derived key is for blind-box create only, not protected DEK release.
+
+`keypair generate --name NAME --curve secp256k1` generates a standard-tier
+signing key entirely inside avault, using k256 and the OS CSPRNG. It seals the
+raw 32-byte scalar under the existing master key and record-name AAD, returning
+only:
+
+```json
+{
+  "envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." },
+  "curve": "secp256k1",
+  "public_key": "<66 lowercase hex characters: compressed SEC1 public key>"
+}
+```
+
+This is a chain-neutral key, not necessarily a wallet: `chain` and `address` are
+omitted, not null. The envelope works with existing `sign`; use
+`ecdsa-secp256k1-der` and a caller-computed domain-separated digest for the keyless
+`verify` contract below. The raw key never leaves avault, and signing with the
+wrong record name fails. There is no secp256k1 private-key import/export,
+mnemonic, derivation path, seed/RNG flag, or new protected-tier generation path.
+Only the signer needs a release containing key generation; v0.1.10 verification
+clients remain compatible.
+
+Existing `keypair generate --curve ed25519` and `keypair import --curve ed25519`
+retain their Solana response: `{envelope, curve, chain, public_key, address}` with
+`curve: "ed25519"`, `chain: "solana"`, a 32-byte hex public key and base58 address.
+Import supports `solana-cli-json` and `base58-secret` (64-byte seed + public key),
+optionally `--blind-box`; see `docs/DESIGN.md` Appendix C.
 
 `sign` reads:
 

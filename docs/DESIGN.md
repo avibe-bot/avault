@@ -507,7 +507,7 @@ These are starting recommendations, not frozen choices — items #2 (envelope) a
 | `pubkey` | — | X25519 public key + fingerprint | one-shot `pubkey` supports blind-box create; protected DEK release uses the resident agent's ephemeral `pubkey` frame |
 | `seal` | blind box (the value) + name/scheme | envelope `{ciphertext, nonce, wrap_meta}` | standard-tier create: open box → wrap DEK under master → return ciphertext (never plaintext). The CLI plaintext-stdin path remains for local `set` / fd passthrough. |
 | `deliver` | envelope + mode (`run` / `fetch` / `inject`) | exit code / response body / written file | one-shot standard-tier delivery uses the master key; protected delivery uses resident-agent grants, never inline DEK boxes |
-| `keypair generate` / `keypair import` | curve + name; import bytes or blind box | sealed key envelope + public metadata | standard-tier key creation/import; v1 supports `ed25519` / Solana only, with no export or protected-tier creation |
+| `keypair generate` / `keypair import` | curve + name; import bytes or blind box | sealed key envelope + public metadata | standard-tier generation for `ed25519` / Solana and chain-neutral `secp256k1`; import remains Ed25519-only, with no private-key export or protected-tier creation |
 | `sign` | key envelope + name + digest or exact message + scheme | signature (public) | one-shot standard-tier signing; protected signing uses resident-agent grants for supported secp256k1 schemes. The private key never leaves `avault` |
 | `verify` | public key + 32-byte digest + DER signature + scheme, all public | `{"valid": true}` / `{"valid": false}` | keyless check of a signature someone else produced (Avibe's signed Model Hub engine index). Touches no store and no key |
 | `key export` / `key import` | passphrase (stdin; if `--store file-passphrase`, first stdin line unlocks the store) | encrypted backup / ok | back up, migrate, restore the master key |
@@ -608,6 +608,37 @@ keypair, seals the 32-byte seed under the machine master, and returns only:
   "address": "<base58 Solana address>"
 }
 ```
+
+`keypair generate --name NAME --curve secp256k1` creates a chain-neutral
+standard-tier signing key inside avault using the existing k256 scalar generator
+and OS CSPRNG. It seals the raw 32-byte big-endian scalar under the same machine
+master/envelope contract and returns exactly:
+
+```json
+{
+  "envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." },
+  "curve": "secp256k1",
+  "public_key": "<66 lowercase hex characters: compressed SEC1, 33 bytes>"
+}
+```
+
+The SEC1 prefix is `02` or `03`. `chain` and `address` are **absent**, not null:
+this key need not be a wallet. Ed25519 generate/import retain all five of their
+existing response fields. No chain selector, address derivation, mnemonic,
+derivation path, caller-supplied seed, or test RNG option is added.
+
+The scalar and its serialized copy are zeroized inside Rust, including on sealing
+errors, before output serialization. Only the envelope and public metadata leave
+the generation path. Its value ciphertext uses the existing AAD
+`name || "machine-aesgcm-v1" || 0x01`, so the envelope is directly consumable by
+existing `sign` and cannot be signed under a different record name. With
+`ecdsa-secp256k1-der`, the returned public key verifies that signature through the
+unchanged keyless `verify` contract below; callers still compute their own
+domain-separated digest. `keypair import --curve secp256k1` and private-key export
+remain unsupported. There is no new protected-tier or resident-agent operation.
+Generation requires a binary containing this additive feature on the signer;
+verification clients can continue using v0.1.10. Release/install authorization is
+separate from this interface change.
 
 `keypair import --name NAME --curve ed25519 --format solana-cli-json|base58-secret`
 accepts exactly 64 bytes in Solana CLI JSON or a base58 string decoding to the
