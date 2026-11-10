@@ -42,6 +42,7 @@ avault key authorize
 avault pubkey
 avault seal --name OPENAI_API_KEY --blind-box < blind-box.json
 avault sign < sign-request.json
+avault verify < verify-request.json
 ```
 
 `seal` reads the value from stdin and writes envelope JSON on stdout:
@@ -221,6 +222,29 @@ rejects unsupported tree options rather than silently ignoring them. One-shot `s
 Protected DEK opens are AAD-only; the P0 empty-AAD read fallback applies only to
 legacy standard-tier rows.
 
+`verify` checks a signature that someone else produced, and is the one keyless
+command. It reads:
+
+```json
+{
+  "scheme": "ecdsa-secp256k1-der",
+  "public_key": "<hex SEC1 public key, 33 or 65 bytes>",
+  "digest": "<hex 32-byte digest>",
+  "signature": "<hex DER signature>"
+}
+```
+
+Output is `{"valid":true}` with exit status 0, or `{"valid":false}` with exit status
+1 when the request is well formed but the signature does not verify (including a
+high-S signature). A malformed request exits 70 and prints no result. Every input
+is public: `verify` never selects, unlocks, or reads a store (`--store` is parsed
+and not used), needs no master key, and returns no private material. It reports
+only whether the signature matches; pinning the public key and hashing the exact
+bytes being trusted are the caller's job. It exists so Avibe can check its signed
+Model Hub engine index without a crypto stack of its own. The full contract is in
+`docs/DESIGN.md` Appendix C, and the known-answer cases are in
+`tests/vectors/verify_ecdsa_secp256k1_der.json`.
+
 ## How Avibe talks to it
 
 Like the `askill` dependency: ensured by `vibe runtime prepare`, resolved on `PATH`, shown in Settings · Dependencies. Two transports:
@@ -232,7 +256,7 @@ Like the `askill` dependency: ensured by `vibe runtime prepare`, resolved on `PA
 
 ```
 crates/
-  avault-core/    pure crypto: AEAD+AAD, DEK wrap, blind-box open, sign — no I/O, zeroized
+  avault-core/    pure crypto: AEAD+AAD, DEK wrap, blind-box open, sign, verify — no I/O, zeroized
   avault-store/   master/VMK store: macOS Keychain, file+mlock, file+passphrase → SE/TPM/KMS
   avault-cli/     the `avault` binary: one-shot CLI + resident agent
 docs/
