@@ -167,6 +167,16 @@ mod tests {
     }
 
     #[test]
+    fn import_errors_do_not_echo_secret_input() {
+        let secret = "solana-secret-material";
+        let input = format!("[\"{secret}\"]");
+        let error = match import_solana_cli_json(input.as_bytes()) {
+            Ok(_) => panic!("secret string should not parse as a byte array"),
+            Err(error) => error,
+        };
+        assert!(!format!("{error:#}").contains(secret));
+    }
+    #[test]
     fn accepts_longer_than_digest_messages() {
         let seed = Zeroizing::new([3u8; 32]);
         let message = vec![0xabu8; 128];
