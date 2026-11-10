@@ -497,6 +497,34 @@ mod tests {
             .is_err());
     }
     #[test]
+    fn opens_known_answer_keypair_import_blind_box_vector() {
+        let vector: serde_json::Value =
+            serde_json::from_str(include_str!("../../../tests/vectors/p2_core_crypto.json"))
+                .unwrap();
+        let blind = &vector["keypair_import_blind_box"];
+        assert_eq!(blind["scheme"], BLIND_BOX_SCHEME);
+        assert_eq!(
+            blind["hpke_info_utf8"],
+            std::str::from_utf8(BLIND_BOX_HPKE_INFO).unwrap()
+        );
+        assert_eq!(blind["aad_domain_utf8"], "avault:blind-box:aad:v1");
+        let master_key = hex::decode(blind["master_key_hex"].as_str().unwrap()).unwrap();
+        let master_key: [u8; KEY_BYTES] = master_key.try_into().unwrap();
+        let keypair = derive_blind_box_keypair_from_master(&master_key);
+        assert_eq!(keypair.public_key_b64(), blind["public_key"]);
+        assert_eq!(keypair.fingerprint_hex(), blind["fingerprint"]);
+        let blind_box: BlindBox = serde_json::from_value(blind["box"].clone()).unwrap();
+        let context = BlindBoxContext::keypair_import(
+            blind["context"]["name"].as_str().unwrap(),
+            blind["context"]["curve"].as_str().unwrap(),
+            blind["context"]["format"].as_str().unwrap(),
+        );
+        assert_eq!(hex::encode(context.aad_bytes()), blind["aad_hex"]);
+        let opened = keypair.open(&blind_box, &context).unwrap();
+        assert_eq!(hex::encode(opened.as_slice()), blind["plaintext_hex"]);
+    }
+
+    #[test]
     fn rejects_wrong_blind_box_context() {
         let keypair = derive_blind_box_keypair_from_master(&MASTER_KEY);
         let context = BlindBoxContext::agent_sign(
