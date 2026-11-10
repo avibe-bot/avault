@@ -70,7 +70,7 @@ dependencies = [
 
 [[package]]
 name = "avault-cli"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -91,7 +91,7 @@ dependencies = [
 
 [[package]]
 name = "avault-core"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -113,7 +113,7 @@ dependencies = [
 
 [[package]]
 name = "avault-store"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "aes-gcm",
  "anyhow",
