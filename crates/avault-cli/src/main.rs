@@ -1977,6 +1977,7 @@ fn keypair_generate_cmd(
     let seed = keypair.into_seed();
     let envelope = avault_core::seal(master.as_bytes(), &options.name, seed.as_ref())
         .context("keypair envelope seal failed")?;
+    drop(seed);
     drop(master);
     drop(unlock);
     let output = KeypairOutput {
@@ -2009,7 +2010,7 @@ fn keypair_import_cmd(
         .context("failed to read Solana keypair import from stdin")?;
     let master = if options.blind_box {
         let blind_box: BlindBox = serde_json::from_slice(raw_input.as_slice())
-            .context("keypair blind-box JSON is invalid")?;
+            .map_err(|_| anyhow!("keypair blind-box JSON is invalid"))?;
         let master = load_existing_master_from_unlock(&unlock)?;
         let receiver = avault_core::derive_blind_box_keypair_from_master(master.as_bytes());
         let opened = receiver
@@ -2040,6 +2041,7 @@ fn keypair_import_cmd(
     let seed = keypair.into_seed();
     let envelope = avault_core::seal(master.as_bytes(), &options.name, seed.as_ref())
         .context("keypair envelope seal failed")?;
+    drop(seed);
     drop(master);
     drop(unlock);
     let output = KeypairOutput {
@@ -3264,7 +3266,7 @@ fn handle_agent_frame_inner(
                         let parsed_scheme = SignatureScheme::from_str(&scheme)?;
                         if parsed_scheme == SignatureScheme::Ed25519 {
                             bail!(
-                                "protected ed25519 signing is not supported yet; use standard sign"
+                                "protected ed25519 signing is not supported yet; trusted Solana transaction context is required"
                             );
                         }
                         let digest_hex = dek.digest.context("sign grant DEK requires digest")?;
@@ -3410,7 +3412,7 @@ fn handle_agent_frame_inner(
             let scope = grant_key_from_id(request.grant_id)?;
             let scheme = SignatureScheme::from_str(&request.scheme)?;
             if scheme == SignatureScheme::Ed25519 {
-                bail!("protected ed25519 signing is not supported yet; use standard sign");
+                bail!("protected ed25519 signing is not supported yet; trusted Solana transaction context is required");
             }
             let digest = decode_hex_32(&request.digest, "digest")?;
             let key_plaintext = open_with_grant(agent, &scope, false, |grant, _| {

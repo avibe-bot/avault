@@ -4477,46 +4477,52 @@ fn solana_keypair_generation_import_and_exact_message_signing() {
     assert_eq!(imported_base58["public_key"], hex::encode(public_key));
 
     let message = b"serialized Solana message bytes";
-    let signed = avault()
-        .arg("sign")
-        .env("AVAULT_HOME", &vault_home)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut signed = signed;
-    signed
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(
-            &serde_json::to_vec(&json!({
-                "name": "SOLANA_GENERATED",
-                "key_envelope": generated["envelope"].clone(),
-                "scheme": "ed25519",
-                "message_hex": hex::encode(message),
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-    let signed = signed.wait_with_output().unwrap();
-    assert!(
-        signed.status.success(),
-        "{}",
-        String::from_utf8_lossy(&signed.stderr)
-    );
-    let signed: serde_json::Value = serde_json::from_slice(&signed.stdout).unwrap();
-    let signature =
-        Signature::from_slice(&hex::decode(signed["signature"].as_str().unwrap()).unwrap())
+    for (name, keypair) in [
+        ("SOLANA_GENERATED", &generated),
+        ("SOLANA_IMPORTED_JSON", &imported_json),
+        ("SOLANA_IMPORTED_BASE58", &imported_base58),
+    ] {
+        let signed = avault()
+            .arg("sign")
+            .env("AVAULT_HOME", &vault_home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
             .unwrap();
-    let public_key = hex::decode(generated["public_key"].as_str().unwrap())
-        .unwrap()
-        .try_into()
-        .unwrap();
-    VerifyingKey::from_bytes(&public_key)
-        .unwrap()
-        .verify(message, &signature)
-        .unwrap();
+        let mut signed = signed;
+        signed
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(
+                &serde_json::to_vec(&json!({
+                    "name": name,
+                    "key_envelope": keypair["envelope"].clone(),
+                    "scheme": "ed25519",
+                    "message_hex": hex::encode(message),
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let signed = signed.wait_with_output().unwrap();
+        assert!(
+            signed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&signed.stderr)
+        );
+        let signed: serde_json::Value = serde_json::from_slice(&signed.stdout).unwrap();
+        let signature =
+            Signature::from_slice(&hex::decode(signed["signature"].as_str().unwrap()).unwrap())
+                .unwrap();
+        let public_key = hex::decode(keypair["public_key"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        VerifyingKey::from_bytes(&public_key)
+            .unwrap()
+            .verify(message, &signature)
+            .unwrap();
+    }
 
     let bad = avault()
         .arg("sign")
@@ -4542,6 +4548,235 @@ fn solana_keypair_generation_import_and_exact_message_signing() {
     let bad = bad.wait_with_output().unwrap();
     assert!(!bad.status.success());
     assert!(String::from_utf8_lossy(&bad.stderr).contains("--message-hex"));
+}
+
+fn solana_cli_input(home: &std::path::Path, args: &[&str], input: &[u8]) -> std::process::Output {
+    let mut child = avault()
+        .args(args)
+        .env("AVAULT_HOME", home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input).unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn solana_signing_accepts_empty_and_maximum_message_and_rejects_invalid_inputs() {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    let home = tempfile::tempdir().unwrap();
+    let vault_home = home.path().join("vault");
+    let seed = [7u8; 32];
+    let envelope = seal_secret(&vault_home, "SOLANA_KEY", &seed);
+    let verifier = VerifyingKey::from_bytes(&avault_core::ed25519_public_key(&seed)).unwrap();
+    for message in [
+        Vec::new(),
+        vec![0xab; avault_core::MAX_ED25519_MESSAGE_BYTES],
+    ] {
+        let output = solana_cli_input(
+            &vault_home,
+            &["sign"],
+            &serde_json::to_vec(&json!({
+                "name": "SOLANA_KEY", "key_envelope": envelope, "scheme": "ed25519",
+                "message_hex": hex::encode(&message),
+            }))
+            .unwrap(),
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let signed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let signature =
+            Signature::from_slice(&hex::decode(signed["signature"].as_str().unwrap()).unwrap())
+                .unwrap();
+        verifier.verify(&message, &signature).unwrap();
+        assert!(signed["recovery_id"].is_null());
+        assert!(verifier.verify(b"different message", &signature).is_err());
+    }
+    for (scheme, digest, message, error) in [
+        (
+            "ed25519",
+            None,
+            "ab".repeat(avault_core::MAX_ED25519_MESSAGE_BYTES + 1),
+            "1 MiB",
+        ),
+        ("ed25519", None, "0".into(), "valid hex"),
+        ("ed25519", None, "zz".into(), "valid hex"),
+        (
+            "ed25519",
+            Some("00".repeat(32)),
+            "ab".into(),
+            "--message-hex",
+        ),
+        (
+            "ecdsa-secp256k1-der",
+            Some("00".repeat(32)),
+            "ab".into(),
+            "only valid for ed25519",
+        ),
+    ] {
+        let output = solana_cli_input(
+            &vault_home,
+            &["sign"],
+            &serde_json::to_vec(&json!({
+                "name": "SOLANA_KEY", "key_envelope": envelope, "scheme": scheme,
+                "digest": digest, "message_hex": message,
+            }))
+            .unwrap(),
+        );
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains(error));
+    }
+}
+
+#[test]
+fn solana_blind_box_import_binds_name_curve_format_and_sanitizes_errors() {
+    let home = tempfile::tempdir().unwrap();
+    let vault_home = home.path().join("vault");
+    let pubkey = solana_cli_input(&vault_home, &["pubkey"], b"");
+    assert!(pubkey.status.success());
+    let pubkey: serde_json::Value = serde_json::from_slice(&pubkey.stdout).unwrap();
+    let public_key = pubkey["public_key"].as_str().unwrap();
+    let seed = [7u8; 32];
+    let public = avault_core::ed25519_public_key(&seed);
+    let mut secret = Vec::from(seed);
+    secret.extend_from_slice(&public);
+    for (format, plaintext) in [
+        ("solana-cli-json", serde_json::to_vec(&secret).unwrap()),
+        (
+            "base58-secret",
+            bs58::encode(&secret).into_string().into_bytes(),
+        ),
+    ] {
+        let args = [
+            "keypair",
+            "import",
+            "--name",
+            "SOLANA_KEY",
+            "--curve",
+            "ed25519",
+            "--format",
+            format,
+            "--blind-box",
+        ];
+        for (name, curve, bound_format, valid) in [
+            ("SOLANA_KEY", "ed25519", format, true),
+            ("OTHER_KEY", "ed25519", format, false),
+            ("SOLANA_KEY", "secp256k1", format, false),
+            ("SOLANA_KEY", "ed25519", "other-format", false),
+        ] {
+            let aad = blind_box_aad(TestBlindBoxAad {
+                purpose: "keypair-import",
+                name,
+                grant_id: "",
+                scheme: &format!("{curve}:{bound_format}"),
+                digest: &[],
+                approval_nonce: &[],
+                approval_expires_at_unix: None,
+                operation_hash: &[],
+            });
+            let blind_box = fixed_blind_box(public_key, &plaintext, &aad);
+            let output =
+                solana_cli_input(&vault_home, &args, &serde_json::to_vec(&blind_box).unwrap());
+            assert_eq!(
+                output.status.success(),
+                valid,
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if valid {
+                let keypair: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(keypair["public_key"], hex::encode(public));
+                assert_eq!(keypair["address"], bs58::encode(public).into_string());
+            } else {
+                assert!(output.stdout.is_empty());
+                assert!(String::from_utf8_lossy(&output.stderr).contains("blind-box open failed"));
+            }
+        }
+    }
+    let marker = "private-key-test-marker";
+    let input = format!("[7,7,7,\"{marker}\"]");
+    let aad = blind_box_aad(TestBlindBoxAad {
+        purpose: "keypair-import",
+        name: "SOLANA_KEY",
+        grant_id: "",
+        scheme: "ed25519:solana-cli-json",
+        digest: &[],
+        approval_nonce: &[],
+        approval_expires_at_unix: None,
+        operation_hash: &[],
+    });
+    let blind_box = fixed_blind_box(public_key, input.as_bytes(), &aad);
+    for (blind, bytes) in [
+        (false, input.into_bytes()),
+        (true, serde_json::to_vec(&blind_box).unwrap()),
+        (true, format!("\"{marker}\"").into_bytes()),
+    ] {
+        let mut args = vec![
+            "keypair",
+            "import",
+            "--name",
+            "SOLANA_KEY",
+            "--curve",
+            "ed25519",
+            "--format",
+            "solana-cli-json",
+        ];
+        if blind {
+            args.push("--blind-box");
+        }
+        let output = solana_cli_input(&vault_home, &args, &bytes);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(marker));
+    }
+}
+
+#[test]
+fn solana_protected_grants_and_signatures_are_refused_before_key_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let socket = tmp.path().join("run").join("avault.sock");
+    let mut agent = spawn_agent_command(&socket, 60)
+        .env("AVAULT_HOME", tmp.path().join("vault"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stream = connect_agent(&socket);
+    // Intentionally invalid ciphertext proves refusal happens before any open.
+    let grant = agent_request(
+        &mut stream,
+        json!({
+            "type": "grant", "grant_id": "solana-denied", "purpose": "sign", "ttl_secs": 60,
+            "deks": [{"name": "SOLANA_KEY", "scheme": "ed25519", "digest": "00".repeat(32),
+                "dek_blindbox": {"scheme": "invalid", "enc": "", "ct": ""},
+                "approval": approval_json(b"solana-approval01", future_expiry())}]
+        }),
+    );
+    let sign = agent_request(
+        &mut stream,
+        json!({
+            "type": "sign", "grant_id": "solana-denied", "name": "SOLANA_KEY",
+            "key_envelope": {"ciphertext": "", "nonce": "", "wrap_meta": ""},
+            "scheme": "ed25519", "digest": "00".repeat(32),
+        }),
+    );
+    let _ = agent.kill();
+    let _ = agent.wait();
+    for response in [grant, sign] {
+        assert_eq!(response["ok"], false);
+        assert!(response["error"]
+            .as_str()
+            .unwrap()
+            .contains("protected ed25519 signing is not supported"));
+        assert!(response["result"].is_null());
+    }
 }
 
 const PYTHON_AAD_REFERENCE: &str = r#"

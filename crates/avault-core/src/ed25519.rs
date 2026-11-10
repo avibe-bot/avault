@@ -73,9 +73,43 @@ pub fn import_solana_cli_json(input: &[u8]) -> anyhow::Result<Ed25519Keypair> {
     if input.len() > MAX_SOLANA_CLI_JSON_BYTES {
         bail!("Solana CLI keypair JSON exceeds the supported size limit");
     }
-    let values: Zeroizing<Vec<u8>> =
-        serde_json::from_slice(input).map_err(|_| anyhow!("Solana CLI keypair JSON is invalid"))?;
-    import_solana_secret_key(values.as_slice())
+    let values = decode_solana_cli_json(input)?;
+    import_solana_secret_key(values.as_ref())
+}
+
+fn decode_solana_cli_json(
+    input: &[u8],
+) -> anyhow::Result<Zeroizing<[u8; SOLANA_SECRET_KEY_BYTES]>> {
+    // Parse the narrow byte-array grammar from borrowed slices. A generic Vec
+    // deserializer can free partial secrets on errors or reallocation before a
+    // Zeroizing wrapper ever owns them; even JSON string errors can copy input.
+    let invalid = || anyhow!("Solana CLI keypair JSON is invalid");
+    let text = std::str::from_utf8(input).map_err(|_| invalid())?;
+    let body = text
+        .trim_matches([' ', '\t', '\r', '\n'])
+        .strip_prefix('[')
+        .and_then(|text| text.strip_suffix(']'))
+        .ok_or_else(invalid)?;
+    let mut tokens = body.split(',');
+    let mut values = Zeroizing::new([0u8; SOLANA_SECRET_KEY_BYTES]);
+    for value in values.iter_mut() {
+        let token = tokens
+            .next()
+            .ok_or_else(invalid)?
+            .trim_matches([' ', '\t', '\r', '\n']);
+        if token.is_empty()
+            || token.len() > 3
+            || !token.bytes().all(|byte| byte.is_ascii_digit())
+            || (token.len() > 1 && token.starts_with('0'))
+        {
+            return Err(invalid());
+        }
+        *value = token.parse::<u8>().map_err(|_| invalid())?;
+    }
+    if tokens.next().is_some() {
+        return Err(invalid());
+    }
+    Ok(values)
 }
 
 /// Import a base58-encoded Solana 64-byte secret key.
@@ -84,11 +118,13 @@ pub fn import_solana_base58(input: &str) -> anyhow::Result<Ed25519Keypair> {
     if input.len() > MAX_SOLANA_SECRET_BASE58_BYTES {
         bail!("Solana secret key base58 input is too long");
     }
-    let decoded = bs58::decode(input)
-        .into_vec()
-        .map(Zeroizing::new)
-        .map_err(|_| anyhow!("Solana secret key is not valid base58"))?;
-    import_solana_secret_key(decoded.as_slice())
+    // The decoder writes directly into guarded storage, including partial
+    // output on invalid characters or overflow; no ordinary Vec holds a key.
+    let mut decoded = Zeroizing::new([0u8; SOLANA_SECRET_KEY_BYTES]);
+    let len = bs58::decode(input)
+        .onto(decoded.as_mut())
+        .map_err(|_| anyhow!("Solana secret key is not valid 64-byte base58"))?;
+    import_solana_secret_key(&decoded[..len])
 }
 
 /// Encode a canonical Ed25519 public key as a Solana address.
@@ -188,6 +224,69 @@ mod tests {
         };
         assert!(!format!("{error:#}").contains(secret));
     }
+    #[test]
+    fn json_byte_array_grammar_and_partial_failures() {
+        for start in [0u8, 64, 128, 192] {
+            let bytes: Vec<u8> = (0..64).map(|offset| start + offset).collect();
+            for input in [
+                serde_json::to_string(&bytes).unwrap(),
+                format!(" \r\n{}\t", serde_json::to_string_pretty(&bytes).unwrap()),
+            ] {
+                assert_eq!(
+                    decode_solana_cli_json(input.as_bytes()).unwrap().as_ref(),
+                    &bytes
+                );
+            }
+        }
+        for token in [
+            "",
+            "-1",
+            "+1",
+            "01",
+            "256",
+            "1.0",
+            "1e0",
+            "null",
+            "true",
+            "[1]",
+            "{}",
+            "\"secret\\nmaterial\"",
+            "\u{a0}1",
+            "1\u{b}",
+        ] {
+            for index in [0, 31, 63] {
+                let mut tokens = vec!["7"; 64];
+                tokens[index] = token;
+                let input = format!("[{}]", tokens.join(","));
+                let error = decode_solana_cli_json(input.as_bytes()).unwrap_err();
+                assert_eq!(error.to_string(), "Solana CLI keypair JSON is invalid");
+            }
+        }
+        for input in ["[]", "[1,2]", "\"secret\"", "{}", "[1,]", "[1][2]"] {
+            assert!(decode_solana_cli_json(input.as_bytes()).is_err());
+        }
+        let input = serde_json::to_vec(&vec![7u8; 65]).unwrap();
+        assert!(decode_solana_cli_json(&input).is_err());
+        assert!(decode_solana_cli_json(&[0xff]).is_err());
+        assert!(import_solana_cli_json(&vec![b' '; MAX_SOLANA_CLI_JSON_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn imports_json_and_base58_with_leading_zero_seed_bytes() {
+        for seed in [[0u8; 32], [7; 32], [255; 32]] {
+            let public = ed25519_public_key(&seed);
+            let mut secret = Vec::from(seed);
+            secret.extend_from_slice(&public);
+            let json = serde_json::to_vec(&secret).unwrap();
+            let base58 = bs58::encode(&secret).into_string();
+            assert_eq!(import_solana_cli_json(&json).unwrap().public_key(), public);
+            assert_eq!(import_solana_base58(&base58).unwrap().public_key(), public);
+            assert!(import_solana_base58(&format!("{}0", &base58[..base58.len() - 1])).is_err());
+        }
+        // Within the text cap, but too many decoded bytes for the fixed buffer.
+        assert!(import_solana_base58(&"1".repeat(65)).is_err());
+    }
+
     #[test]
     fn accepts_longer_than_digest_messages() {
         let seed = Zeroizing::new([3u8; 32]);

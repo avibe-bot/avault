@@ -567,12 +567,16 @@ master-derived and therefore not ephemeral. Current `purpose` and
 
 | Operation | `purpose` | Required AAD context | `operation_hash` fields |
 |---|---|---|---|
+| `seal --blind-box` | `seal` | `name` | empty |
 | keypair import | `keypair-import` | `name`, `curve`, `format` | empty |
 | agent delivery grant | `agent-deliver` | `grant_id`, `name`, approval, `ttl_secs` | `"agent-deliver"`, name, `ttl_secs_u64_be` |
 | agent signing grant | `agent-sign` | `grant_id`, `name`, `sign_scheme`, `digest`, approval, `ttl_secs` | `"agent-sign"`, scheme, raw 32-byte digest, `ttl_secs_u64_be` |
 
-These values and example AAD bytes are pinned in
-`tests/vectors/p2_core_crypto.json`.
+For `keypair-import`, `curve` and `format` occupy the existing `sign_scheme`
+field as the UTF-8 string `ed25519:solana-cli-json` or `ed25519:base58-secret`;
+no new AAD fields are appended. `grant_id`, the reserved field, `digest`,
+approval fields, and `operation_hash` are empty. These values and example AAD
+bytes are pinned in `tests/vectors/p2_core_crypto.json`.
 
 `pubkey` emits:
 
@@ -607,13 +611,16 @@ keypair, seals the 32-byte seed under the machine master, and returns only:
 
 `keypair import --name NAME --curve ed25519 --format solana-cli-json|base58-secret`
 accepts exactly 64 bytes in Solana CLI JSON or a base58 string decoding to the
-same 64-byte seed+public-key secret. The trailing public key must match the
-seed-derived public key. With `--blind-box`, the input is HPKE-sealed and the
+same 64-byte seed+public-key secret. The JSON input is bounded to 4096 bytes;
+the trimmed base58 input is bounded to 88 characters before decoding. Both
+decoders write directly to a fixed-size zeroizing buffer, including on partial
+parse failure. The trailing public key must match the seed-derived public key.
+With `--blind-box`, the input is HPKE-sealed and the
 AAD binds the name, curve, and format; plaintext secret bytes never leave
 `avault`. Mnemonics, derivation paths, raw 32-byte user imports, other curves,
 and export are rejected. Protected Solana key creation is not supported.
 
-
+`seal --name NAME --blind-box` reads a blind box from stdin:
 
 ```json
 {
