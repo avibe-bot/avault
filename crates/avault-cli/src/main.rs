@@ -45,6 +45,8 @@ use zeroize::{Zeroize, Zeroizing};
 
 const MAX_STDIN_SECRET_BYTES: usize = 1024 * 1024;
 const MAX_STDIN_ENVELOPE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_STDIN_SIGN_REQUEST_BYTES: usize =
+    MAX_STDIN_ENVELOPE_BYTES + (2 * avault_core::MAX_ED25519_MESSAGE_BYTES) + 128 * 1024;
 const MAX_STDIN_PASSPHRASE_BYTES: usize = 64 * 1024;
 const STDIN_READ_CHUNK_BYTES: usize = 8192;
 /// A `verify` request is a few hundred bytes: three short hex strings and a scheme name.
@@ -422,7 +424,7 @@ fn sign_cmd(args: &[OsString], config: &CliConfig, input: &mut impl Read) -> any
         bail!("sign reads its JSON request from stdin and takes no options");
     }
     let unlock = read_store_unlock(config, input)?;
-    let input = read_json_input(input, "failed to read sign JSON from stdin")?;
+    let input = read_sign_json_input(input)?;
     let request: SignInput =
         serde_json::from_slice(input.as_slice()).context("sign JSON is invalid")?;
     let scheme = SignatureScheme::from_str(&request.scheme)?;
@@ -3731,6 +3733,11 @@ fn read_json_input(
     context: &'static str,
 ) -> anyhow::Result<Zeroizing<Vec<u8>>> {
     read_zeroizing_to_cap(reader, MAX_STDIN_ENVELOPE_BYTES).context(context)
+}
+
+fn read_sign_json_input(reader: &mut impl Read) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+    read_zeroizing_to_cap(reader, MAX_STDIN_SIGN_REQUEST_BYTES)
+        .context("failed to read sign JSON from stdin")
 }
 
 fn read_zeroizing_to_cap(

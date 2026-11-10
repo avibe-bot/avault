@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Context};
+use anyhow::{anyhow, bail};
 use ed25519_dalek::{Signer, SigningKey};
 use rand::rngs::OsRng;
 use rand::RngCore;
@@ -66,17 +66,18 @@ pub fn import_solana_secret_key(secret_key: &[u8]) -> anyhow::Result<Ed25519Keyp
 
 /// Import the Solana CLI JSON keypair format: exactly 64 integers in `0..=255`.
 pub fn import_solana_cli_json(input: &[u8]) -> anyhow::Result<Ed25519Keypair> {
-    let values: Vec<u8> =
-        serde_json::from_slice(input).context("Solana CLI keypair JSON is invalid")?;
-    import_solana_secret_key(&values)
+    let values: Zeroizing<Vec<u8>> =
+        serde_json::from_slice(input).map_err(|_| anyhow!("Solana CLI keypair JSON is invalid"))?;
+    import_solana_secret_key(values.as_slice())
 }
 
 /// Import a base58-encoded Solana 64-byte secret key.
 pub fn import_solana_base58(input: &str) -> anyhow::Result<Ed25519Keypair> {
     let decoded = bs58::decode(input.trim())
         .into_vec()
+        .map(Zeroizing::new)
         .map_err(|_| anyhow!("Solana secret key is not valid base58"))?;
-    import_solana_secret_key(&decoded)
+    import_solana_secret_key(decoded.as_slice())
 }
 
 /// Encode a canonical Ed25519 public key as a Solana address.

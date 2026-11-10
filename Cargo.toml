@@ -25,7 +25,7 @@ repository = "https://github.com/avibe-bot/avault"
 aes-gcm = { version = "0.10", features = ["zeroize"] }      # AES-256-GCM AEAD
 hkdf = "0.12"         # HKDF-SHA256
 sha2 = "0.10"
-zeroize = { version = "1", features = ["zeroize_derive"] }  # deterministic wipe
+zeroize = { version = "1", features = ["zeroize_derive", "serde"] }  # deterministic wipe
 subtle = "2"          # constant-time comparison
 rand = "0.8"          # CSPRNG (OsRng)
 anyhow = "1"
