@@ -38,7 +38,7 @@ pub use ed25519::{
     ed25519_public_key, generate_ed25519_keypair, import_solana_base58, import_solana_cli_json,
     import_solana_secret_key, sign_ed25519, solana_address, Ed25519Keypair,
     ED25519_PUBLIC_KEY_BYTES, ED25519_SEED_BYTES, MAX_ED25519_MESSAGE_BYTES,
-    SOLANA_SECRET_KEY_BYTES,
+    MAX_SOLANA_CLI_JSON_BYTES, MAX_SOLANA_SECRET_BASE58_BYTES, SOLANA_SECRET_KEY_BYTES,
 };
 pub use signing::{
     LocalSignerProvider, SignatureResult, SignatureScheme, SignerProvider,

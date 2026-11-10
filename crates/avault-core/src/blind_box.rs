@@ -414,6 +414,12 @@ mod tests {
                         hex::decode(digest_hex).unwrap().try_into().unwrap();
                     BlindBoxContext::agent_sign(grant_id, name, sign_scheme, &digest)
                 }
+                "keypair-import" => {
+                    let (curve, format) = sign_scheme
+                        .split_once(':')
+                        .expect("keypair-import sign_scheme must contain curve and format");
+                    BlindBoxContext::keypair_import(name, curve, format)
+                }
                 _ => panic!("unexpected blind-box AAD vector purpose"),
             };
             if let Some(nonce_hex) = case["approval_nonce_hex"]

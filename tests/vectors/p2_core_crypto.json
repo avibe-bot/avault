@@ -29,6 +29,17 @@
     "digest_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
     "cases": [
       {
+        "purpose": "keypair-import",
+        "name": "SOLANA_KEY",
+        "grant_id": "",
+        "sign_scheme": "ed25519:base58-secret",
+        "digest_hex": "",
+        "approval_nonce_hex": "",
+        "approval_expires_at_unix": null,
+        "operation_hash_hex": "",
+        "aad_hex": "617661756c743a626c696e642d626f783a6161643a76310000000e6b6579706169722d696d706f72740000000a534f4c414e415f4b4559000000116d616368696e652d61657367636d2d76310000000101000000000000000000000015656432353531393a6261736535382d73656372657400000000000000000000000000000000"
+      },
+      {
         "purpose": "seal",
         "name": "BLIND_SECRET",
         "grant_id": "",

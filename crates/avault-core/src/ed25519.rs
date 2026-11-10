@@ -12,6 +12,10 @@ pub const ED25519_PUBLIC_KEY_BYTES: usize = 32;
 pub const SOLANA_SECRET_KEY_BYTES: usize = 64;
 /// Maximum raw message accepted by the v1 signing boundary.
 pub const MAX_ED25519_MESSAGE_BYTES: usize = 1024 * 1024;
+/// Maximum user-facing base58 length for a 64-byte Solana secret key.
+pub const MAX_SOLANA_SECRET_BASE58_BYTES: usize = 88;
+/// Maximum JSON framing accepted for a 64-byte Solana CLI keypair.
+pub const MAX_SOLANA_CLI_JSON_BYTES: usize = 4096;
 
 /// An Ed25519 keypair whose seed is wiped when the value is dropped.
 ///
@@ -66,6 +70,9 @@ pub fn import_solana_secret_key(secret_key: &[u8]) -> anyhow::Result<Ed25519Keyp
 
 /// Import the Solana CLI JSON keypair format: exactly 64 integers in `0..=255`.
 pub fn import_solana_cli_json(input: &[u8]) -> anyhow::Result<Ed25519Keypair> {
+    if input.len() > MAX_SOLANA_CLI_JSON_BYTES {
+        bail!("Solana CLI keypair JSON exceeds the supported size limit");
+    }
     let values: Zeroizing<Vec<u8>> =
         serde_json::from_slice(input).map_err(|_| anyhow!("Solana CLI keypair JSON is invalid"))?;
     import_solana_secret_key(values.as_slice())
@@ -73,7 +80,11 @@ pub fn import_solana_cli_json(input: &[u8]) -> anyhow::Result<Ed25519Keypair> {
 
 /// Import a base58-encoded Solana 64-byte secret key.
 pub fn import_solana_base58(input: &str) -> anyhow::Result<Ed25519Keypair> {
-    let decoded = bs58::decode(input.trim())
+    let input = input.trim();
+    if input.len() > MAX_SOLANA_SECRET_BASE58_BYTES {
+        bail!("Solana secret key base58 input is too long");
+    }
+    let decoded = bs58::decode(input)
         .into_vec()
         .map(Zeroizing::new)
         .map_err(|_| anyhow!("Solana secret key is not valid base58"))?;
@@ -164,6 +175,7 @@ mod tests {
         let mut secret = vec![0u8; 64];
         secret[63] = 1;
         assert!(import_solana_secret_key(&secret).is_err());
+        assert!(import_solana_base58(&"z".repeat(MAX_SOLANA_SECRET_BASE58_BYTES + 1)).is_err());
     }
 
     #[test]
