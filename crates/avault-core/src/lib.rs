@@ -27,6 +27,7 @@ use zeroize::Zeroizing;
 
 mod blind_box;
 mod ed25519;
+mod secp256k1;
 mod signing;
 mod verifying;
 
@@ -40,6 +41,7 @@ pub use ed25519::{
     ED25519_PUBLIC_KEY_BYTES, ED25519_SEED_BYTES, MAX_ED25519_MESSAGE_BYTES,
     MAX_SOLANA_CLI_JSON_BYTES, MAX_SOLANA_SECRET_BASE58_BYTES, SOLANA_SECRET_KEY_BYTES,
 };
+pub use secp256k1::generate_sealed_secp256k1_keypair;
 pub use signing::{
     LocalSignerProvider, SignatureResult, SignatureScheme, SignerProvider,
     SIGN_SCHEME_ECDSA_SECP256K1_DER, SIGN_SCHEME_ECDSA_SECP256K1_RECOVERABLE, SIGN_SCHEME_ED25519,

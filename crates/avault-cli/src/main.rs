@@ -94,7 +94,7 @@ USAGE:
     avault key export
     avault key import [--force]
     avault key authorize
-    avault keypair generate --name NAME --curve ed25519
+    avault keypair generate --name NAME --curve ed25519|secp256k1
     avault keypair import --name NAME --curve ed25519 --format solana-cli-json|base58-secret [--blind-box]
     avault pubkey
     avault sign < sign-request.json
@@ -1952,9 +1952,11 @@ fn parse_keypair_options(args: &[OsString]) -> anyhow::Result<KeypairOptions> {
 struct KeypairOutput {
     envelope: Sealed,
     curve: String,
-    chain: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chain: Option<String>,
     public_key: String,
-    address: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    address: Option<String>,
 }
 
 fn keypair_generate_cmd(
@@ -1963,7 +1965,7 @@ fn keypair_generate_cmd(
     input: &mut impl Read,
 ) -> anyhow::Result<u8> {
     let options = parse_keypair_options(args)?;
-    if options.curve != "ed25519" {
+    if !matches!(options.curve.as_str(), "ed25519" | "secp256k1") {
         bail!("unsupported keypair curve");
     }
     if options.format.is_some() || options.blind_box {
@@ -1971,22 +1973,39 @@ fn keypair_generate_cmd(
     }
     let unlock = read_store_unlock(config, input)?;
     let master = load_or_create_master_from_unlock(&unlock)?;
-    let keypair = avault_core::generate_ed25519_keypair();
-    let public_key = keypair.public_key();
-    let address = keypair.address();
-    let seed = keypair.into_seed();
-    let envelope = avault_core::seal(master.as_bytes(), &options.name, seed.as_ref())
-        .context("keypair envelope seal failed")?;
-    drop(seed);
+    let output = match options.curve.as_str() {
+        "secp256k1" => {
+            let (envelope, public_key) =
+                avault_core::generate_sealed_secp256k1_keypair(master.as_bytes(), &options.name)
+                    .context("keypair envelope seal failed")?;
+            KeypairOutput {
+                envelope,
+                curve: "secp256k1".to_string(),
+                chain: None,
+                public_key: hex::encode(public_key),
+                address: None,
+            }
+        }
+        "ed25519" => {
+            let keypair = avault_core::generate_ed25519_keypair();
+            let public_key = keypair.public_key();
+            let address = keypair.address();
+            let seed = keypair.into_seed();
+            let envelope = avault_core::seal(master.as_bytes(), &options.name, seed.as_ref())
+                .context("keypair envelope seal failed")?;
+            drop(seed);
+            KeypairOutput {
+                envelope,
+                curve: "ed25519".to_string(),
+                chain: Some("solana".to_string()),
+                public_key: hex::encode(public_key),
+                address: Some(address),
+            }
+        }
+        _ => unreachable!("curve validated above"),
+    };
     drop(master);
     drop(unlock);
-    let output = KeypairOutput {
-        envelope,
-        curve: "ed25519".to_string(),
-        chain: "solana".to_string(),
-        public_key: hex::encode(public_key),
-        address,
-    };
     serde_json::to_writer(io::stdout(), &output).context("failed to write keypair JSON")?;
     println!();
     Ok(0)
@@ -2047,9 +2066,9 @@ fn keypair_import_cmd(
     let output = KeypairOutput {
         envelope,
         curve: "ed25519".to_string(),
-        chain: "solana".to_string(),
+        chain: Some("solana".to_string()),
         public_key: hex::encode(public_key),
-        address,
+        address: Some(address),
     };
     serde_json::to_writer(io::stdout(), &output).context("failed to write keypair JSON")?;
     println!();
