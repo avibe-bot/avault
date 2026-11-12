@@ -96,6 +96,7 @@ USAGE:
     avault key authorize
     avault keypair generate --name NAME --curve ed25519|secp256k1
     avault keypair import --name NAME --curve ed25519 --format solana-cli-json|base58-secret [--blind-box]
+    avault keypair import --name NAME --type hd-seed --format raw-seed [--blind-box]
     avault pubkey
     avault sign < sign-request.json
     avault verify < verify-request.json
@@ -406,11 +407,22 @@ struct SignInput {
     digest: Option<String>,
     #[serde(default)]
     message_hex: Option<String>,
-    scheme: String,
+    #[serde(default)]
+    scheme: Option<String>,
+    #[serde(default)]
+    derivation: Option<DerivationInput>,
     #[serde(default)]
     dek_blindbox: Option<BlindBox>,
     #[serde(default)]
     approval: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DerivationInput {
+    chain: String,
+    #[serde(default)]
+    account: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -427,7 +439,7 @@ fn sign_cmd(args: &[OsString], config: &CliConfig, input: &mut impl Read) -> any
     let input = read_sign_json_input(input)?;
     let request: SignInput =
         serde_json::from_slice(input.as_slice()).context("sign JSON is invalid")?;
-    let scheme = SignatureScheme::from_str(&request.scheme)?;
+    let (scheme, derivation) = validate_sign_request(&request)?;
     let (digest, message) = match scheme {
         SignatureScheme::Ed25519 => {
             if request.digest.is_some() {
@@ -449,14 +461,36 @@ fn sign_cmd(args: &[OsString], config: &CliConfig, input: &mut impl Read) -> any
     };
 
     reject_one_shot_protected_fields(request.dek_blindbox.as_ref(), request.approval.as_ref())?;
+    let envelope_kind = avault_core::envelope_kind(&request.key_envelope)?;
+    match (envelope_kind, derivation.is_some()) {
+        (avault_core::EnvelopeKind::Legacy, true) => {
+            bail!("legacy keypairs do not accept derivation")
+        }
+        (avault_core::EnvelopeKind::HdSeed, false) => {
+            bail!("HD seed signing requires derivation")
+        }
+        _ => {}
+    }
     let master = load_existing_master_from_unlock(&unlock)?;
-    let key_plaintext = avault_core::open(master.as_bytes(), &request.name, &request.key_envelope)
-        .context("key envelope open failed")?;
+    let key_plaintext = if derivation.is_some() {
+        avault_core::open_hd_seed(master.as_bytes(), &request.name, &request.key_envelope)
+            .context("HD seed envelope open failed")?
+    } else {
+        avault_core::open(master.as_bytes(), &request.name, &request.key_envelope)
+            .context("key envelope open failed")?
+    };
     drop(master);
     drop(unlock);
+    let private_key = if let Some(derivation) = derivation {
+        let seed = zeroizing_vec_to_seed64(key_plaintext)?;
+        avault_core::derive_hd_private_key(&seed, derivation.chain, derivation.account)
+            .context("HD seed derivation failed")?
+    } else {
+        zeroizing_vec_to_key32(key_plaintext, "signing key")?
+    };
     let output = match (digest, message) {
-        (Some(digest), None) => sign_digest_with_key(scheme, &digest, key_plaintext)?,
-        (None, Some(message)) => sign_message_with_key(scheme, &message, key_plaintext)?,
+        (Some(digest), None) => sign_digest_with_private_key(scheme, &digest, private_key)?,
+        (None, Some(message)) => sign_message_with_private_key(scheme, &message, private_key)?,
         _ => unreachable!("scheme input validation must select one signing input"),
     };
     serde_json::to_writer(io::stdout(), &output).context("failed to write signature JSON")?;
@@ -464,18 +498,60 @@ fn sign_cmd(args: &[OsString], config: &CliConfig, input: &mut impl Read) -> any
     Ok(0)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ValidatedDerivation {
+    chain: avault_core::HdChain,
+    account: u32,
+}
+
+fn validate_sign_request(
+    request: &SignInput,
+) -> anyhow::Result<(SignatureScheme, Option<ValidatedDerivation>)> {
+    let derivation = request
+        .derivation
+        .as_ref()
+        .map(|input| -> anyhow::Result<ValidatedDerivation> {
+            let chain = avault_core::HdChain::from_str(&input.chain)?;
+            avault_core::validate_account(input.account)?;
+            Ok(ValidatedDerivation {
+                chain,
+                account: input.account,
+            })
+        })
+        .transpose()?;
+    let scheme = match (&request.scheme, derivation) {
+        (Some(name), _) => SignatureScheme::from_str(name)?,
+        (None, Some(derivation)) => derivation.chain.signing_scheme(),
+        (None, None) => bail!("scheme is required"),
+    };
+    if let Some(derivation) = derivation {
+        if scheme != derivation.chain.signing_scheme() {
+            bail!("signing scheme does not match derivation chain");
+        }
+    }
+    Ok((scheme, derivation))
+}
+
+#[cfg(unix)]
 fn sign_digest_with_key(
     scheme: SignatureScheme,
     digest: &[u8; 32],
     key_plaintext: Zeroizing<Vec<u8>>,
 ) -> anyhow::Result<SignOutput> {
-    let mut private_key = zeroizing_vec_to_key32(key_plaintext, "signing key")?;
+    let private_key = zeroizing_vec_to_key32(key_plaintext, "signing key")?;
+    sign_digest_with_private_key(scheme, digest, private_key)
+}
+
+fn sign_digest_with_private_key(
+    scheme: SignatureScheme,
+    digest: &[u8; 32],
+    mut private_key: Zeroizing<[u8; 32]>,
+) -> anyhow::Result<SignOutput> {
     let signer = LocalSignerProvider;
     let result = signer
         .sign_digest(scheme, &private_key, digest)
         .context("signing failed")?;
     private_key.zeroize();
-    drop(private_key);
     Ok(SignOutput {
         signature: hex::encode(result.signature),
         recovery_id: result.recovery_id,
@@ -558,18 +634,16 @@ fn decode_verify_hex(text: &str, label: &str) -> anyhow::Result<Vec<u8>> {
     hex::decode(text).map_err(|_| anyhow!("{label} is not valid hex"))
 }
 
-fn sign_message_with_key(
+fn sign_message_with_private_key(
     scheme: SignatureScheme,
     message: &[u8],
-    key_plaintext: Zeroizing<Vec<u8>>,
+    mut private_key: Zeroizing<[u8; 32]>,
 ) -> anyhow::Result<SignOutput> {
-    let mut private_key = zeroizing_vec_to_key32(key_plaintext, "signing key")?;
     let signer = LocalSignerProvider;
     let result = signer
         .sign_message(scheme, &private_key, message)
         .context("signing failed")?;
     private_key.zeroize();
-    drop(private_key);
     Ok(SignOutput {
         signature: hex::encode(result.signature),
         recovery_id: result.recovery_id,
@@ -584,6 +658,12 @@ fn decode_hex_message(text: &str) -> anyhow::Result<Zeroizing<Vec<u8>>> {
     Ok(Zeroizing::new(bytes))
 }
 
+fn zeroizing_vec_to_seed64(
+    value: Zeroizing<Vec<u8>>,
+) -> anyhow::Result<Zeroizing<[u8; avault_core::BIP39_SEED_BYTES]>> {
+    zeroizing_vec_to_array(value, "HD seed")
+}
+
 fn decode_hex_32(text: &str, label: &str) -> anyhow::Result<[u8; 32]> {
     if text.len() != 64 {
         bail!("{label} must be 32 bytes of hex");
@@ -595,14 +675,21 @@ fn decode_hex_32(text: &str, label: &str) -> anyhow::Result<[u8; 32]> {
 }
 
 fn zeroizing_vec_to_key32(
-    mut value: Zeroizing<Vec<u8>>,
+    value: Zeroizing<Vec<u8>>,
     label: &str,
 ) -> anyhow::Result<Zeroizing<[u8; 32]>> {
-    if value.len() != 32 {
+    zeroizing_vec_to_array(value, label)
+}
+
+fn zeroizing_vec_to_array<const N: usize>(
+    mut value: Zeroizing<Vec<u8>>,
+    label: &str,
+) -> anyhow::Result<Zeroizing<[u8; N]>> {
+    if value.len() != N {
         value.zeroize();
         bail!("{label} has invalid length");
     }
-    let mut out = Zeroizing::new([0u8; 32]);
+    let mut out = Zeroizing::new([0u8; N]);
     out.as_mut().copy_from_slice(value.as_slice());
     value.zeroize();
     Ok(out)
@@ -1878,7 +1965,8 @@ fn keypair_cmd(args: &[OsString], config: &CliConfig, input: &mut impl Read) -> 
 #[derive(Debug)]
 struct KeypairOptions {
     name: String,
-    curve: String,
+    curve: Option<String>,
+    key_type: Option<String>,
     format: Option<String>,
     blind_box: bool,
 }
@@ -1886,6 +1974,7 @@ struct KeypairOptions {
 fn parse_keypair_options(args: &[OsString]) -> anyhow::Result<KeypairOptions> {
     let mut name = None;
     let mut curve = None;
+    let mut key_type = None;
     let mut format = None;
     let mut blind_box = false;
     let mut index = 0;
@@ -1918,6 +2007,18 @@ fn parse_keypair_options(args: &[OsString]) -> anyhow::Result<KeypairOptions> {
                 );
                 index += 2;
             }
+            "--type" => {
+                if key_type.is_some() {
+                    bail!("--type was provided more than once");
+                }
+                key_type = Some(
+                    args.get(index + 1)
+                        .and_then(|value| value.to_str())
+                        .context("--type requires a value")?
+                        .to_string(),
+                );
+                index += 2;
+            }
             "--format" => {
                 if format.is_some() {
                     bail!("--format was provided more than once");
@@ -1940,9 +2041,13 @@ fn parse_keypair_options(args: &[OsString]) -> anyhow::Result<KeypairOptions> {
             other => bail!("unknown keypair option: {other}"),
         }
     }
+    if curve.is_some() && key_type.is_some() {
+        bail!("--curve and --type cannot both be provided");
+    }
     Ok(KeypairOptions {
         name: name.context("--name is required")?,
-        curve: curve.context("--curve is required")?,
+        curve,
+        key_type,
         format,
         blind_box,
     })
@@ -1959,13 +2064,33 @@ struct KeypairOutput {
     address: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct HdSeedOutput {
+    #[serde(rename = "type")]
+    key_type: &'static str,
+    envelope: Sealed,
+    accounts: Vec<HdAccountOutput>,
+}
+
+#[derive(Debug, Serialize)]
+struct HdAccountOutput {
+    account: u32,
+    evm: String,
+    bitcoin: String,
+    solana: String,
+}
+
 fn keypair_generate_cmd(
     args: &[OsString],
     config: &CliConfig,
     input: &mut impl Read,
 ) -> anyhow::Result<u8> {
     let options = parse_keypair_options(args)?;
-    if !matches!(options.curve.as_str(), "ed25519" | "secp256k1") {
+    if options.key_type.is_some() {
+        bail!("keypair generate does not accept --type");
+    }
+    let curve = options.curve.as_deref().context("--curve is required")?;
+    if !matches!(curve, "ed25519" | "secp256k1") {
         bail!("unsupported keypair curve");
     }
     if options.format.is_some() || options.blind_box {
@@ -1973,7 +2098,7 @@ fn keypair_generate_cmd(
     }
     let unlock = read_store_unlock(config, input)?;
     let master = load_or_create_master_from_unlock(&unlock)?;
-    let output = match options.curve.as_str() {
+    let output = match curve {
         "secp256k1" => {
             let (envelope, public_key) =
                 avault_core::generate_sealed_secp256k1_keypair(master.as_bytes(), &options.name)
@@ -2017,7 +2142,14 @@ fn keypair_import_cmd(
     input: &mut impl Read,
 ) -> anyhow::Result<u8> {
     let options = parse_keypair_options(args)?;
-    if options.curve != "ed25519" {
+    if let Some(key_type) = options.key_type.as_deref() {
+        if key_type != "hd-seed" {
+            bail!("unsupported keypair import type");
+        }
+        return keypair_import_hd_seed_cmd(options, config, input);
+    }
+    let curve = options.curve.as_deref().context("--curve is required")?;
+    if curve != "ed25519" {
         bail!("unsupported keypair curve");
     }
     let format = options.format.context("--format is required")?;
@@ -2031,13 +2163,8 @@ fn keypair_import_cmd(
         let blind_box: BlindBox = serde_json::from_slice(raw_input.as_slice())
             .map_err(|_| anyhow!("keypair blind-box JSON is invalid"))?;
         let master = load_existing_master_from_unlock(&unlock)?;
-        let receiver = avault_core::derive_blind_box_keypair_from_master(master.as_bytes());
-        let opened = receiver
-            .open(
-                &blind_box,
-                &BlindBoxContext::keypair_import(&options.name, "ed25519", &format),
-            )
-            .context("keypair blind-box open failed")?;
+        let opened =
+            open_keypair_blind_box(&master, &blind_box, &options.name, "ed25519", &format)?;
         raw_input.zeroize();
         raw_input = opened;
         master
@@ -2073,6 +2200,73 @@ fn keypair_import_cmd(
     serde_json::to_writer(io::stdout(), &output).context("failed to write keypair JSON")?;
     println!();
     Ok(0)
+}
+
+fn keypair_import_hd_seed_cmd(
+    options: KeypairOptions,
+    config: &CliConfig,
+    input: &mut impl Read,
+) -> anyhow::Result<u8> {
+    let format = options.format.context("--format is required")?;
+    if format != "raw-seed" {
+        bail!("unsupported HD seed import format");
+    }
+    let unlock = read_store_unlock(config, input)?;
+    let mut raw_input =
+        read_stdin_zeroizing_from(input).context("failed to read HD seed import from stdin")?;
+    let (master, seed) = if options.blind_box {
+        let blind_box: BlindBox = serde_json::from_slice(raw_input.as_slice())
+            .map_err(|_| anyhow!("keypair blind-box JSON is invalid"))?;
+        let master = load_existing_master_from_unlock(&unlock)?;
+        let opened =
+            open_keypair_blind_box(&master, &blind_box, &options.name, "hd-seed", &format)?;
+        raw_input.zeroize();
+        let seed = zeroizing_vec_to_seed64(opened)?;
+        (master, seed)
+    } else {
+        let seed = zeroizing_vec_to_seed64(raw_input)?;
+        let master = load_or_create_master_from_unlock(&unlock)?;
+        (master, seed)
+    };
+    let envelope = avault_core::seal_hd_seed(master.as_bytes(), &options.name, seed.as_ref())
+        .context("HD seed envelope seal failed")?;
+    let accounts = avault_core::derive_hd_accounts(&seed)
+        .context("HD seed account derivation failed")?
+        .into_iter()
+        .map(|account| HdAccountOutput {
+            account: account.account,
+            evm: hex::encode(account.evm),
+            bitcoin: hex::encode(account.bitcoin),
+            solana: hex::encode(account.solana),
+        })
+        .collect();
+    drop(seed);
+    drop(master);
+    drop(unlock);
+    let output = HdSeedOutput {
+        key_type: "hd-seed",
+        envelope,
+        accounts,
+    };
+    serde_json::to_writer(io::stdout(), &output).context("failed to write keypair JSON")?;
+    println!();
+    Ok(0)
+}
+
+fn open_keypair_blind_box(
+    master: &MasterKey,
+    blind_box: &BlindBox,
+    name: &str,
+    key_type: &str,
+    format: &str,
+) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+    let receiver = avault_core::derive_blind_box_keypair_from_master(master.as_bytes());
+    receiver
+        .open(
+            blind_box,
+            &BlindBoxContext::keypair_import(name, key_type, format),
+        )
+        .context("keypair blind-box open failed")
 }
 
 fn key_export_cmd(config: &CliConfig, input: &mut impl Read) -> anyhow::Result<u8> {

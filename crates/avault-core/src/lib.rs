@@ -27,6 +27,7 @@ use zeroize::Zeroizing;
 
 mod blind_box;
 mod ed25519;
+mod hd;
 mod secp256k1;
 mod signing;
 mod verifying;
@@ -41,6 +42,10 @@ pub use ed25519::{
     ED25519_PUBLIC_KEY_BYTES, ED25519_SEED_BYTES, MAX_ED25519_MESSAGE_BYTES,
     MAX_SOLANA_CLI_JSON_BYTES, MAX_SOLANA_SECRET_BASE58_BYTES, SOLANA_SECRET_KEY_BYTES,
 };
+pub use hd::{
+    derive_hd_account, derive_hd_accounts, derive_hd_private_key, validate_account,
+    HdAccountPublicKeys, HdChain, BIP39_SEED_BYTES, HD_ACCOUNT_COUNT,
+};
 pub use secp256k1::generate_sealed_secp256k1_keypair;
 pub use signing::{
     LocalSignerProvider, SignatureResult, SignatureScheme, SignerProvider,
@@ -48,6 +53,19 @@ pub use signing::{
     SIGN_SCHEME_SCHNORR_SECP256K1_BIP340, SIGN_SCHEME_SCHNORR_SECP256K1_BIP341_KEYPATH,
 };
 pub use verifying::verify_ecdsa_secp256k1_der;
+
+/// Distinct, AAD-authenticated type tag for standard-tier 64-byte HD seeds.
+/// Legacy versions and generic value/protected opens reject this scheme.
+pub const HD_SEED_WRAP_SCHEME: &str = "machine-hd-seed-aesgcm-v1";
+
+/// The semantic type of an envelope, as selected by its wrap scheme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvelopeKind {
+    /// An existing untagged avault record.
+    Legacy,
+    /// A typed 64-byte BIP39 seed.
+    HdSeed,
+}
 
 /// Wrap-meta scheme tag used by the P0 Python standard-tier envelope.
 pub const WRAP_SCHEME: &str = "machine-aesgcm-v1";
@@ -119,12 +137,36 @@ pub struct ExportBlob {
 /// between records. `value` is borrowed because CLI stdin and browser blind-box
 /// opens own the plaintext; callers should hold it in a zeroizing buffer.
 pub fn seal(master_key: &[u8; KEY_BYTES], name: &str, value: &[u8]) -> anyhow::Result<Sealed> {
+    seal_with_scheme(master_key, name, value, WRAP_SCHEME)
+}
+
+/// Seal a 64-byte browser-derived BIP39 seed with its distinct envelope type tag.
+///
+/// The tag is required by the HD signing path; an untagged private-key envelope
+/// cannot be used as a seed and a seed envelope cannot enter legacy signing.
+pub fn seal_hd_seed(
+    master_key: &[u8; KEY_BYTES],
+    name: &str,
+    seed: &[u8],
+) -> anyhow::Result<Sealed> {
+    if seed.len() != crate::BIP39_SEED_BYTES {
+        bail!("HD seed must be exactly 64 bytes");
+    }
+    seal_with_scheme(master_key, name, seed, HD_SEED_WRAP_SCHEME)
+}
+
+fn seal_with_scheme(
+    master_key: &[u8; KEY_BYTES],
+    name: &str,
+    value: &[u8],
+    scheme: &str,
+) -> anyhow::Result<Sealed> {
     let mut dek = Zeroizing::new([0u8; KEY_BYTES]);
     OsRng.fill_bytes(dek.as_mut());
 
     let mut value_nonce = [0u8; NONCE_BYTES];
     OsRng.fill_bytes(&mut value_nonce);
-    let ciphertext = encrypt_with_key(&dek, &value_nonce, value, &aad(name))?;
+    let ciphertext = encrypt_with_key(&dek, &value_nonce, value, &aad_for_scheme(name, scheme))?;
 
     let mut dek_nonce = [0u8; NONCE_BYTES];
     OsRng.fill_bytes(&mut dek_nonce);
@@ -132,7 +174,7 @@ pub fn seal(master_key: &[u8; KEY_BYTES], name: &str, value: &[u8]) -> anyhow::R
 
     let wrap_meta = WrapMeta {
         v: WRAP_META_VERSION,
-        scheme: WRAP_SCHEME.to_string(),
+        scheme: scheme.to_string(),
         wrapped_dek: b64(&wrapped_dek),
         dek_nonce: b64(&dek_nonce),
         record_meta: None,
@@ -143,6 +185,49 @@ pub fn seal(master_key: &[u8; KEY_BYTES], name: &str, value: &[u8]) -> anyhow::R
         nonce: b64(&value_nonce),
         wrap_meta: serde_json::to_string(&wrap_meta).context("failed to encode wrap_meta")?,
     })
+}
+
+/// Return the semantic type tag without opening the envelope.
+pub fn envelope_kind(sealed: &Sealed) -> anyhow::Result<EnvelopeKind> {
+    let meta: WrapMeta =
+        serde_json::from_str(&sealed.wrap_meta).context("wrap_meta is not valid JSON")?;
+    match meta.scheme.as_str() {
+        WRAP_SCHEME => Ok(EnvelopeKind::Legacy),
+        HD_SEED_WRAP_SCHEME => Ok(EnvelopeKind::HdSeed),
+        _ => bail!("unsupported wrap scheme"),
+    }
+}
+
+/// Open a typed HD-seed envelope without allowing an untagged key envelope through.
+pub fn open_hd_seed(
+    master_key: &[u8; KEY_BYTES],
+    name: &str,
+    sealed: &Sealed,
+) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+    let meta: WrapMeta =
+        serde_json::from_str(&sealed.wrap_meta).context("wrap_meta is not valid JSON")?;
+    if meta.scheme != HD_SEED_WRAP_SCHEME {
+        bail!("envelope is not an HD seed");
+    }
+    if meta.v != WRAP_META_VERSION || meta.record_meta.is_some() {
+        bail!("unsupported HD seed envelope metadata");
+    }
+    let dek = unwrap_dek(master_key, &meta)?;
+    let nonce = decode_nonce(&sealed.nonce, "nonce")?;
+    let ciphertext = unb64(&sealed.ciphertext, "ciphertext")?;
+    let value = Zeroizing::new(
+        decrypt_with_key(
+            slice_to_key(&dek)?,
+            &nonce,
+            &ciphertext,
+            &aad_for_scheme(name, HD_SEED_WRAP_SCHEME),
+        )
+        .context("HD seed decrypt failed")?,
+    );
+    if value.len() != BIP39_SEED_BYTES {
+        bail!("HD seed envelope has invalid length");
+    }
+    Ok(value)
 }
 
 /// Reverse [`seal`]. Returns plaintext in a zeroizing buffer; the caller must
@@ -165,6 +250,11 @@ pub fn open(
         bail!("unsupported wrap_meta version");
     }
 
+    let dek = unwrap_dek(master_key, &meta)?;
+    open_value_with_dek(slice_to_key(&dek)?, name, sealed)
+}
+
+fn unwrap_dek(master_key: &[u8; KEY_BYTES], meta: &WrapMeta) -> anyhow::Result<Zeroizing<Vec<u8>>> {
     let dek_nonce = decode_nonce(&meta.dek_nonce, "dek_nonce")?;
     let wrapped_dek = unb64(&meta.wrapped_dek, "wrapped_dek")?;
     let dek = Zeroizing::new(
@@ -173,8 +263,7 @@ pub fn open(
     if dek.len() != KEY_BYTES {
         bail!("DEK unwrap produced invalid length");
     }
-
-    open_value_with_dek(slice_to_key(dek.as_slice())?, name, sealed)
+    Ok(dek)
 }
 
 /// Open an envelope when the per-record DEK was released through a blind box.
@@ -359,9 +448,13 @@ fn validate_scrypt_params(n: u32, r: u32, p: u32) -> anyhow::Result<()> {
 }
 
 fn aad(name: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(name.len() + WRAP_SCHEME.len() + 1);
+    aad_for_scheme(name, WRAP_SCHEME)
+}
+
+fn aad_for_scheme(name: &str, scheme: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(name.len() + scheme.len() + 1);
     out.extend_from_slice(name.as_bytes());
-    out.extend_from_slice(WRAP_SCHEME.as_bytes());
+    out.extend_from_slice(scheme.as_bytes());
     out.push(WRAP_META_VERSION);
     out
 }
@@ -447,6 +540,103 @@ mod tests {
         assert_eq!(meta["scheme"], WRAP_SCHEME);
         assert!(meta["wrapped_dek"].as_str().unwrap().len() > 32);
         assert!(meta["dek_nonce"].as_str().unwrap().len() > 8);
+    }
+
+    #[test]
+    fn typed_seed_envelope_cannot_cross_keypair_boundary_or_be_retagged() {
+        let seed = [0x42u8; crate::BIP39_SEED_BYTES];
+        let sealed = seal_hd_seed(&MASTER_KEY, "HD_WALLET", &seed).unwrap();
+        assert_eq!(envelope_kind(&sealed).unwrap(), EnvelopeKind::HdSeed);
+        assert_eq!(
+            open_hd_seed(&MASTER_KEY, "HD_WALLET", &sealed)
+                .unwrap()
+                .as_slice(),
+            seed
+        );
+        assert!(open(&MASTER_KEY, "HD_WALLET", &sealed).is_err());
+        assert!(open_with_dek(&MASTER_KEY, "HD_WALLET", &sealed).is_err());
+
+        let private = seal(&MASTER_KEY, "PRIVATE_KEY", &[0x11u8; KEY_BYTES]).unwrap();
+        assert_eq!(envelope_kind(&private).unwrap(), EnvelopeKind::Legacy);
+        assert!(open_hd_seed(&MASTER_KEY, "PRIVATE_KEY", &private).is_err());
+
+        let mut retagged = sealed.clone();
+        let mut meta: serde_json::Value = serde_json::from_str(&retagged.wrap_meta).unwrap();
+        meta["scheme"] = json!(WRAP_SCHEME);
+        retagged.wrap_meta = meta.to_string();
+        assert!(open(&MASTER_KEY, "HD_WALLET", &retagged).is_err());
+        assert!(open_hd_seed(&MASTER_KEY, "OTHER", &sealed).is_err());
+        assert!(open_hd_seed(&[7; KEY_BYTES], "HD_WALLET", &sealed).is_err());
+        for len in [0, 32, 63, 65] {
+            assert!(seal_hd_seed(&MASTER_KEY, "HD_WALLET", &vec![1; len]).is_err());
+            let bad_length =
+                seal_with_scheme(&MASTER_KEY, "HD_WALLET", &vec![1; len], HD_SEED_WRAP_SCHEME)
+                    .unwrap();
+            assert!(open_hd_seed(&MASTER_KEY, "HD_WALLET", &bad_length).is_err());
+        }
+        for len in [32, 64] {
+            let mut legacy = seal(&MASTER_KEY, "HD_WALLET", &vec![1; len]).unwrap();
+            let mut meta: serde_json::Value = serde_json::from_str(&legacy.wrap_meta).unwrap();
+            meta["scheme"] = json!(HD_SEED_WRAP_SCHEME);
+            legacy.wrap_meta = meta.to_string();
+            assert!(open_hd_seed(&MASTER_KEY, "HD_WALLET", &legacy).is_err());
+        }
+        for (field, value) in [
+            ("v", json!(2)),
+            ("scheme", json!("unknown")),
+            ("record_meta", json!({"kind":"static"})),
+        ] {
+            let mut modified = sealed.clone();
+            let mut meta: serde_json::Value = serde_json::from_str(&modified.wrap_meta).unwrap();
+            meta[field] = value;
+            modified.wrap_meta = meta.to_string();
+            assert!(open_hd_seed(&MASTER_KEY, "HD_WALLET", &modified).is_err());
+        }
+        let mut damaged = sealed.clone();
+        let mut ciphertext = unb64(&damaged.ciphertext, "ciphertext").unwrap();
+        ciphertext[0] ^= 1;
+        damaged.ciphertext = b64(&ciphertext);
+        assert!(open_hd_seed(&MASTER_KEY, "HD_WALLET", &damaged).is_err());
+    }
+
+    #[test]
+    fn hd_envelope_matches_independent_aesgcm_vector_and_has_no_empty_aad_fallback() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../../tests/vectors/hd_wallets.json")).unwrap();
+        let vector = &fixture["envelope"];
+        let master: [u8; KEY_BYTES] = hex::decode(vector["master"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let dek: [u8; KEY_BYTES] = hex::decode(vector["dek"].as_str().unwrap())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let name = vector["name"].as_str().unwrap();
+        let seed = hex::decode(fixture["bip86_seed"].as_str().unwrap()).unwrap();
+        let mut sealed: Sealed = serde_json::from_value(vector["sealed"].clone()).unwrap();
+        assert_eq!(
+            aad_for_scheme(name, HD_SEED_WRAP_SCHEME),
+            hex::decode(vector["aad"].as_str().unwrap()).unwrap()
+        );
+        assert_eq!(
+            open_hd_seed(&master, name, &sealed).unwrap().as_slice(),
+            seed
+        );
+        let nonce = decode_nonce(&sealed.nonce, "nonce").unwrap();
+        assert_eq!(
+            b64(&encrypt_with_key(
+                &dek,
+                &nonce,
+                &seed,
+                &aad_for_scheme(name, HD_SEED_WRAP_SCHEME)
+            )
+            .unwrap()),
+            sealed.ciphertext
+        );
+        assert!(open_with_dek(&dek, name, &sealed).is_err());
+        sealed.ciphertext = b64(&encrypt_with_key(&dek, &nonce, &seed, &[]).unwrap());
+        assert!(open_hd_seed(&master, name, &sealed).is_err());
     }
 
     #[test]
