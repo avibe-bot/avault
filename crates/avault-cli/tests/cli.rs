@@ -4738,6 +4738,153 @@ fn solana_blind_box_import_binds_name_curve_format_and_sanitizes_errors() {
 }
 
 #[test]
+fn hd_seed_agent_delivery_rejects_standard_and_released_dek_paths() {
+    let home = tempfile::tempdir().unwrap();
+    let vault_home = home.path().join("vault");
+    let socket = home.path().join("run/avault.sock");
+    let imported = solana_cli_input(
+        &vault_home,
+        &[
+            "keypair",
+            "import",
+            "--name",
+            "HD_VECTOR",
+            "--type",
+            "hd-seed",
+            "--format",
+            "raw-seed",
+        ],
+        &[42; 64],
+    );
+    assert!(imported.status.success());
+    let imported: serde_json::Value = serde_json::from_slice(&imported.stdout).unwrap();
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../../../tests/vectors/hd_wallets.json")).unwrap();
+    let dek: [u8; 32] = hex::decode(fixture["envelope"]["dek"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let mut agent = spawn_agent_command(&socket, 60)
+        .env("AVAULT_HOME", &vault_home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stream = connect_agent(&socket);
+    let pubkey = agent_request(&mut stream, json!({"type":"pubkey"}));
+    let grant = grant_protected_dek(
+        &mut stream,
+        pubkey["result"]["public_key"].as_str().unwrap(),
+        "hd-refusal",
+        "HD_VECTOR",
+        &dek,
+        b"hd-refusal-nonce-1",
+    );
+    let path = home.path().join("must-not-write");
+    let mut responses = Vec::new();
+    for (tier, envelope) in [
+        ("standard", &imported["envelope"]),
+        ("protected", &fixture["envelope"]["sealed"]),
+    ] {
+        let secret =
+            json!({"name":"HD_VECTOR", "tier":tier, "env":"HD_VECTOR", "envelope":envelope});
+        for request in [
+            json!({"type":"deliver.run","grant_id":"hd-refusal","command":["must-not-start"],"secrets":[secret]}),
+            json!({"type":"deliver.inject","grant_id":"hd-refusal","path":path,"format":"dotenv","secrets":[secret]}),
+            json!({"type":"deliver.fetch","grant_id":"hd-refusal","auth":{"name":"HD_VECTOR","tier":tier,"envelope":envelope},"request":{
+                "method":"GET","url":"http://127.0.0.1:9/","allowed_hosts":["127.0.0.1"]
+            }}),
+        ] {
+            responses.push(agent_request(&mut stream, request));
+        }
+    }
+    let _ = agent.kill();
+    let _ = agent.wait();
+    assert_eq!(grant["ok"], true, "{grant}");
+    assert!(!path.exists());
+    for response in responses {
+        assert_eq!(response["ok"], false, "{response}");
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap()
+                .contains("unsupported wrap scheme"),
+            "{response}"
+        );
+        assert!(response.get("result").is_none());
+    }
+}
+
+#[test]
+fn hd_seed_blind_box_import_binds_name_type_format_purpose_and_exact_length() {
+    let home = tempfile::tempdir().unwrap();
+    let vault_home = home.path().join("vault");
+    let output = solana_cli_input(&vault_home, &["pubkey"], b"");
+    assert!(output.status.success());
+    let public: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let args = [
+        "keypair",
+        "import",
+        "--name",
+        "HD_SEED",
+        "--type",
+        "hd-seed",
+        "--format",
+        "raw-seed",
+        "--blind-box",
+    ];
+    let raw = solana_cli_input(&vault_home, &args[..args.len() - 1], &[42; 64]);
+    assert!(raw.status.success());
+    let expected: serde_json::Value = serde_json::from_slice(&raw.stdout).unwrap();
+    for (name, scheme, purpose, length, valid) in [
+        ("HD_SEED", "hd-seed:raw-seed", "keypair-import", 64, true),
+        ("OTHER", "hd-seed:raw-seed", "keypair-import", 64, false),
+        ("HD_SEED", "ed25519:raw-seed", "keypair-import", 64, false),
+        ("HD_SEED", "hd-seed:seed-hex", "keypair-import", 64, false),
+        ("HD_SEED", "hd-seed:raw-seed", "seal", 64, false),
+        ("HD_SEED", "hd-seed:raw-seed", "keypair-import", 32, false),
+        ("HD_SEED", "hd-seed:raw-seed", "keypair-import", 65, false),
+    ] {
+        // Independently assemble the browser AAD, not the production context helper.
+        let aad = blind_box_aad(TestBlindBoxAad {
+            purpose,
+            name,
+            grant_id: "",
+            scheme,
+            digest: &[],
+            approval_nonce: &[],
+            approval_expires_at_unix: None,
+            operation_hash: &[],
+        });
+        let blind = fixed_blind_box(
+            public["public_key"].as_str().unwrap(),
+            &vec![42; length],
+            &aad,
+        );
+        let output = solana_cli_input(&vault_home, &args, &serde_json::to_vec(&blind).unwrap());
+        assert_eq!(
+            output.status.success(),
+            valid,
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if valid {
+            let imported: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(imported["accounts"], expected["accounts"]);
+            assert_eq!(imported["type"], "hd-seed");
+        } else {
+            assert!(output.stdout.is_empty());
+        }
+    }
+    let marker = b"never-echo-this-seed-input";
+    let output = solana_cli_input(&vault_home, &args, &serde_json::to_vec(marker).unwrap());
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("never-echo"));
+}
+
+#[test]
 fn solana_protected_grants_and_signatures_are_refused_before_key_open() {
     let tmp = tempfile::tempdir().unwrap();
     let socket = tmp.path().join("run").join("avault.sock");

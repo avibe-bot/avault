@@ -728,6 +728,129 @@ key-path scheme, and the official BIP341/BIP86 parity coverage live in
 Production Schnorr signing uses fresh auxiliary randomness; deterministic fixtures use
 an explicit all-zero auxiliary value only for test-vector comparison.
 
+### Standard-tier HD seed wallets
+
+This is an additive **one-shot** import/sign contract. Existing keypair generation,
+Solana imports, signing requests, envelope bytes/AAD, and resident protected signing
+are unchanged. No release, version bump, or Avibe binary pin is implied by this
+interface change; the consumer must enable it only after an approved release.
+
+The browser handles BIP39 words, checksum, optional passphrase, and PBKDF2. avault
+receives exactly **64 seed bytes**, not mnemonic entropy and not a Solana seed+public
+key. It contains no word list, mnemonic parser, BIP39 KDF, or mnemonic reveal/export.
+A single standard-tier envelope stores this seed and supplies 20 accounts, #0–#19.
+The same index selects the following three fixed paths:
+
+| `derivation.chain` | Path for index `i` | Required signing scheme |
+|---|---|---|
+| `evm` | `m/44'/60'/0'/0/i` (BIP32) | `ecdsa-secp256k1-recoverable` |
+| `bitcoin` | `m/86'/0'/0'/0/i` (BIP32/BIP86) | `schnorr-secp256k1-bip341-keypath` |
+| `solana` | `m/44'/501'/i'/0'` (SLIP-0010 Ed25519) | `ed25519` |
+
+Here “account” is the product's shared index, not necessarily the BIP44 account
+component: EVM/Bitcoin increment the receiving-address index. Only these exact chain
+names and integer indices 0–19 are accepted; there is no arbitrary-path, change-chain,
+xprv/xpub, chain-code, or more-accounts operation. BIP32 rejects an invalid master
+scalar, an out-of-range child tweak, or a zero child scalar. For the vanishingly rare
+undefined child at an exact requested path it fails instead of silently advancing an
+index and returning a different path under the requested label. A zero tweak is valid.
+SLIP-0010 Ed25519 derivation is hardened-only.
+
+#### Import and authenticated type separation
+
+```sh
+avault keypair import --name WALLET --type hd-seed --format raw-seed --blind-box
+```
+
+`--type` and `--curve` are mutually exclusive. `--type hd-seed` is import-only;
+`--format raw-seed` is the only seed format. Without `--blind-box`, stdin is exactly
+64 binary bytes (no newline trimming). That mode is for a direct file descriptor,
+not an invitation for Python or an Agent to handle the plaintext. With `--blind-box`,
+stdin is the existing HPKE JSON. Its existing length-prefixed blind-box AAD binds
+purpose `keypair-import`, record name, and scheme `hd-seed:raw-seed` (the import
+context's curve/type and format). A generic `seal` box or an Ed25519 import box cannot
+be substituted. Import returns only ciphertext and public metadata:
+
+```json
+{
+  "type": "hd-seed",
+  "envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." },
+  "accounts": [
+    { "account": 0, "evm": "<33-byte compressed SEC1 hex>", "bitcoin": "<33-byte compressed SEC1 hex>", "solana": "<32-byte Ed25519 hex>" }
+  ]
+}
+```
+
+The real array always has **20** entries in ascending order. Hex is lowercase with
+no prefix; Bitcoin's key is the **untweaked internal key**, so existing address
+formatting and the BIP341 signer each apply TapTweak at their established boundary.
+No private key, chain code, or address is returned by the HD import API.
+
+HD `wrap_meta` has the existing fields `v`, `scheme`, `wrapped_dek`, `dek_nonce`,
+with `v=1` and a **distinct scheme** `machine-hd-seed-aesgcm-v1`. This scheme is the
+type tag, not an unauthenticated optional hint. Value AES-GCM AAD is exactly
+`UTF8(name) || UTF8("machine-hd-seed-aesgcm-v1") || 0x01`. DEK wrapping and nonce
+sizes are unchanged. The plaintext must be 64 bytes; ciphertext including its tag
+is 80 bytes. HD opening rejects protected `record_meta` and has **no empty-AAD
+fallback**. Generic value and protected-DEK opens accept only the legacy scheme,
+so run/fetch/inject cannot deliver a seed, including through the resident agent.
+Changing the scheme in either direction fails value authentication even if length
+checks would otherwise accept the plaintext. Existing records retain the legacy
+scheme and its original read-compatibility behavior.
+
+#### Signing and compatibility
+
+The existing JSON `sign` request adds optional `derivation`:
+
+```json
+{
+  "name": "WALLET",
+  "key_envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." },
+  "derivation": { "chain": "evm", "account": 1 },
+  "digest": "<32-byte hex digest>"
+}
+```
+
+`chain` is required with derivation; omitted `account` means 0. `scheme` may be
+omitted **only** with derivation; if supplied, it must equal the chain's fixed
+scheme. EVM/Bitcoin require `digest`, Solana requires exact `message_hex` under the
+existing 1 MiB cap. Chain, index, scheme and payload mismatches fail before loading
+the master or opening any envelope. A seed requires derivation; an ordinary keypair
+rejects it. One-shot protected `dek_blindbox`/`approval` fields remain rejected.
+The result is the unchanged `{signature,recovery_id}` object.
+
+After opening, the master is dropped before deriving. The seed is dropped before
+signing, and the derived key is dropped after the existing signer returns, including
+error paths. Owned seeds, node keys, chain codes, HMAC output, derivation payloads,
+and scalar/serialized intermediates use zeroizing storage. This is deterministic
+cleanup of owned buffers, **not** a proof that compiler/register copies or upstream
+HMAC/SHA-512 internal states are scrubbed: the pinned `hmac`/`sha2` implementations
+do not promise that cleanup. Derived buffers are not individually mlocked; the
+existing store owns the locked master-key pages. There is no resident seed cache.
+
+Avibe owns “enabled account” authorization and public metadata persistence; avault
+only enforces the 20-account bound. Avibe must verify each returned signature against
+the selected stored public key. The consumer keeps `kind=keypair` and introduces
+`signer_kind=hd-seed`: old Avibe refuses value delivery for keypairs and refuses
+non-local signing. New Avibe must check the approved minimum avault version before
+creating or signing HD records. Independently of that gate, old avault rejects
+`--type`, unknown `derivation`, and the new wrap scheme; removing derivation or
+retagging cannot turn the seed into a legacy signing key or deliverable value.
+Protected HD creation/signing and the sandbox protocol are outside this change.
+
+The standard-tier threat model is unchanged, but the loss scope is larger: same-UID
+machine compromise can expose the **entire seed**, including unenabled accounts and
+other chains derived from it. This is a hot-wallet facility, not protection for a
+user's primary recovery phrase. Words cannot be recovered from the stored seed.
+
+`tests/vectors/hd_wallets.json` contains all BIP32 derivation vectors 1–4 (including
+leading zeros), SLIP-0010 Ed25519 vectors 1–2, the BIP86 root/account/receiving/change
+vectors, the public test mnemonic's first two multichain accounts, and an independent
+Python AES-GCM HD envelope. Source URLs and content hashes identify the official
+vector inputs. Tests verify BIP86 signatures against published **output keys**, not
+only the returned internal keys. Invalid extended-key import vectors are irrelevant:
+there is no extended-key input API. All fixture seed/key material is public test data.
+
 ### Public signature verification (`verify`)
 
 `verify` answers one question about public data: does this signature match this public
