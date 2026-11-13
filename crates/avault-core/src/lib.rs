@@ -27,6 +27,7 @@ use zeroize::Zeroizing;
 
 mod blind_box;
 mod ed25519;
+mod generate_secret;
 mod hd;
 mod secp256k1;
 mod signing;
@@ -42,6 +43,7 @@ pub use ed25519::{
     ED25519_PUBLIC_KEY_BYTES, ED25519_SEED_BYTES, MAX_ED25519_MESSAGE_BYTES,
     MAX_SOLANA_CLI_JSON_BYTES, MAX_SOLANA_SECRET_BASE58_BYTES, SOLANA_SECRET_KEY_BYTES,
 };
+pub use generate_secret::{generate_sealed_secret, SecretGeneration};
 pub use hd::{
     derive_hd_account, derive_hd_accounts, derive_hd_bitcoin_public_key, derive_hd_private_key,
     derive_hd_private_key_with_address_type, validate_account, BitcoinAddressType,

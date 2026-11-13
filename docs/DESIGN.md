@@ -506,6 +506,7 @@ These are starting recommendations, not frozen choices — items #2 (envelope) a
 |---|---|---|---|
 | `pubkey` | — | X25519 public key + fingerprint | one-shot `pubkey` supports blind-box create; protected DEK release uses the resident agent's ephemeral `pubkey` frame |
 | `seal` | blind box (the value) + name/scheme | envelope `{ciphertext, nonce, wrap_meta}` | standard-tier create: open box → wrap DEK under master → return ciphertext (never plaintext). The CLI plaintext-stdin path remains for local `set` / fd passthrough. |
+| `generate-secret` | name + password/hex/base64 recipe | envelope `{ciphertext, nonce, wrap_meta}` | generate a static Standard value inside avault with `rand 0.8::rngs::OsRng`, seal it immediately, and return no plaintext |
 | `deliver` | envelope + mode (`run` / `fetch` / `inject`) | exit code / response body / written file | one-shot standard-tier delivery uses the master key; protected delivery uses resident-agent grants, never inline DEK boxes |
 | `keypair generate` / `keypair import` | curve + name; import bytes or blind box | sealed key envelope + public metadata | standard-tier generation for `ed25519` / Solana and chain-neutral `secp256k1`; import remains Ed25519-only, with no private-key export or protected-tier creation |
 | `sign` | key envelope + name + digest or exact message + scheme | signature (public) | one-shot standard-tier signing; protected signing uses resident-agent grants for supported secp256k1 schemes. The private key never leaves `avault` |
@@ -675,6 +676,35 @@ The legacy/local CLI path `seal --name NAME < value` remains available for direc
 file-descriptor passthrough from Avibe's local `set` path. In both paths, new
 envelopes authenticate value ciphertext with AAD
 `name || "machine-aesgcm-v1" || 0x01`.
+
+`generate-secret` is available in the additive avault capability released after
+0.1.12 (the consumer floor is `>=0.1.13`). It takes no value from stdin for the
+normal file/keychain stores and emits exactly the same `Sealed` JSON envelope as
+`seal`:
+
+```sh
+avault generate-secret --name NAME --type password --length N \
+  [--no-digits] [--no-symbols] [--no-lookalikes]
+avault generate-secret --name NAME --type hex --bytes N
+avault generate-secret --name NAME --type base64 --bytes N
+```
+
+Password length is 12..=128. Letters are always enabled; digits and the exact
+symbol set `!#$%&*+-.:=?@^_~` are enabled by default. `--no-lookalikes` removes
+`0 O 1 l I` from every enabled class. Every enabled class must occur at least
+once; a failed candidate causes whole-string regeneration. Hex and Base64 accept
+16..=64 random bytes. Hex is lowercase; Base64 is standard padded Base64 with
+no line wrapping and no trailing CLI newline (the body of `openssl rand
+-base64 N` after its line terminator is removed).
+
+The password sampler draws one byte from the OS CSPRNG and rejects values at or
+above the largest multiple of the alphabet size below 256 before modulo
+reduction, preventing modulo bias. Generated plaintext and encoded bytes remain
+in zeroizing memory until `seal` completes. Invalid recipes, unknown types, and
+flags belonging to another type fail before the master store is opened; stdout
+is empty on failure and stderr never contains a generated value. Older binaries
+reject the unknown `generate-secret` command, so Avibe must gate this operation
+on avault `>=0.1.13` rather than fall back.
 
 `sign` reads one JSON object from stdin:
 
