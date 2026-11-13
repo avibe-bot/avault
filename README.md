@@ -31,6 +31,9 @@ Implemented CLI surface:
 
 ```sh
 avault seal --name OPENAI_API_KEY < value.txt
+avault generate-secret --name NEW_API_KEY --type password --length 24
+avault generate-secret --name NEW_HEX --type hex --bytes 32
+avault generate-secret --name NEW_BASE64 --type base64 --bytes 32
 avault deliver run --name OPENAI_API_KEY --env OPENAI_API_KEY -- env
 avault deliver run --name OPENAI_API_KEY --env OPENAI_API_KEY --envelope-file envelope.json -- env
 avault deliver run -- env < run-secrets.json
@@ -48,7 +51,16 @@ avault sign < sign-request.json
 avault verify < verify-request.json
 ```
 
-`seal` reads the value from stdin and writes envelope JSON on stdout:
+`generate-secret` creates a new static Standard value inside avault and returns only the
+same `{ciphertext, nonce, wrap_meta}` envelope as `seal`; plaintext is never returned.
+It requires avault `>=0.1.13`. Passwords are 12..=128 characters with letters always
+enabled, optional digits and the fixed symbol set `!#$%&*+-.:=?@^_~` enabled by
+default, and optional `--no-lookalikes`. Hex and standard padded, unwrapped Base64
+accept 16..=64 random bytes. The generated value is held in zeroizing memory and
+sealed directly with the OS CSPRNG; invalid or cross-type flags fail before the store
+is opened.
+
+`seal` reads the value from stdin and writes envelope JSON on stdout. The result is
 `{ciphertext, nonce, wrap_meta}`. `wrap_meta` matches P0 Python's
 `{"v":1,"scheme":"machine-aesgcm-v1","wrapped_dek":...,"dek_nonce":...}` shape.
 New P1 writes authenticate the value with AAD bytes

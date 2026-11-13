@@ -19,6 +19,9 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[path = "support/generate_secret.rs"]
+mod generate_secret;
+
 fn avault() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_avault"));
     command.arg("--store").arg("file");

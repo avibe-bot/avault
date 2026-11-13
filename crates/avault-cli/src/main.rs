@@ -6,8 +6,8 @@ use anyhow::{anyhow, bail, Context};
 #[cfg(unix)]
 use avault_core::BlindBoxKeypair;
 use avault_core::{
-    BlindBox, BlindBoxContext, ExportBlob, LocalSignerProvider, Sealed, SignatureScheme,
-    SignerProvider,
+    BlindBox, BlindBoxContext, ExportBlob, LocalSignerProvider, Sealed, SecretGeneration,
+    SignatureScheme, SignerProvider,
 };
 use avault_store::{Backend, MasterKey, PassphraseFileStore};
 #[cfg(unix)]
@@ -89,6 +89,8 @@ USAGE:
     avault [--store auto|keychain|tpm|file|file-passphrase] COMMAND ...
     avault seal --name NAME
     avault seal --name NAME --blind-box
+    avault generate-secret --name NAME --type password --length N [--no-digits] [--no-symbols] [--no-lookalikes]
+    avault generate-secret --name NAME --type hex|base64 --bytes N
     avault deliver run --name NAME --env VAR [--envelope-file PATH] -- COMMAND [ARGS...]
     avault deliver run -- COMMAND [ARGS...] < run-secrets.json
     avault deliver fetch < fetch-request.json
@@ -178,6 +180,7 @@ fn run(args: Vec<OsString>) -> anyhow::Result<u8> {
             Ok(0)
         }
         "seal" => seal_cmd(&args[1..], &config, &mut stdin),
+        "generate-secret" => generate_secret_cmd(&args[1..], &config, &mut stdin),
         "deliver" => deliver_cmd(&args[1..], &config, &mut stdin),
         "key" => key_cmd(&args[1..], &config, &mut stdin),
         "keypair" => keypair_cmd(&args[1..], &config, &mut stdin),
@@ -373,6 +376,167 @@ fn parse_seal_options(args: &[OsString]) -> anyhow::Result<SealOptions> {
     Ok(SealOptions {
         name: name.context("--name is required")?,
         blind_box,
+    })
+}
+
+#[derive(Debug)]
+struct GenerateSecretOptions {
+    name: String,
+    recipe: SecretGeneration,
+}
+
+fn generate_secret_cmd(
+    args: &[OsString],
+    config: &CliConfig,
+    input: &mut impl Read,
+) -> anyhow::Result<u8> {
+    // Parse and validate the complete recipe before unlocking or creating the master key. An
+    // invalid request therefore cannot create a store record or produce partial output.
+    let options = parse_generate_secret_options(args)?;
+    let unlock = read_store_unlock(config, input)?;
+    let master = load_or_create_master_from_unlock(&unlock)?;
+    let sealed =
+        avault_core::generate_sealed_secret(master.as_bytes(), &options.name, options.recipe)
+            .context("secret generation or seal failed")?;
+    drop(master);
+    drop(unlock);
+    serde_json::to_writer(io::stdout(), &sealed).context("failed to write envelope JSON")?;
+    println!();
+    Ok(0)
+}
+
+fn parse_generate_secret_options(args: &[OsString]) -> anyhow::Result<GenerateSecretOptions> {
+    let mut name = None;
+    let mut secret_type = None;
+    let mut length = None;
+    let mut bytes = None;
+    let mut no_digits = false;
+    let mut no_symbols = false;
+    let mut no_lookalikes = false;
+    let mut index = 0;
+
+    while index < args.len() {
+        let flag = args[index]
+            .to_str()
+            .context("generate-secret options must be valid UTF-8")?;
+        match flag {
+            "--name" => {
+                if name.is_some() {
+                    bail!("--name was provided more than once");
+                }
+                let value = args
+                    .get(index + 1)
+                    .and_then(|s| s.to_str())
+                    .context("--name requires a value")?;
+                name = Some(value.to_string());
+                index += 2;
+            }
+            "--type" => {
+                if secret_type.is_some() {
+                    bail!("--type was provided more than once");
+                }
+                let value = args
+                    .get(index + 1)
+                    .and_then(|s| s.to_str())
+                    .context("--type requires a value")?;
+                secret_type = Some(value.to_string());
+                index += 2;
+            }
+            "--length" => {
+                if length.is_some() {
+                    bail!("--length was provided more than once");
+                }
+                let value = args
+                    .get(index + 1)
+                    .and_then(|s| s.to_str())
+                    .context("--length requires a value")?;
+                length = Some(
+                    value
+                        .parse::<usize>()
+                        .with_context(|| "--length must be a decimal integer")?,
+                );
+                index += 2;
+            }
+            "--bytes" => {
+                if bytes.is_some() {
+                    bail!("--bytes was provided more than once");
+                }
+                let value = args
+                    .get(index + 1)
+                    .and_then(|s| s.to_str())
+                    .context("--bytes requires a value")?;
+                bytes = Some(
+                    value
+                        .parse::<usize>()
+                        .with_context(|| "--bytes must be a decimal integer")?,
+                );
+                index += 2;
+            }
+            "--no-digits" => {
+                if no_digits {
+                    bail!("--no-digits was provided more than once");
+                }
+                no_digits = true;
+                index += 1;
+            }
+            "--no-symbols" => {
+                if no_symbols {
+                    bail!("--no-symbols was provided more than once");
+                }
+                no_symbols = true;
+                index += 1;
+            }
+            "--no-lookalikes" => {
+                if no_lookalikes {
+                    bail!("--no-lookalikes was provided more than once");
+                }
+                no_lookalikes = true;
+                index += 1;
+            }
+            other => bail!("unknown generate-secret option: {other}"),
+        }
+    }
+
+    let secret_type = secret_type.context("--type is required")?;
+    let recipe = match secret_type.as_str() {
+        "password" => {
+            if bytes.is_some() {
+                bail!("password type does not accept --bytes");
+            }
+            let length = length.context("password type requires --length")?;
+            if !(12..=128).contains(&length) {
+                bail!("password length must be between 12 and 128");
+            }
+            SecretGeneration::Password {
+                length,
+                digits: !no_digits,
+                symbols: !no_symbols,
+                no_lookalikes,
+            }
+        }
+        "hex" | "base64" => {
+            if length.is_some() {
+                bail!("{secret_type} type does not accept --length");
+            }
+            if no_digits || no_symbols || no_lookalikes {
+                bail!("{secret_type} type does not accept password flags");
+            }
+            let bytes = bytes.with_context(|| format!("{secret_type} type requires --bytes"))?;
+            if !(16..=64).contains(&bytes) {
+                bail!("{secret_type} byte count must be between 16 and 64");
+            }
+            if secret_type == "hex" {
+                SecretGeneration::Hex { bytes }
+            } else {
+                SecretGeneration::Base64 { bytes }
+            }
+        }
+        other => bail!("unsupported secret type '{other}'; expected password, hex, or base64"),
+    };
+
+    Ok(GenerateSecretOptions {
+        name: name.context("--name is required")?,
+        recipe,
     })
 }
 
