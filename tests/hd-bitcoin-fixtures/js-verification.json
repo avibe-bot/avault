@@ -1,0 +1,108 @@
+{
+  "status": "PASS",
+  "node": "v22.23.4",
+  "fixture_sha256": "d5c2fcbdfe3c4949b4d715dd77276569a3601dab7903b79ded3a32589b526109",
+  "package_lock_sha256": "e9580e905c756aa26d2b750a50768cd64c9788b4535489762c1f1b8f1c070931",
+  "packages": [
+    {
+      "path": "node_modules/@scure/bip32",
+      "name": "@scure/bip32",
+      "version": "1.7.0",
+      "url": "https://registry.npmjs.org/@scure/bip32/-/bip32-1.7.0.tgz",
+      "integrity": "sha512-E4FFX/N3f4B80AKWp5dP6ow+flD1LQZo/w8UnLGYZO674jS6YnYeepycOOksv+vLPSpgN35wgKgy+ybfTb2SMw==",
+      "installed_code_tree": {
+        "files": 4,
+        "sha256_of_sorted_path_sha256_json": "15d421c8d683b5213776cb8cbdbb79946efc9198c9d190a0ac52cac9f56b6295"
+      }
+    },
+    {
+      "path": "node_modules/@scure/bip39",
+      "name": "@scure/bip39",
+      "version": "1.6.0",
+      "url": "https://registry.npmjs.org/@scure/bip39/-/bip39-1.6.0.tgz",
+      "integrity": "sha512-+lF0BbLiJNwVlev4eKelw1WWLaiKXw7sSl8T6FvBlWkdX+94aGJ4o8XjUdlyhTCjd8c+B3KT3JfS8P0bLRNU6A==",
+      "installed_code_tree": {
+        "files": 24,
+        "sha256_of_sorted_path_sha256_json": "2e34b9fc71cf91d1aa4f85beb00c95133b1b74eb63d9185798ba0955b39b5a6a"
+      }
+    },
+    {
+      "path": "node_modules/@scure/base",
+      "name": "@scure/base",
+      "version": "1.2.6",
+      "url": "https://registry.npmjs.org/@scure/base/-/base-1.2.6.tgz",
+      "integrity": "sha512-g/nm5FgUa//MCj1gV09zTJTaM6KBAHqLN907YVQqf7zC49+DcO4B1so4ZX07Ef10Twr6nuqYEH9GEggFXA4Fmg==",
+      "installed_code_tree": {
+        "files": 4,
+        "sha256_of_sorted_path_sha256_json": "31d3546cd3c82767c1b116ad4cd53dc740ad9dca8ea08d75be6fd7fe4771ee20"
+      }
+    },
+    {
+      "path": "node_modules/@noble/curves",
+      "name": "@noble/curves",
+      "version": "2.2.0",
+      "url": "https://registry.npmjs.org/@noble/curves/-/curves-2.2.0.tgz",
+      "integrity": "sha512-T/BoHgFXirb0ENSPBquzX0rcjXeM6Lo892a2jlYJkqk83LqZx0l1Of7DzlKJ6jkpvMrkHSnAcgb5JegL8SeIkQ==",
+      "installed_code_tree": {
+        "files": 23,
+        "sha256_of_sorted_path_sha256_json": "c5432a1f64fbb171976a1a00c787a5bffef6b88d2d7c17ee8feed2f24aad5075"
+      }
+    },
+    {
+      "path": "node_modules/@noble/hashes",
+      "name": "@noble/hashes",
+      "version": "2.2.0",
+      "url": "https://registry.npmjs.org/@noble/hashes/-/hashes-2.2.0.tgz",
+      "integrity": "sha512-IYqDGiTXab6FniAgnSdZwgWbomxpy9FtYvLKs7wCUs2a8RkITG+DFGO1DM9cr+E3/RgADRpFjrKVaJ1z6sjtEg==",
+      "installed_code_tree": {
+        "files": 20,
+        "sha256_of_sorted_path_sha256_json": "447094d57583bbc6c41fdcda1e3bdd941006ab5ac71a0f5ee2c6e0828affe919"
+      }
+    },
+    {
+      "path": "node_modules/@scure/bip32/node_modules/@noble/curves",
+      "name": "@noble/curves",
+      "version": "1.9.7",
+      "url": "https://registry.npmjs.org/@noble/curves/-/curves-1.9.7.tgz",
+      "integrity": "sha512-gbKGcRUYIjA3/zCCNaWDciTMFI0dCkvou3TL8Zmy5Nc7sJ47a0jtOeZoTaMxkuqRo9cRhjOdZJXegxYE5FN/xw==",
+      "installed_code_tree": {
+        "files": 55,
+        "sha256_of_sorted_path_sha256_json": "ff1992ff704754ff67bdad123058e2492377a93d56ee8422ccee1a9d576ad020"
+      }
+    },
+    {
+      "path": "node_modules/@scure/bip32/node_modules/@noble/hashes",
+      "name": "@noble/hashes",
+      "version": "1.8.0",
+      "url": "https://registry.npmjs.org/@noble/hashes/-/hashes-1.8.0.tgz",
+      "integrity": "sha512-jCs9ldd7NwzpgXDIf6P3+NrHh9/sD6CQdxHyjQI+h/6rDNo88ypBxxz45UDuZHz9r3tNz7N/VInSVoVdtXEI4A==",
+      "installed_code_tree": {
+        "files": 56,
+        "sha256_of_sorted_path_sha256_json": "aa03948668b4846d3f236822bf6a7fb852b09d6b342607cb53a5526b106c1a21"
+      }
+    },
+    {
+      "path": "node_modules/@scure/bip39/node_modules/@noble/hashes",
+      "name": "@noble/hashes",
+      "version": "1.8.0",
+      "url": "https://registry.npmjs.org/@noble/hashes/-/hashes-1.8.0.tgz",
+      "integrity": "sha512-jCs9ldd7NwzpgXDIf6P3+NrHh9/sD6CQdxHyjQI+h/6rDNo88ypBxxz45UDuZHz9r3tNz7N/VInSVoVdtXEI4A==",
+      "installed_code_tree": {
+        "files": 56,
+        "sha256_of_sorted_path_sha256_json": "aa03948668b4846d3f236822bf6a7fb852b09d6b342607cb53a5526b106c1a21"
+      }
+    }
+  ],
+  "checks": {
+    "cases": 7,
+    "accounts": 140,
+    "mnemonic_seed_comparisons": 7,
+    "public_key_comparisons": 700,
+    "output_key_comparisons": 140,
+    "address_comparisons": 420,
+    "address_decode_roundtrips": 420,
+    "wrong_purpose_reencodings_rejected": 280,
+    "unicode_nfkd_equivalences": 2,
+    "slip10_official_ed25519_nodes": 12
+  }
+}

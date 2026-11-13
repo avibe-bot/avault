@@ -25,8 +25,62 @@ pub enum HdChain {
     Solana,
 }
 
+/// Fixed Bitcoin script type; each selects its own BIP purpose and signing scheme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BitcoinAddressType {
+    /// Legacy P2PKH, `m/44'/0'/0'/0/i`, low-S DER ECDSA.
+    P2pkh,
+    /// Native SegWit P2WPKH, `m/84'/0'/0'/0/i`, low-S DER ECDSA.
+    P2wpkh,
+    /// Taproot P2TR, `m/86'/0'/0'/0/i`, BIP341 key-path Schnorr.
+    P2tr,
+}
+
+impl BitcoinAddressType {
+    fn purpose(self) -> u32 {
+        match self {
+            Self::P2pkh => 44,
+            Self::P2wpkh => 84,
+            Self::P2tr => 86,
+        }
+    }
+
+    fn signing_scheme(self) -> SignatureScheme {
+        match self {
+            Self::P2pkh | Self::P2wpkh => SignatureScheme::EcdsaSecp256k1Der,
+            Self::P2tr => SignatureScheme::SchnorrSecp256k1Bip341Keypath,
+        }
+    }
+}
+
+impl FromStr for BitcoinAddressType {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "p2pkh" => Ok(Self::P2pkh),
+            "p2wpkh" => Ok(Self::P2wpkh),
+            "p2tr" => Ok(Self::P2tr),
+            _ => bail!("unsupported Bitcoin address type"),
+        }
+    }
+}
+
 impl HdChain {
-    /// The only signature scheme allowed for this chain's derived key.
+    /// Select a fixed scheme, rejecting address-type selectors on other chains.
+    /// Omission preserves the original Bitcoin Taproot behavior.
+    pub fn signing_scheme_for(
+        self,
+        address_type: Option<BitcoinAddressType>,
+    ) -> anyhow::Result<SignatureScheme> {
+        match (self, address_type) {
+            (Self::Bitcoin, Some(address_type)) => Ok(address_type.signing_scheme()),
+            (_, Some(_)) => bail!("address_type is only valid for bitcoin derivation"),
+            (_, None) => Ok(self.signing_scheme()),
+        }
+    }
+
+    /// The original signature scheme when no Bitcoin address type is selected.
     pub const fn signing_scheme(self) -> SignatureScheme {
         match self {
             Self::Evm => SignatureScheme::EcdsaSecp256k1Recoverable,
@@ -77,16 +131,52 @@ pub fn derive_hd_private_key(
     chain: HdChain,
     account: u32,
 ) -> anyhow::Result<Zeroizing<[u8; KEY_BYTES]>> {
+    derive_hd_private_key_with_address_type(seed, chain, account, None)
+}
+
+/// Derive a fixed-path key with an optional Bitcoin script-type selector.
+/// Other chains reject a selector; omitted Bitcoin type remains BIP86 Taproot.
+pub fn derive_hd_private_key_with_address_type(
+    seed: &[u8; BIP39_SEED_BYTES],
+    chain: HdChain,
+    account: u32,
+    address_type: Option<BitcoinAddressType>,
+) -> anyhow::Result<Zeroizing<[u8; KEY_BYTES]>> {
     validate_account(account)?;
+    chain.signing_scheme_for(address_type)?;
     let node = match chain {
         HdChain::Evm => bip32_node(seed, &[44 | HARDENED, 60 | HARDENED, HARDENED, 0, account])?,
-        HdChain::Bitcoin => bip32_node(seed, &[86 | HARDENED, HARDENED, HARDENED, 0, account])?,
+        HdChain::Bitcoin => bip32_node(
+            seed,
+            &[
+                address_type.unwrap_or(BitcoinAddressType::P2tr).purpose() | HARDENED,
+                HARDENED,
+                HARDENED,
+                0,
+                account,
+            ],
+        )?,
         HdChain::Solana => slip10_node(
             seed,
             &[44 | HARDENED, 501 | HARDENED, account | HARDENED, HARDENED],
         )?,
     };
     Ok(node.key)
+}
+
+/// Derive one compressed Bitcoin public key on its script type's fixed path.
+/// P2TR returns the untweaked internal key; no chain code or private bytes escape.
+pub fn derive_hd_bitcoin_public_key(
+    seed: &[u8; BIP39_SEED_BYTES],
+    account: u32,
+    address_type: BitcoinAddressType,
+) -> anyhow::Result<[u8; 33]> {
+    compressed_public_key(&*derive_hd_private_key_with_address_type(
+        seed,
+        HdChain::Bitcoin,
+        account,
+        Some(address_type),
+    )?)
 }
 
 /// Derive public keys for one supported account. Private intermediates are wiped on drop.

@@ -156,6 +156,154 @@ fn fixed_paths_match_the_independent_wallet_check_and_account_bounds() {
 }
 
 #[test]
+fn bitcoin_address_types_select_fixed_purposes_and_preserve_default_keys() {
+    let seed: [u8; 64] = hex::decode(fixture()["bip86_seed"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    for (token, address_type, purpose, scheme) in [
+        (
+            "p2pkh",
+            BitcoinAddressType::P2pkh,
+            44,
+            SignatureScheme::EcdsaSecp256k1Der,
+        ),
+        (
+            "p2wpkh",
+            BitcoinAddressType::P2wpkh,
+            84,
+            SignatureScheme::EcdsaSecp256k1Der,
+        ),
+        (
+            "p2tr",
+            BitcoinAddressType::P2tr,
+            86,
+            SignatureScheme::SchnorrSecp256k1Bip341Keypath,
+        ),
+    ] {
+        assert_eq!(BitcoinAddressType::from_str(token).unwrap(), address_type);
+        assert_eq!(
+            HdChain::Bitcoin
+                .signing_scheme_for(Some(address_type))
+                .unwrap(),
+            scheme
+        );
+        for account in 0..HD_ACCOUNT_COUNT {
+            let key = derive_hd_private_key_with_address_type(
+                &seed,
+                HdChain::Bitcoin,
+                account,
+                Some(address_type),
+            )
+            .unwrap();
+            let fixed =
+                bip32_node(&seed, &[purpose | HARDENED, HARDENED, HARDENED, 0, account]).unwrap();
+            assert_eq!(*key, *fixed.key);
+            assert_eq!(
+                derive_hd_bitcoin_public_key(&seed, account, address_type).unwrap(),
+                compressed_public_key(&key).unwrap()
+            );
+            if address_type == BitcoinAddressType::P2tr {
+                assert_eq!(
+                    *key,
+                    *derive_hd_private_key(&seed, HdChain::Bitcoin, account).unwrap()
+                );
+                assert_eq!(
+                    derive_hd_account(&seed, account).unwrap().bitcoin,
+                    compressed_public_key(&key).unwrap()
+                );
+            }
+        }
+        for chain in [HdChain::Evm, HdChain::Solana] {
+            assert!(chain.signing_scheme_for(Some(address_type)).is_err());
+            assert!(
+                derive_hd_private_key_with_address_type(&seed, chain, 0, Some(address_type))
+                    .is_err()
+            );
+        }
+        for account in [20, HARDENED, u32::MAX] {
+            assert!(derive_hd_bitcoin_public_key(&seed, account, address_type).is_err());
+        }
+    }
+    for token in ["", "P2PKH", "p2sh", "p2wsh", "legacy", "p2tr "] {
+        assert!(BitcoinAddressType::from_str(token).is_err());
+    }
+    for chain in [HdChain::Evm, HdChain::Bitcoin, HdChain::Solana] {
+        assert_eq!(
+            chain.signing_scheme_for(None).unwrap(),
+            chain.signing_scheme()
+        );
+    }
+}
+
+#[test]
+fn bip84_published_receiving_keys_are_not_bip86_reencodings() {
+    // BIP84's first two receiving keys, not its change path (unsupported by this API).
+    let seed: [u8; 64] = hex::decode(fixture()["bip86_seed"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    for (account, expected) in [
+        (
+            0,
+            "0330d54fd0dd420a6e5f8d3624f5f3482cae350f79d5f0753bf5beef9c2d91af3c",
+        ),
+        (
+            1,
+            "03e775fd51f0dfb8cd865d9ff1cca2a158cf651fe997fdc9fee9c1d3b5e995ea77",
+        ),
+    ] {
+        let public =
+            derive_hd_bitcoin_public_key(&seed, account, BitcoinAddressType::P2wpkh).unwrap();
+        assert_eq!(hex::encode(public), expected);
+        assert_ne!(public, derive_hd_account(&seed, account).unwrap().bitcoin);
+    }
+}
+
+#[test]
+fn slip132_bip44_and_bip84_published_account_keys_anchor_fixed_paths() {
+    let official: Value = serde_json::from_str(include_str!(
+        "../../../../tests/vectors/hd_bitcoin_official.json"
+    ))
+    .unwrap();
+    let matrix: Value = serde_json::from_str(include_str!(
+        "../../../../tests/vectors/hd_bitcoin_address_types.json"
+    ))
+    .unwrap();
+    let reference = matrix["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|case| case["id"] == "bip39_abandon11_about_empty")
+        .unwrap();
+    let seed: [u8; 64] = hex::decode(reference["seed_hex"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    for (row, address_type, field, address) in [
+        (0, BitcoinAddressType::P2pkh, "bitcoin_p2pkh", "p2pkh"),
+        (1, BitcoinAddressType::P2wpkh, "bitcoin_p2wpkh", "p2wpkh"),
+    ] {
+        let expected = &official["slip132"][row];
+        let node = bip32_node(&seed, &path(expected["account_path"].as_str().unwrap())).unwrap();
+        let xpub = extended(expected["account_xpub"].as_str().unwrap());
+        assert_eq!(node.chain_code.as_slice(), &xpub[13..45]);
+        assert_eq!(
+            compressed_public_key(&node.key).unwrap().as_slice(),
+            &xpub[45..78]
+        );
+        assert_eq!(
+            hex::encode(derive_hd_bitcoin_public_key(&seed, 0, address_type).unwrap()),
+            reference["accounts"][0][field]
+        );
+        assert_eq!(
+            reference["accounts"][0]["addresses"][address],
+            expected["address"]
+        );
+    }
+}
+
+#[test]
 fn exceptional_bip32_tweaks_fail_closed_without_advancing_the_path() {
     let mut one = [0u8; 32];
     one[31] = 1;

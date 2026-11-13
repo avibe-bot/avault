@@ -4862,19 +4862,53 @@ fn hd_seed_blind_box_import_binds_name_type_format_purpose_and_exact_length() {
             &vec![42; length],
             &aad,
         );
-        let output = solana_cli_input(&vault_home, &args, &serde_json::to_vec(&blind).unwrap());
-        assert_eq!(
-            output.status.success(),
-            valid,
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        if valid {
-            let imported: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-            assert_eq!(imported["accounts"], expected["accounts"]);
-            assert_eq!(imported["type"], "hd-seed");
-        } else {
-            assert!(output.stdout.is_empty());
+        for extended in [false, true] {
+            let mut requested_args = args.to_vec();
+            if extended {
+                requested_args.extend(["--profile", "bitcoin-address-types-v1"]);
+            }
+            let output = solana_cli_input(
+                &vault_home,
+                &requested_args,
+                &serde_json::to_vec(&blind).unwrap(),
+            );
+            assert_eq!(
+                output.status.success(),
+                valid,
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if valid {
+                let imported: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(imported["type"], "hd-seed");
+                if extended {
+                    assert_eq!(imported["profile"], "bitcoin-address-types-v1");
+                    let request = json!({"name":"HD_SEED","key_envelope":imported["envelope"],"profile":"bitcoin-address-types-v1"});
+                    let derived = solana_cli_input(
+                        &vault_home,
+                        &["keypair", "derive-public"],
+                        request.to_string().as_bytes(),
+                    );
+                    assert!(derived.status.success());
+                    let derived: serde_json::Value =
+                        serde_json::from_slice(&derived.stdout).unwrap();
+                    assert_eq!(derived["accounts"], imported["accounts"]);
+                    assert!(derived.get("envelope").is_none());
+                    for i in 0..20 {
+                        for field in ["account", "evm", "bitcoin", "solana"] {
+                            assert_eq!(
+                                imported["accounts"][i][field],
+                                expected["accounts"][i][field]
+                            );
+                        }
+                    }
+                } else {
+                    assert_eq!(imported["accounts"], expected["accounts"]);
+                    assert!(imported.get("profile").is_none());
+                }
+            } else {
+                assert!(output.stdout.is_empty());
+            }
         }
     }
     let marker = b"never-echo-this-seed-input";
