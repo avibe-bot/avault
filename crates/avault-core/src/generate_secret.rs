@@ -210,18 +210,76 @@ mod tests {
     impl CryptoRng for ByteRng {}
 
     #[test]
-    fn production_api_uses_os_csprng_and_returns_only_distinct_envelopes() {
+    fn production_api_uses_os_csprng_and_returns_distinct_valid_plaintexts() {
         let master = [0x42; KEY_BYTES];
-        let first =
+        let first_password = generate_sealed_secret(
+            &master,
+            "GENERATED",
+            SecretGeneration::Password {
+                length: 24,
+                digits: true,
+                symbols: true,
+                no_lookalikes: true,
+            },
+        )
+        .unwrap();
+        let second_password = generate_sealed_secret(
+            &master,
+            "GENERATED",
+            SecretGeneration::Password {
+                length: 24,
+                digits: true,
+                symbols: true,
+                no_lookalikes: true,
+            },
+        )
+        .unwrap();
+        let first_password = crate::open(&master, "GENERATED", &first_password).unwrap();
+        let second_password = crate::open(&master, "GENERATED", &second_password).unwrap();
+        assert_eq!(first_password.len(), 24);
+        assert!(first_password.as_slice() != second_password.as_slice());
+        assert!(first_password.iter().all(|byte| {
+            PASSWORD_LETTERS.contains(byte)
+                || PASSWORD_DIGITS.contains(byte)
+                || PASSWORD_SYMBOLS.contains(byte)
+        }));
+        assert!(first_password
+            .iter()
+            .all(|byte| !LOOKALIKE_BYTES.contains(byte)));
+        assert!(first_password
+            .iter()
+            .any(|byte| PASSWORD_LETTERS.contains(byte)));
+        assert!(first_password
+            .iter()
+            .any(|byte| PASSWORD_DIGITS.contains(byte)));
+        assert!(first_password
+            .iter()
+            .any(|byte| PASSWORD_SYMBOLS.contains(byte)));
+
+        let hex_envelope =
             generate_sealed_secret(&master, "GENERATED", SecretGeneration::Hex { bytes: 16 })
                 .unwrap();
-        let second =
-            generate_sealed_secret(&master, "GENERATED", SecretGeneration::Hex { bytes: 16 })
+        let hex_plaintext = crate::open(&master, "GENERATED", &hex_envelope).unwrap();
+        assert_eq!(hex_plaintext.len(), 32);
+        assert!(hex_plaintext
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte)));
+        let decoded_hex = hex::decode(hex_plaintext.as_slice()).unwrap();
+        assert_eq!(decoded_hex.len(), 16);
+
+        let base64_envelope =
+            generate_sealed_secret(&master, "GENERATED", SecretGeneration::Base64 { bytes: 16 })
                 .unwrap();
-        assert_ne!(first, second);
-        assert!(!first.ciphertext.is_empty());
-        assert!(!second.ciphertext.is_empty());
+        let base64_plaintext = crate::open(&master, "GENERATED", &base64_envelope).unwrap();
+        assert_eq!(base64_plaintext.len(), 24);
+        assert!(base64_plaintext.ends_with(b"=="));
+        assert!(!base64_plaintext
+            .iter()
+            .any(|byte| *byte == b'\n' || *byte == b'\r'));
+        let decoded_base64 = B64.decode(base64_plaintext.as_slice()).unwrap();
+        assert_eq!(decoded_base64.len(), 16);
     }
+
     #[test]
     fn deterministic_hex_and_base64_vectors_match_standard_encodings() {
         let input: Vec<u8> = (0..16).collect();
