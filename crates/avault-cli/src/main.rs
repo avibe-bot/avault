@@ -51,6 +51,8 @@ const MAX_STDIN_PASSPHRASE_BYTES: usize = 64 * 1024;
 const STDIN_READ_CHUNK_BYTES: usize = 8192;
 /// A `verify` request is a few hundred bytes: three short hex strings and a scheme name.
 const MAX_VERIFY_REQUEST_BYTES: usize = 4096;
+/// One small typed envelope plus its record name and public-response profile.
+const MAX_DERIVE_PUBLIC_REQUEST_BYTES: usize = 64 * 1024;
 #[cfg(unix)]
 const MAX_AGENT_FRAME_BYTES: usize = 2 * 1024 * 1024;
 #[cfg(unix)]
@@ -96,7 +98,8 @@ USAGE:
     avault key authorize
     avault keypair generate --name NAME --curve ed25519|secp256k1
     avault keypair import --name NAME --curve ed25519 --format solana-cli-json|base58-secret [--blind-box]
-    avault keypair import --name NAME --type hd-seed --format raw-seed [--blind-box]
+    avault keypair import --name NAME --type hd-seed --format raw-seed [--blind-box] [--profile bitcoin-address-types-v1]
+    avault keypair derive-public < derive-public-request.json
     avault pubkey
     avault sign < sign-request.json
     avault verify < verify-request.json
@@ -423,6 +426,15 @@ struct DerivationInput {
     chain: String,
     #[serde(default)]
     account: u32,
+    #[serde(default, deserialize_with = "present_string")]
+    address_type: Option<String>,
+}
+
+// Optional means absent, not an explicitly null/malformed new selector.
+fn present_string<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    String::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Serialize)]
@@ -483,8 +495,13 @@ fn sign_cmd(args: &[OsString], config: &CliConfig, input: &mut impl Read) -> any
     drop(unlock);
     let private_key = if let Some(derivation) = derivation {
         let seed = zeroizing_vec_to_seed64(key_plaintext)?;
-        avault_core::derive_hd_private_key(&seed, derivation.chain, derivation.account)
-            .context("HD seed derivation failed")?
+        avault_core::derive_hd_private_key_with_address_type(
+            &seed,
+            derivation.chain,
+            derivation.account,
+            derivation.address_type,
+        )
+        .context("HD seed derivation failed")?
     } else {
         zeroizing_vec_to_key32(key_plaintext, "signing key")?
     };
@@ -502,6 +519,8 @@ fn sign_cmd(args: &[OsString], config: &CliConfig, input: &mut impl Read) -> any
 struct ValidatedDerivation {
     chain: avault_core::HdChain,
     account: u32,
+    address_type: Option<avault_core::BitcoinAddressType>,
+    scheme: SignatureScheme,
 }
 
 fn validate_sign_request(
@@ -513,19 +532,27 @@ fn validate_sign_request(
         .map(|input| -> anyhow::Result<ValidatedDerivation> {
             let chain = avault_core::HdChain::from_str(&input.chain)?;
             avault_core::validate_account(input.account)?;
+            let address_type = input
+                .address_type
+                .as_deref()
+                .map(avault_core::BitcoinAddressType::from_str)
+                .transpose()?;
+            let scheme = chain.signing_scheme_for(address_type)?;
             Ok(ValidatedDerivation {
                 chain,
                 account: input.account,
+                address_type,
+                scheme,
             })
         })
         .transpose()?;
     let scheme = match (&request.scheme, derivation) {
         (Some(name), _) => SignatureScheme::from_str(name)?,
-        (None, Some(derivation)) => derivation.chain.signing_scheme(),
+        (None, Some(derivation)) => derivation.scheme,
         (None, None) => bail!("scheme is required"),
     };
     if let Some(derivation) = derivation {
-        if scheme != derivation.chain.signing_scheme() {
+        if scheme != derivation.scheme {
             bail!("signing scheme does not match derivation chain");
         }
     }
@@ -1958,8 +1985,113 @@ fn keypair_cmd(args: &[OsString], config: &CliConfig, input: &mut impl Read) -> 
     match subcmd {
         "generate" => keypair_generate_cmd(&args[1..], config, input),
         "import" => keypair_import_cmd(&args[1..], config, input),
+        "derive-public" => keypair_derive_public_cmd(&args[1..], config, input),
         other => bail!("unknown keypair subcommand: {other}"),
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum HdPublicProfile {
+    BitcoinAddressTypesV1,
+}
+
+impl HdPublicProfile {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::BitcoinAddressTypesV1 => "bitcoin-address-types-v1",
+        }
+    }
+}
+
+impl FromStr for HdPublicProfile {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "bitcoin-address-types-v1" => Ok(Self::BitcoinAddressTypesV1),
+            _ => bail!("unsupported HD public profile"),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DerivePublicInput {
+    name: String,
+    key_envelope: Sealed,
+    profile: String,
+}
+
+fn keypair_derive_public_cmd(
+    args: &[OsString],
+    config: &CliConfig,
+    input: &mut impl Read,
+) -> anyhow::Result<u8> {
+    if !args.is_empty() {
+        bail!("keypair derive-public reads its JSON request from stdin and takes no options");
+    }
+    let unlock = read_store_unlock(config, input)?;
+    let bytes = read_zeroizing_to_cap(input, MAX_DERIVE_PUBLIC_REQUEST_BYTES)
+        .context("failed to read derive-public JSON from stdin")?;
+    let request: DerivePublicInput = serde_json::from_slice(bytes.as_slice())
+        .map_err(|_| anyhow!("derive-public JSON is invalid"))?;
+    let profile = HdPublicProfile::from_str(&request.profile)?;
+    if avault_core::envelope_kind(&request.key_envelope)? != avault_core::EnvelopeKind::HdSeed {
+        bail!("derive-public requires an HD seed envelope");
+    }
+    let master = load_existing_master_from_unlock(&unlock)?;
+    let plaintext =
+        avault_core::open_hd_seed(master.as_bytes(), &request.name, &request.key_envelope)
+            .context("HD seed envelope open failed")?;
+    drop(master);
+    drop(unlock);
+    let seed = zeroizing_vec_to_seed64(plaintext)?;
+    let accounts = hd_public_accounts(&seed, Some(profile))?;
+    drop(seed);
+    let output = HdSeedOutput {
+        key_type: "hd-seed",
+        envelope: None,
+        profile: Some(profile.as_str()),
+        accounts,
+    };
+    serde_json::to_writer(io::stdout(), &output).context("failed to write public key JSON")?;
+    println!();
+    Ok(0)
+}
+
+fn hd_public_accounts(
+    seed: &[u8; avault_core::BIP39_SEED_BYTES],
+    profile: Option<HdPublicProfile>,
+) -> anyhow::Result<Vec<HdAccountOutput>> {
+    avault_core::derive_hd_accounts(seed)
+        .context("HD seed account derivation failed")?
+        .into_iter()
+        .map(|account| {
+            let (bitcoin_p2pkh, bitcoin_p2wpkh) = match profile {
+                None => (None, None),
+                Some(HdPublicProfile::BitcoinAddressTypesV1) => (
+                    Some(hex::encode(avault_core::derive_hd_bitcoin_public_key(
+                        seed,
+                        account.account,
+                        avault_core::BitcoinAddressType::P2pkh,
+                    )?)),
+                    Some(hex::encode(avault_core::derive_hd_bitcoin_public_key(
+                        seed,
+                        account.account,
+                        avault_core::BitcoinAddressType::P2wpkh,
+                    )?)),
+                ),
+            };
+            Ok(HdAccountOutput {
+                account: account.account,
+                evm: hex::encode(account.evm),
+                bitcoin: hex::encode(account.bitcoin),
+                solana: hex::encode(account.solana),
+                bitcoin_p2pkh,
+                bitcoin_p2wpkh,
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug)]
@@ -1968,6 +2100,7 @@ struct KeypairOptions {
     curve: Option<String>,
     key_type: Option<String>,
     format: Option<String>,
+    profile: Option<HdPublicProfile>,
     blind_box: bool,
 }
 
@@ -1976,6 +2109,7 @@ fn parse_keypair_options(args: &[OsString]) -> anyhow::Result<KeypairOptions> {
     let mut curve = None;
     let mut key_type = None;
     let mut format = None;
+    let mut profile = None;
     let mut blind_box = false;
     let mut index = 0;
     while index < args.len() {
@@ -2031,6 +2165,17 @@ fn parse_keypair_options(args: &[OsString]) -> anyhow::Result<KeypairOptions> {
                 );
                 index += 2;
             }
+            "--profile" => {
+                if profile.is_some() {
+                    bail!("--profile was provided more than once");
+                }
+                let value = args
+                    .get(index + 1)
+                    .and_then(|value| value.to_str())
+                    .context("--profile requires a value")?;
+                profile = Some(HdPublicProfile::from_str(value)?);
+                index += 2;
+            }
             "--blind-box" => {
                 if blind_box {
                     bail!("--blind-box was provided more than once");
@@ -2049,6 +2194,7 @@ fn parse_keypair_options(args: &[OsString]) -> anyhow::Result<KeypairOptions> {
         curve,
         key_type,
         format,
+        profile,
         blind_box,
     })
 }
@@ -2068,7 +2214,10 @@ struct KeypairOutput {
 struct HdSeedOutput {
     #[serde(rename = "type")]
     key_type: &'static str,
-    envelope: Sealed,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    envelope: Option<Sealed>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile: Option<&'static str>,
     accounts: Vec<HdAccountOutput>,
 }
 
@@ -2078,6 +2227,10 @@ struct HdAccountOutput {
     evm: String,
     bitcoin: String,
     solana: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bitcoin_p2pkh: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bitcoin_p2wpkh: Option<String>,
 }
 
 fn keypair_generate_cmd(
@@ -2088,6 +2241,9 @@ fn keypair_generate_cmd(
     let options = parse_keypair_options(args)?;
     if options.key_type.is_some() {
         bail!("keypair generate does not accept --type");
+    }
+    if options.profile.is_some() {
+        bail!("keypair generate does not accept --profile");
     }
     let curve = options.curve.as_deref().context("--curve is required")?;
     if !matches!(curve, "ed25519" | "secp256k1") {
@@ -2147,6 +2303,9 @@ fn keypair_import_cmd(
             bail!("unsupported keypair import type");
         }
         return keypair_import_hd_seed_cmd(options, config, input);
+    }
+    if options.profile.is_some() {
+        bail!("--profile is only valid for HD seed import");
     }
     let curve = options.curve.as_deref().context("--curve is required")?;
     if curve != "ed25519" {
@@ -2230,22 +2389,14 @@ fn keypair_import_hd_seed_cmd(
     };
     let envelope = avault_core::seal_hd_seed(master.as_bytes(), &options.name, seed.as_ref())
         .context("HD seed envelope seal failed")?;
-    let accounts = avault_core::derive_hd_accounts(&seed)
-        .context("HD seed account derivation failed")?
-        .into_iter()
-        .map(|account| HdAccountOutput {
-            account: account.account,
-            evm: hex::encode(account.evm),
-            bitcoin: hex::encode(account.bitcoin),
-            solana: hex::encode(account.solana),
-        })
-        .collect();
-    drop(seed);
     drop(master);
     drop(unlock);
+    let accounts = hd_public_accounts(&seed, options.profile)?;
+    drop(seed);
     let output = HdSeedOutput {
         key_type: "hd-seed",
-        envelope,
+        envelope: Some(envelope),
+        profile: options.profile.map(HdPublicProfile::as_str),
         accounts,
     };
     serde_json::to_writer(io::stdout(), &output).context("failed to write keypair JSON")?;

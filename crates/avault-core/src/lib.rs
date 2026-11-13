@@ -43,7 +43,8 @@ pub use ed25519::{
     MAX_SOLANA_CLI_JSON_BYTES, MAX_SOLANA_SECRET_BASE58_BYTES, SOLANA_SECRET_KEY_BYTES,
 };
 pub use hd::{
-    derive_hd_account, derive_hd_accounts, derive_hd_private_key, validate_account,
+    derive_hd_account, derive_hd_accounts, derive_hd_bitcoin_public_key, derive_hd_private_key,
+    derive_hd_private_key_with_address_type, validate_account, BitcoinAddressType,
     HdAccountPublicKeys, HdChain, BIP39_SEED_BYTES, HD_ACCOUNT_COUNT,
 };
 pub use secp256k1::generate_sealed_secp256k1_keypair;

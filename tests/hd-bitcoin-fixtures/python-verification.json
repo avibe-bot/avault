@@ -1,0 +1,25 @@
+{
+  "status": "PASS",
+  "python": "3.13.7",
+  "unicode_database": "15.1.0",
+  "openssl": "OpenSSL 4.0.3 29 Sep 2026 (Library: OpenSSL 4.0.3 29 Sep 2026)",
+  "fixture_sha256": "d5c2fcbdfe3c4949b4d715dd77276569a3601dab7903b79ded3a32589b526109",
+  "checks": {
+    "bip39_english_vectors": 24,
+    "bip32_extended_key_pairs_vectors_1_to_4": 17,
+    "bip84_official_address_vectors": 3,
+    "bip86_official_address_vectors": 3,
+    "slip132_bip44_and_bip84_account_xpub_and_address": 2,
+    "slip10_secp256k1_official_nodes": 12,
+    "slip10_ed25519_official_nodes": 12,
+    "fixture_cases": 7,
+    "accounts_per_case": 20,
+    "total_account_rows": 140,
+    "openssl_secp256k1_fixture_key_comparisons": 560,
+    "openssl_ed25519_fixture_public_keys": 140,
+    "fixture_addresses": 420,
+    "taproot_odd_y_internal_keys": 65,
+    "taproot_even_y_internal_keys": 75,
+    "unicode_nfkd_equivalence_and_raw_utf8_inequality_cases": 2
+  }
+}

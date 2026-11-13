@@ -8,6 +8,9 @@ use std::process::{Command, Output, Stdio};
 const NAME: &str = "TEST_CHANNEL_KEY";
 const SCHEME: &str = "ecdsa-secp256k1-der";
 
+#[path = "keypair/hd_bitcoin.rs"]
+mod hd_bitcoin;
+
 struct Sandbox(tempfile::TempDir);
 
 impl Sandbox {

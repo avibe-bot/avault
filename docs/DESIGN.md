@@ -730,7 +730,7 @@ an explicit all-zero auxiliary value only for test-vector comparison.
 
 ### Standard-tier HD seed wallets
 
-This is an additive **one-shot** import/sign contract. Existing keypair generation,
+This is an additive **one-shot** import/public-derivation/sign contract. Existing keypair generation,
 Solana imports, signing requests, envelope bytes/AAD, and resident protected signing
 are unchanged. No release, version bump, or Avibe binary pin is implied by this
 interface change; the consumer must enable it only after an approved release.
@@ -739,16 +739,23 @@ The browser handles BIP39 words, checksum, optional passphrase, and PBKDF2. avau
 receives exactly **64 seed bytes**, not mnemonic entropy and not a Solana seed+public
 key. It contains no word list, mnemonic parser, BIP39 KDF, or mnemonic reveal/export.
 A single standard-tier envelope stores this seed and supplies 20 accounts, #0–#19.
-The same index selects the following three fixed paths:
+The same index selects the following fixed paths. Bitcoin's optional
+`derivation.address_type` selects the script type; omission preserves shipped Taproot:
 
-| `derivation.chain` | Path for index `i` | Required signing scheme |
-|---|---|---|
-| `evm` | `m/44'/60'/0'/0/i` (BIP32) | `ecdsa-secp256k1-recoverable` |
-| `bitcoin` | `m/86'/0'/0'/0/i` (BIP32/BIP86) | `schnorr-secp256k1-bip341-keypath` |
-| `solana` | `m/44'/501'/i'/0'` (SLIP-0010 Ed25519) | `ed25519` |
+| `derivation.chain` | `address_type` | Path for index `i` | Required signing scheme |
+|---|---|---|---|
+| `evm` | absent | `m/44'/60'/0'/0/i` (BIP32) | `ecdsa-secp256k1-recoverable` |
+| `bitcoin` | absent or `p2tr` | `m/86'/0'/0'/0/i` (BIP32/BIP86) | `schnorr-secp256k1-bip341-keypath` |
+| `bitcoin` | `p2pkh` | `m/44'/0'/0'/0/i` (BIP32/BIP44) | `ecdsa-secp256k1-der` |
+| `bitcoin` | `p2wpkh` | `m/84'/0'/0'/0/i` (BIP32/BIP84) | `ecdsa-secp256k1-der` |
+| `solana` | absent | `m/44'/501'/i'/0'` (SLIP-0010 Ed25519) | `ed25519` |
 
 Here “account” is the product's shared index, not necessarily the BIP44 account
-component: EVM/Bitcoin increment the receiving-address index. Only these exact chain
+component: EVM/Bitcoin increment the receiving-address index. All three Bitcoin
+purposes keep hardened account 0 and external chain 0; #1–#19 are **not** hardened
+account-i, and this is not a claim of Phantom account-i parity. Legacy/SegWit keys
+are independently derived at purpose 44/84, never a re-encoding of the BIP86 key.
+Only these exact chain
 names and integer indices 0–19 are accepted; there is no arbitrary-path, change-chain,
 xprv/xpub, chain-code, or more-accounts operation. BIP32 rejects an invalid master
 scalar, an out-of-range child tweak, or a zero child scalar. For the vanishingly rare
@@ -798,6 +805,57 @@ Changing the scheme in either direction fails value authentication even if lengt
 checks would otherwise accept the plaintext. Existing records retain the legacy
 scheme and its original read-compatibility behavior.
 
+#### Versioned public metadata and existing-seed derivation
+
+The no-profile import above retains **exactly** its original root/account fields;
+strict old consumers reject extra fields. Opt in with
+`--profile bitcoin-address-types-v1` to add root `profile` and two account fields,
+`bitcoin_p2pkh` and `bitcoin_p2wpkh`. They contain lowercase 33-byte compressed SEC1
+public-key hex from the respective paths above. Existing `bitcoin` remains the
+untweaked BIP86 internal key, not a renamed field or a tweaked output key. The
+profile changes only public response shape: it is not a path selector and is not
+part of the seed envelope, AAD, or HPKE import context. Unknown/duplicate profiles
+and profiles on ordinary imports or key generation are rejected.
+
+Existing wallets need no words or seed resubmission. The new one-shot command
+`avault keypair derive-public` accepts no argv options and reads this exact JSON
+from stdin (maximum 64 KiB, after the store-passphrase line when applicable):
+
+```json
+{
+  "name": "WALLET",
+  "key_envelope": { "ciphertext": "...", "nonce": "...", "wrap_meta": "..." },
+  "profile": "bitcoin-address-types-v1"
+}
+```
+
+Only this required profile is supported. Missing/null/unknown profiles, unknown
+request fields, and non-HD envelopes fail closed. It opens the **existing** envelope
+only inside avault using the existing master; it never generates a master or seed,
+seals/re-encrypts an envelope, or writes public metadata. The existing store policy
+is unchanged: `auto` may migrate the same existing file master into Keychain/TPM,
+as other existing-key operations do; it never generates a replacement key on read.
+Explicit file/passphrase-store reads leave their store unchanged. The master and
+unlock are dropped before derivation; the seed is dropped before serialization.
+The response has exactly `type`, `profile`, and all 20 `accounts`, **no envelope**:
+
+```json
+{
+  "type": "hd-seed",
+  "profile": "bitcoin-address-types-v1",
+  "accounts": [
+    { "account": 0, "evm": "...", "bitcoin": "...", "solana": "...", "bitcoin_p2pkh": "...", "bitcoin_p2wpkh": "..." }
+  ]
+}
+```
+
+Extended import returns this same public shape **plus** `envelope`. Neither API
+returns addresses, private/extended keys, chain codes, or seed material. Avibe must
+validate all old identities before attaching new public metadata, then compare-and-swap
+against the exact row id and envelope it supplied. A same-name replacement must not
+receive stale metadata; account enablement/policy/names/history remain caller-owned
+and unchanged. avault knows the name/envelope, not the Avibe row id or database.
+
 #### Signing and compatibility
 
 The existing JSON `sign` request adds optional `derivation`:
@@ -811,13 +869,23 @@ The existing JSON `sign` request adds optional `derivation`:
 }
 ```
 
-`chain` is required with derivation; omitted `account` means 0. `scheme` may be
-omitted **only** with derivation; if supplied, it must equal the chain's fixed
-scheme. EVM/Bitcoin require `digest`, Solana requires exact `message_hex` under the
-existing 1 MiB cap. Chain, index, scheme and payload mismatches fail before loading
+`chain` is required with derivation; omitted `account` means 0. The optional
+`address_type` accepts exactly `p2pkh`, `p2wpkh`, or `p2tr` and **only** with
+`chain:"bitcoin"`. Explicit null/non-string/unknown values are errors, not default
+selection. `scheme` may be omitted **only** with derivation; if supplied, it must
+equal the selected chain/script-type scheme in the table. For example,
+`{"chain":"bitcoin","account":1,"address_type":"p2wpkh"}` selects BIP84 and DER
+ECDSA; omitting `address_type` still selects BIP86/BIP341, even if a different
+scheme was supplied (that mismatch is rejected, never used as a selector).
+EVM/Bitcoin require `digest`, Solana requires exact `message_hex` under the
+existing 1 MiB cap. Chain, index, address type, scheme and payload mismatches fail before loading
 the master or opening any envelope. A seed requires derivation; an ordinary keypair
 rejects it. One-shot protected `dek_blindbox`/`approval` fields remain rejected.
-The result is the unchanged `{signature,recovery_id}` object.
+The result is the unchanged `{signature,recovery_id}` object. For P2PKH/P2WPKH it
+contains low-S DER ECDSA, with no recovery id and **no** transaction sighash byte.
+Legacy/BIP143 transaction assembly, digest validation, sighash-byte appending, and
+broadcast are caller-owned. P2TR still uses the existing tweaked empty-script-tree
+BIP341 signer, never raw BIP340 under the internal key.
 
 After opening, the master is dropped before deriving. The seed is dropped before
 signing, and the derived key is dropped after the existing signer returns, including
@@ -838,6 +906,13 @@ creating or signing HD records. Independently of that gate, old avault rejects
 retagging cannot turn the seed into a legacy signing key or deliverable value.
 Protected HD creation/signing and the sandbox protocol are outside this change.
 
+The address-type/public-profile extension needs a release newer than v0.1.11.
+v0.1.11 understands the original HD contract, but rejects `address_type` (including
+explicit `p2tr`) as an unknown field, rejects `--profile`, and has no `derive-public`
+verb. Consumers must version-gate this extension and surface upgrade-required;
+never strip a selector/profile or retry a different path/scheme after refusal.
+Omitted-selector Taproot and old-shape import remain interoperable with v0.1.11.
+
 The standard-tier threat model is unchanged, but the loss scope is larger: same-UID
 machine compromise can expose the **entire seed**, including unenabled accounts and
 other chains derived from it. This is a hot-wallet facility, not protection for a
@@ -850,6 +925,15 @@ Python AES-GCM HD envelope. Source URLs and content hashes identify the official
 vector inputs. Tests verify BIP86 signatures against published **output keys**, not
 only the returned internal keys. Invalid extended-key import vectors are irrelevant:
 there is no extended-key input API. All fixture seed/key material is public test data.
+The additive `tests/vectors/hd_bitcoin_address_types.json` covers two fixed public
+12/24-word mnemonics with empty, ASCII, and NFKD-sensitive passphrases plus the
+published BIP84/BIP86 mnemonic, all 20 indices, and independent Python/OpenSSL and
+scure/noble public-key/address checks. BIP84 and SLIP-0132's BIP44 reference anchor
+the new purpose paths (BIP44 itself supplies the hierarchy, not numeric vectors).
+CLI tests verify low-S canonical DER and signatures under the selected independent
+keys, reject cross-path/account verification, and pin the published BIP143 native
+P2WPKH digest/signature interface. These are never funded wallets and do not replace
+consumer backfill/concurrency or disposable-testnet receive/spend acceptance.
 
 ### Public signature verification (`verify`)
 

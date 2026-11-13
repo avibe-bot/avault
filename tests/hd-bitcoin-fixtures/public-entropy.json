@@ -1,0 +1,16 @@
+{
+  "warning": "PUBLIC TEST DATA - NEVER FUND - NOT A WALLET",
+  "origin": "Two fresh OS-CSPRNG entropy draws, made once; fixed forever after initialization.",
+  "mnemonics": [
+    {
+      "id": "random12",
+      "words": 12,
+      "entropy_hex": "c6e3b8798e5a8541862033bd0b491f1c"
+    },
+    {
+      "id": "random24",
+      "words": 24,
+      "entropy_hex": "c06ca2b6bcbfb28e2da531ee124c934692170c334a91d72415e1ca38c50bd167"
+    }
+  ]
+}
