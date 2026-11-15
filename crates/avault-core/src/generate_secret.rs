@@ -22,7 +22,7 @@ const LOOKALIKE_BYTES: &[u8] = b"0O1lI";
 pub enum SecretGeneration {
     /// Generate an ASCII password. Letters are always enabled; the other classes are optional.
     Password {
-        /// Number of generated characters, inclusive range 12..=128.
+        /// Number of generated characters, inclusive range 8..=128.
         length: usize,
         /// Include decimal digits.
         digits: bool,
@@ -55,8 +55,8 @@ pub fn generate_sealed_secret(
 
 fn validate_recipe(recipe: SecretGeneration) -> anyhow::Result<()> {
     match recipe {
-        SecretGeneration::Password { length, .. } if !(12..=128).contains(&length) => {
-            bail!("password length must be between 12 and 128")
+        SecretGeneration::Password { length, .. } if !(8..=128).contains(&length) => {
+            bail!("password length must be between 8 and 128")
         }
         SecretGeneration::Hex { bytes } | SecretGeneration::Base64 { bytes }
             if !(16..=64).contains(&bytes) =>
@@ -354,18 +354,61 @@ mod tests {
     }
 
     #[test]
+    fn password_bounds_accept_supported_lengths_with_all_flag_combinations() {
+        let master = [0x42; KEY_BYTES];
+        for length in [8, 11, 12, 128] {
+            for digits in [false, true] {
+                for symbols in [false, true] {
+                    for no_lookalikes in [false, true] {
+                        let envelope = generate_sealed_secret(
+                            &master,
+                            "GENERATED",
+                            SecretGeneration::Password {
+                                length,
+                                digits,
+                                symbols,
+                                no_lookalikes,
+                            },
+                        )
+                        .unwrap();
+                        let password = crate::open(&master, "GENERATED", &envelope).unwrap();
+                        assert_eq!(password.len(), length);
+                        assert!(password.iter().all(|byte| {
+                            PASSWORD_LETTERS.contains(byte)
+                                || (digits && PASSWORD_DIGITS.contains(byte))
+                                || (symbols && PASSWORD_SYMBOLS.contains(byte))
+                        }));
+                        assert!(password.iter().any(|byte| PASSWORD_LETTERS.contains(byte)));
+                        assert_eq!(
+                            password.iter().any(|byte| PASSWORD_DIGITS.contains(byte)),
+                            digits
+                        );
+                        assert_eq!(
+                            password.iter().any(|byte| PASSWORD_SYMBOLS.contains(byte)),
+                            symbols
+                        );
+                        if no_lookalikes {
+                            assert!(password.iter().all(|byte| !LOOKALIKE_BYTES.contains(byte)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn recipe_bounds_are_rejected_before_randomness_or_sealing() {
         let mut rng = ByteRng::new(Vec::new());
-        assert!(generate_plaintext_with_rng(
-            SecretGeneration::Password {
-                length: 11,
+        for length in [0, 7, 129] {
+            let recipe = SecretGeneration::Password {
+                length,
                 digits: true,
                 symbols: true,
                 no_lookalikes: false,
-            },
-            &mut rng
-        )
-        .is_err());
+            };
+            assert!(generate_plaintext_with_rng(recipe, &mut rng).is_err());
+            assert!(generate_sealed_secret(&[0x42; KEY_BYTES], "GENERATED", recipe).is_err());
+        }
         assert!(
             generate_plaintext_with_rng(SecretGeneration::Hex { bytes: 65 }, &mut rng).is_err()
         );

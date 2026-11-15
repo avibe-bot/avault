@@ -504,8 +504,8 @@ fn parse_generate_secret_options(args: &[OsString]) -> anyhow::Result<GenerateSe
                 bail!("password type does not accept --bytes");
             }
             let length = length.context("password type requires --length")?;
-            if !(12..=128).contains(&length) {
-                bail!("password length must be between 12 and 128");
+            if !(8..=128).contains(&length) {
+                bail!("password length must be between 8 and 128");
             }
             SecretGeneration::Password {
                 length,

@@ -677,8 +677,8 @@ file-descriptor passthrough from Avibe's local `set` path. In both paths, new
 envelopes authenticate value ciphertext with AAD
 `name || "machine-aesgcm-v1" || 0x01`.
 
-`generate-secret` is available in the additive avault capability released after
-0.1.12 (the consumer floor is `>=0.1.13`). It takes no value from stdin for the
+`generate-secret` was introduced in avault 0.1.13. The password range below
+requires avault `>=0.1.14`; 0.1.13 rejects lengths below 12. It takes no value from stdin for the
 normal file/keychain stores and emits exactly the same `Sealed` JSON envelope as
 `seal`:
 
@@ -689,7 +689,7 @@ avault generate-secret --name NAME --type hex --bytes N
 avault generate-secret --name NAME --type base64 --bytes N
 ```
 
-Password length is 12..=128. Letters are always enabled; digits and the exact
+Password length is 8..=128. Letters are always enabled; digits and the exact
 symbol set `!#$%&*+-.:=?@^_~` are enabled by default. `--no-lookalikes` removes
 `0 O 1 l I` from every enabled class. Every enabled class must occur at least
 once; a failed candidate causes whole-string regeneration. Hex and Base64 accept
@@ -702,9 +702,10 @@ above the largest multiple of the alphabet size below 256 before modulo
 reduction, preventing modulo bias. Generated plaintext and encoded bytes remain
 in zeroizing memory until `seal` completes. Invalid recipes, unknown types, and
 flags belonging to another type fail before the master store is opened; stdout
-is empty on failure and stderr never contains a generated value. Older binaries
-reject the unknown `generate-secret` command, so Avibe must gate this operation
-on avault `>=0.1.13` rather than fall back.
+is empty on failure and stderr never contains a generated value. Binaries before
+0.1.13 reject the unknown `generate-secret` command, and 0.1.13 rejects passwords
+of 8–11 characters. Avibe must gate this contract on avault `>=0.1.14` rather than
+fall back.
 
 `sign` reads one JSON object from stdin:
 
