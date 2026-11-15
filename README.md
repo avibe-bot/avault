@@ -53,7 +53,7 @@ avault verify < verify-request.json
 
 `generate-secret` creates a new static Standard value inside avault and returns only the
 same `{ciphertext, nonce, wrap_meta}` envelope as `seal`; plaintext is never returned.
-It requires avault `>=0.1.13`. Passwords are 12..=128 characters with letters always
+It requires avault `>=0.1.14`. Passwords are 8..=128 characters with letters always
 enabled, optional digits and the fixed symbol set `!#$%&*+-.:=?@^_~` enabled by
 default, and optional `--no-lookalikes`. Hex and standard padded, unwrapped Base64
 accept 16..=64 random bytes. The generated value is held in zeroizing memory and

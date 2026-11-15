@@ -68,6 +68,25 @@ fn generate_secret_stdout_is_only_the_existing_envelope_and_stderr_is_empty() {
 }
 
 #[test]
+fn generate_secret_password_accepts_new_floor_and_preserves_upper_bound() {
+    for length in ["8", "11", "12", "128"] {
+        let home = TempDir::new().unwrap();
+        assert_envelope_only(&run_generate(
+            home.path(),
+            &[
+                "--name",
+                "GENERATED_PASSWORD",
+                "--type",
+                "password",
+                "--length",
+                length,
+            ],
+        ));
+        assert!(home.path().join("machine.key").exists());
+    }
+}
+
+#[test]
 fn generate_secret_rejects_wrong_type_flags_without_unlocking_or_sealing() {
     let home = TempDir::new().unwrap();
     let output = run_generate(
@@ -98,7 +117,15 @@ fn generate_secret_rejects_out_of_range_and_unknown_recipes_without_output() {
             "--type",
             "password",
             "--length",
-            "11",
+            "7",
+        ],
+        vec![
+            "--name",
+            "BAD_LENGTH",
+            "--type",
+            "password",
+            "--length",
+            "129",
         ],
         vec!["--name", "BAD_BYTES", "--type", "base64", "--bytes", "65"],
         vec!["--name", "BAD_TYPE", "--type", "urlsafe", "--bytes", "16"],
